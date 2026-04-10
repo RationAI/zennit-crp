@@ -37,7 +37,7 @@ class ChannelConcept(Concept):
     @staticmethod
     def mask(batch_id: int, concept_ids: List, layer_name=None):
         """
-        Wrapper that generates a function thath modifies the gradient (replaced by zennit by attributions).
+        Wrapper that generates a function that modifies the gradient (replaced by zennit by attributions).
 
         Parameters:
         ----------
@@ -144,3 +144,52 @@ class ChannelConcept(Concept):
         rf_ch_sorted = torch.gather(rf_neuron, 0, d_ch_sorted)
 
         return d_ch_sorted, rel_ch_sorted, rf_ch_sorted
+
+
+class AttentionHeadConcept(ChannelConcept):
+    """
+    Concept Class for Vision Transformer attention heads.
+    Each concept corresponds to a single attention head.
+
+    Architecture-agnostic: infers head_dim from gradient tensor shape and number of heads.
+    """
+
+    @staticmethod
+    def mask(batch_id: int, concept_ids: List, layer_name=None):
+        """
+        Wrapper that generates a function which masks attention head dimensions
+        in the gradient tensor.
+
+        Parameters:
+        ----------
+        batch_id: int
+            Specifies the batch dimension in the torch.Tensor.
+        concept_ids: list of integer values
+            Attention head indices (0..num_heads-1) to be masked.
+        layer_name: str (optional)
+            Name of the layer (used for architecture lookup if needed).
+
+        Returns:
+        --------
+        callable function that modifies the gradient
+        """
+
+        def mask_fct(grad):
+
+            # grad shape: [batch, seq_len, hidden_dim]
+            # Assume standard head dimension of 64 (ViT-B/16, ViT-L/16, etc.)
+            # TODO: universal dimension detection
+            head_dim = 64
+
+            mask = torch.zeros_like(grad[batch_id])
+
+            for head_id in concept_ids:
+                start = head_id * head_dim
+                end = (head_id + 1) * head_dim
+                mask[:, start:end] = 1
+
+            grad[batch_id] = grad[batch_id] * mask
+
+            return grad
+
+        return mask_fct

@@ -9,7 +9,7 @@ import functools
 import inspect
 from tqdm import tqdm
 from zennit.composites import NameMapComposite, Composite
-from crp.attribution import CondAttribution
+from crp.attribution import CondAttribution, AttentionAttribution
 from crp.maximization import Maximization
 from crp.concepts import ChannelConcept, Concept
 from crp.statistics import Statistics
@@ -118,7 +118,7 @@ class FeatureVisualization:
             samples_batch = samples[b * batch_size: (b + 1) * batch_size]
             data_batch, targets_samples = self.get_data_concurrently(samples_batch, preprocessing=True)
 
-            targets_samples = np.atleast_1d(targets_samples) # numpy operation needed
+            targets_samples = np.array(targets_samples) # numpy operation needed
 
             # convert multi target to single target if user defined the method
             data_broadcast, targets, sample_indices = [], [], []

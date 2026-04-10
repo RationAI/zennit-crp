@@ -18,7 +18,15 @@ class MaskHook:
 
         @functools.wraps(self.backward)
         def wrapper(grad):
-            return hook_ref().backward(module, grad)
+            # Handle both single gradients and tuples (for multi-output layers)
+            if isinstance(grad, tuple):
+                result = tuple(
+                    hook_ref().backward(module, g) if g is not None else None
+                    for g in grad
+                )
+                return result
+            else:
+                return hook_ref().backward(module, grad)
 
         if not isinstance(output, tuple):
             output = (output,)
@@ -72,9 +80,23 @@ class FeatVisHook:
     def post_forward(self, module, input, output):
         '''Register a backward-hook to the resulting tensor right after the forward.'''
 
-        s_indices, targets = self.dict_inputs["sample_indices"], self.dict_inputs["targets"]
-        activation = output.detach().to(self.on_device) if self.on_device else output.detach()
-        self.FV.analyze_activation(activation, self.layer_name, self.concept, s_indices, targets)
+        s_indices, targets = (
+            self.dict_inputs["sample_indices"],
+            self.dict_inputs["targets"],
+        )
+        if isinstance(output, tuple):
+            output_tensor = output[0]
+        else:
+            output_tensor = output
+
+        activation = (
+            output_tensor.detach().to(self.on_device)
+            if self.on_device
+            else output_tensor.detach()
+        )
+        self.FV.analyze_activation(
+            activation, self.layer_name, self.concept, s_indices, targets
+        )
 
         hook_ref = weakref.ref(self)
 

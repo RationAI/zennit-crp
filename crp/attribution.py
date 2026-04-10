@@ -10,6 +10,7 @@ import numpy as np
 import math
 from tqdm import tqdm
 from collections import namedtuple
+from crp.concepts import AttentionHeadConcept
 
 attrResult = namedtuple("AttributionResults", "heatmap, activations, relevances, prediction")
 attrGraphResult = namedtuple("AttributionGraphResults", "nodes, connections")
@@ -673,3 +674,97 @@ class AttributionGraph:
                 connections[(l_name, c_id)].extend([(inp_l, id, rel_c[id].item()) for id in c_ids])
 
         return None
+
+
+class AttentionAttribution(CondAttribution):
+    """
+    Attribution class for Vision Transformer attention heads.
+
+    UNANSWERED QUESTIONS:
+    1. How should heatmap_modifier work for attention layers?
+       - ChannelConcept sums over spatial dims: torch.sum(heatmap, dim=1)
+       - AttentionHeadConcept: should we sum over seq_len and hidden_dim? Or just seq_len?
+       - Current implementation: sums over everything except batch (same as ChannelConcept pattern)
+
+    2. Should we validate hidden_dim is divisible by head_dim (64)?
+       - Current: assumes head_dim=64 (ViT-B/16, ViT-L/16 standard)
+       - Should we make this configurable or validate at runtime?
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        device: torch.device = None,
+        overwrite_data_grad=True,
+        no_param_grad=True,
+    ):
+        """
+        Initialize AttentionHeadAttribution.
+        Uses AttentionHeadConcept.mask as default mask function.
+        """
+
+        super().__init__(model, device, overwrite_data_grad, no_param_grad)
+        # Default to AttentionHeadConcept.mask instead of ChannelConcept.mask
+        self.default_mask = AttentionHeadConcept.mask
+
+    def __call__(
+        self,
+        data: torch.tensor,
+        conditions: List[Dict[str, List]],
+        composite: Composite = None,
+        record_layer: List[str] = [],
+        mask_map: Union[Callable, Dict[str, Callable]] = None,
+        start_layer: str = None,
+        init_rel=None,
+        on_device: str = None,
+        exclude_parallel=True,
+    ) -> attrResult:
+        """
+        Same as CondAttribution.__call__ but with AttentionHeadConcept.mask as default.
+        """
+        if mask_map is None:
+            mask_map = self.default_mask
+
+        return super().__call__(
+            data,
+            conditions,
+            composite,
+            record_layer,
+            mask_map,
+            start_layer,
+            init_rel,
+            on_device,
+            exclude_parallel,
+        )
+
+    def generate(
+        self,
+        data: torch.tensor,
+        conditions: List[Dict[str, List]],
+        composite: Composite = None,
+        record_layer: List[str] = [],
+        mask_map: Union[Callable, Dict[str, Callable]] = None,
+        start_layer: str = None,
+        init_rel=None,
+        on_device=None,
+        exclude_parallel=True,
+        verbose=True,
+    ) -> attrResult:
+        """
+        Same as CondAttribution.generate but with AttentionHeadConcept.mask as default.
+        """
+        if mask_map is None:
+            mask_map = self.default_mask
+
+        return super().generate(
+            data,
+            conditions,
+            composite,
+            record_layer,
+            mask_map,
+            start_layer,
+            init_rel,
+            on_device,
+            exclude_parallel,
+            verbose,
+        )

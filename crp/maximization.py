@@ -15,7 +15,8 @@ class Maximization:
     def __init__(self, mode="relevance", max_target="sum", abs_norm=False, path=None):
 
         self.d_c_sorted, self.rel_c_sorted, self.rf_c_sorted = {}, {}, {}
-        self.SAMPLE_SIZE = 40
+        # None means: keep all collected samples (no top-k truncation).
+        self.SAMPLE_SIZE = None
 
         self.max_target = max_target
         self.abs_norm = abs_norm
@@ -51,8 +52,15 @@ class Maximization:
         targets = torch.Tensor(targets).to(b_c_sorted)
         t_c_sorted = torch.take(targets, b_c_sorted)
 
-        SZ = self.SAMPLE_SIZE
-        self.concatenate_with_results(layer_name, d_c_sorted[:SZ], rel_c_sorted[:SZ], rf_c_sorted[:SZ])
+        if self.SAMPLE_SIZE is None:
+            self.concatenate_with_results(
+                layer_name, d_c_sorted, rel_c_sorted, rf_c_sorted
+            )
+        else:
+            SZ = self.SAMPLE_SIZE
+            self.concatenate_with_results(
+                layer_name, d_c_sorted[:SZ], rel_c_sorted[:SZ], rf_c_sorted[:SZ]
+            )
         self.sort_result_array(layer_name)
 
         return d_c_sorted, rel_c_sorted, rf_c_sorted, t_c_sorted
@@ -77,7 +85,8 @@ class Maximization:
     def sort_result_array(self, layer_name):
 
         d_c_args = torch.flip(torch.argsort(self.rel_c_sorted[layer_name], dim=0), dims=(0,))
-        d_c_args = d_c_args[:self.SAMPLE_SIZE, :]
+        if self.SAMPLE_SIZE is not None:
+            d_c_args = d_c_args[: self.SAMPLE_SIZE, :]
 
         self.rel_c_sorted[layer_name] = torch.gather(self.rel_c_sorted[layer_name], 0, d_c_args)
         self.rf_c_sorted[layer_name] = torch.gather(self.rf_c_sorted[layer_name], 0, d_c_args)
