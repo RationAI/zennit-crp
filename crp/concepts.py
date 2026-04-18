@@ -154,6 +154,52 @@ class AttentionHeadConcept(ChannelConcept):
     Architecture-agnostic: infers head_dim from gradient tensor shape and number of heads.
     """
 
+    _NUM_HEADS_BY_LAYER = {}
+
+    @classmethod
+    def register_num_heads(cls, layer_name: str, num_heads: int):
+        """Register number of attention heads for a specific layer name."""
+
+        if not isinstance(num_heads, int) or num_heads <= 0:
+            raise ValueError("<num_heads> must be a positive integer.")
+        cls._NUM_HEADS_BY_LAYER[layer_name] = num_heads
+
+    @classmethod
+    def register_from_model(cls, model):
+        """
+        Extract and register attention head counts from all named modules in a model.
+        Supports common attribute names used by ViT implementations.
+        """
+
+        for layer_name, module in model.named_modules():
+            for attr_name in ("num_heads", "n_heads", "num_attention_heads"):
+                if hasattr(module, attr_name):
+                    n_heads = getattr(module, attr_name)
+                    if isinstance(n_heads, int) and n_heads > 0:
+                        cls._NUM_HEADS_BY_LAYER[layer_name] = n_heads
+                        break
+
+    @classmethod
+    def _resolve_num_heads(cls, layer_name: str):
+        """
+        Resolve number of heads for layer_name. If not found directly,
+        progressively tries parent module names.
+        """
+
+        if not layer_name:
+            return None
+
+        if layer_name in cls._NUM_HEADS_BY_LAYER:
+            return cls._NUM_HEADS_BY_LAYER[layer_name]
+
+        parts = layer_name.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            parent_name = ".".join(parts[:i])
+            if parent_name in cls._NUM_HEADS_BY_LAYER:
+                return cls._NUM_HEADS_BY_LAYER[parent_name]
+
+        return None
+
     @staticmethod
     def mask(batch_id: int, concept_ids: List, layer_name=None):
         """
@@ -176,17 +222,36 @@ class AttentionHeadConcept(ChannelConcept):
 
         def mask_fct(grad):
 
-            # grad shape: [batch, seq_len, hidden_dim]
-            # Assume standard head dimension of 64 (ViT-B/16, ViT-L/16, etc.)
-            # TODO: universal dimension detection
-            head_dim = 64
+            # grad shape (typically): [batch, seq_len, hidden_dim]
+            hidden_dim = grad[batch_id].shape[-1]
+            num_heads = AttentionHeadConcept._resolve_num_heads(layer_name)
+
+            if num_heads is None:
+                raise ValueError(
+                    f"Could not resolve number of attention heads for layer '{layer_name}'. "
+                    "Register layer head counts via AttentionHeadConcept.register_from_model(model) "
+                    "or AttentionHeadConcept.register_num_heads(layer_name, num_heads)."
+                )
+
+            if hidden_dim % num_heads != 0:
+                raise ValueError(
+                    f"hidden_dim ({hidden_dim}) is not divisible by num_heads ({num_heads}) "
+                    f"for layer '{layer_name}'."
+                )
+
+            head_dim = hidden_dim // num_heads
 
             mask = torch.zeros_like(grad[batch_id])
 
             for head_id in concept_ids:
+                if head_id < 0 or head_id >= num_heads:
+                    raise IndexError(
+                        f"Attention head index {head_id} out of range for layer '{layer_name}' "
+                        f"with {num_heads} heads."
+                    )
                 start = head_id * head_dim
                 end = (head_id + 1) * head_dim
-                mask[:, start:end] = 1
+                mask[..., start:end] = 1
 
             grad[batch_id] = grad[batch_id] * mask
 

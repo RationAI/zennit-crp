@@ -706,6 +706,7 @@ class AttentionAttribution(CondAttribution):
         super().__init__(model, device, overwrite_data_grad, no_param_grad)
         # Default to AttentionHeadConcept.mask instead of ChannelConcept.mask
         self.default_mask = AttentionHeadConcept.mask
+        AttentionHeadConcept.register_from_model(self.model)
 
     def __call__(
         self,
@@ -746,6 +747,7 @@ class AttentionAttribution(CondAttribution):
         mask_map: Union[Callable, Dict[str, Callable]] = None,
         start_layer: str = None,
         init_rel=None,
+        batch_size=10,
         on_device=None,
         exclude_parallel=True,
         verbose=True,
@@ -764,6 +766,7 @@ class AttentionAttribution(CondAttribution):
             mask_map,
             start_layer,
             init_rel,
+            batch_size,
             on_device,
             exclude_parallel,
             verbose,

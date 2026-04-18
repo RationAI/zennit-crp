@@ -11,8 +11,6 @@ class Statistics:
     def __init__(self, mode="relevance", max_target="sum", abs_norm=False, path=None):
 
         self.d_c_sorted, self.rel_c_sorted, self.rf_c_sorted = {}, {}, {}
-        # None means: keep all collected samples (no top-k truncation).
-        self.SAMPLE_SIZE = None
 
         # generate path string for filenames
         if abs_norm:
@@ -80,8 +78,6 @@ class Statistics:
     def sort_result_array(self, layer_name, target):
 
         d_c_args = torch.argsort(self.rel_c_sorted[target][layer_name], dim=0, descending=True)
-        if self.SAMPLE_SIZE is not None:
-            d_c_args = d_c_args[: self.SAMPLE_SIZE, :]
 
         self.rel_c_sorted[target][layer_name] = torch.gather(self.rel_c_sorted[target][layer_name], 0, d_c_args)
         self.rf_c_sorted[target][layer_name] = torch.gather(self.rf_c_sorted[target][layer_name], 0, d_c_args)
