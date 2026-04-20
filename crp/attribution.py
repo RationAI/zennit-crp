@@ -680,15 +680,11 @@ class AttentionAttribution(CondAttribution):
     """
     Attribution class for Vision Transformer attention heads.
 
-    UNANSWERED QUESTIONS:
-    1. How should heatmap_modifier work for attention layers?
-       - ChannelConcept sums over spatial dims: torch.sum(heatmap, dim=1)
-       - AttentionHeadConcept: should we sum over seq_len and hidden_dim? Or just seq_len?
-       - Current implementation: sums over everything except batch (same as ChannelConcept pattern)
-
-    2. Should we validate hidden_dim is divisible by head_dim (64)?
-       - Current: assumes head_dim=64 (ViT-B/16, ViT-L/16 standard)
-       - Should we make this configurable or validate at runtime?
+    Relevance aggregation:
+      - Current implementation: sums or max over whole head (similar to aggregation over kernel in ChannelConcept pattern)
+      - TODO: Future implementation: We will have to modes of relevance aggregation: (1) sum or max over whole head and
+        (2) relevance for each query, key and value vector separately. The latter will be more fine-grained and
+        can be implemented by changing the mask function and the relevance aggregation in the attribute method.
     """
 
     def __init__(
