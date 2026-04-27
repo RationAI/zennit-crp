@@ -458,6 +458,8 @@ class CondAttribution:
     @staticmethod
     def _generate_hook(layer_name, layer_out):
         def get_tensor_hook(module, input, output):
+            if isinstance(output, tuple):
+                output = output[0]
             layer_out[layer_name] = output
             output.retain_grad()
 
@@ -682,9 +684,6 @@ class AttentionAttribution(CondAttribution):
 
     Relevance aggregation:
       - Current implementation: sums or max over whole head (similar to aggregation over kernel in ChannelConcept pattern)
-      - TODO: Future implementation: We will have to modes of relevance aggregation: (1) sum or max over whole head and
-        (2) relevance for each query, key and value vector separately. The latter will be more fine-grained and
-        can be implemented by changing the mask function and the relevance aggregation in the attribute method.
     """
 
     def __init__(
@@ -700,9 +699,9 @@ class AttentionAttribution(CondAttribution):
         """
 
         super().__init__(model, device, overwrite_data_grad, no_param_grad)
-        # Default to AttentionHeadConcept.mask instead of ChannelConcept.mask
-        self.default_mask = AttentionHeadConcept.mask
-        AttentionHeadConcept.register_from_model(self.model)
+        self.head_concept = AttentionHeadConcept()
+        self.head_concept.register_from_model(self.model)
+        self.default_mask = self.head_concept.mask
 
     def __call__(
         self,

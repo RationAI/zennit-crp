@@ -154,18 +154,17 @@ class AttentionHeadConcept(ChannelConcept):
     Architecture-agnostic: infers head_dim from gradient tensor shape and number of heads.
     """
 
-    _NUM_HEADS_BY_LAYER = {}
+    def __init__(self):
+        self._num_heads_by_layer = {}
 
-    @classmethod
-    def register_num_heads(cls, layer_name: str, num_heads: int):
+    def register_num_heads(self, layer_name: str, num_heads: int):
         """Register number of attention heads for a specific layer name."""
 
         if not isinstance(num_heads, int) or num_heads <= 0:
             raise ValueError("<num_heads> must be a positive integer.")
-        cls._NUM_HEADS_BY_LAYER[layer_name] = num_heads
+        self._num_heads_by_layer[layer_name] = num_heads
 
-    @classmethod
-    def register_from_model(cls, model):
+    def register_from_model(self, model):
         """
         Extract and register attention head counts from all named modules in a model.
         Supports common attribute names used by ViT implementations.
@@ -176,11 +175,10 @@ class AttentionHeadConcept(ChannelConcept):
                 if hasattr(module, attr_name):
                     n_heads = getattr(module, attr_name)
                     if isinstance(n_heads, int) and n_heads > 0:
-                        cls._NUM_HEADS_BY_LAYER[layer_name] = n_heads
+                        self._num_heads_by_layer[layer_name] = n_heads
                         break
 
-    @classmethod
-    def _resolve_num_heads(cls, layer_name: str):
+    def _resolve_num_heads(self, layer_name: str):
         """
         Resolve number of heads for layer_name. If not found directly,
         progressively tries parent module names.
@@ -189,19 +187,18 @@ class AttentionHeadConcept(ChannelConcept):
         if not layer_name:
             return None
 
-        if layer_name in cls._NUM_HEADS_BY_LAYER:
-            return cls._NUM_HEADS_BY_LAYER[layer_name]
+        if layer_name in self._num_heads_by_layer:
+            return self._num_heads_by_layer[layer_name]
 
         parts = layer_name.split(".")
         for i in range(len(parts) - 1, 0, -1):
             parent_name = ".".join(parts[:i])
-            if parent_name in cls._NUM_HEADS_BY_LAYER:
-                return cls._NUM_HEADS_BY_LAYER[parent_name]
+            if parent_name in self._num_heads_by_layer:
+                return self._num_heads_by_layer[parent_name]
 
         return None
 
-    @staticmethod
-    def mask(batch_id: int, concept_ids: List, layer_name=None):
+    def mask(self, batch_id: int, concept_ids: List, layer_name=None):
         """
         Wrapper that generates a function which masks attention head dimensions
         in the gradient tensor.
@@ -224,13 +221,13 @@ class AttentionHeadConcept(ChannelConcept):
 
             # grad shape (typically): [batch, seq_len, hidden_dim]
             hidden_dim = grad[batch_id].shape[-1]
-            num_heads = AttentionHeadConcept._resolve_num_heads(layer_name)
+            num_heads = self._resolve_num_heads(layer_name)
 
             if num_heads is None:
                 raise ValueError(
                     f"Could not resolve number of attention heads for layer '{layer_name}'. "
-                    "Register layer head counts via AttentionHeadConcept.register_from_model(model) "
-                    "or AttentionHeadConcept.register_num_heads(layer_name, num_heads)."
+                    "Register layer head counts via head_concept.register_from_model(model) "
+                    "or head_concept.register_num_heads(layer_name, num_heads)."
                 )
 
             if hidden_dim % num_heads != 0:
@@ -258,3 +255,22 @@ class AttentionHeadConcept(ChannelConcept):
             return grad
 
         return mask_fct
+
+    def attribute(self, relevance, mask=None, layer_name: str = None, abs_norm=True):
+
+        if isinstance(mask, torch.Tensor):
+            relevance = relevance * mask
+
+        num_heads = self._resolve_num_heads(layer_name) if layer_name else None
+
+        if num_heads is not None and relevance.dim() == 3:
+            batch, seq_len, hidden_dim = relevance.shape
+            head_dim = hidden_dim // num_heads
+            rel_l = relevance.view(batch, seq_len, num_heads, head_dim).sum(dim=(1, 3))
+        else:
+            rel_l = torch.sum(relevance.view(*relevance.shape[:2], -1), dim=-1)
+
+        if abs_norm:
+            rel_l = rel_l / (torch.abs(rel_l).sum(-1).view(-1, 1) + 1e-10)
+
+        return rel_l

@@ -83,15 +83,16 @@ class FeatVisHook:
         s_indices = self.dict_inputs["sample_indices"]
         targets = self.dict_inputs["targets"]
 
-        if isinstance(output, tuple):
-            output_tensor = output[0]
-        else:
-            output_tensor = output
+        if not isinstance(output, tuple):
+            output = (output,)
 
+        # Only output[0] is analyzed: it is the primary activation tensor.
+        # Secondary outputs (e.g. attention weights, key/value caches) are intentionally skipped
+        # because calling analyze_activation multiple times with the same layer_name would corrupt stats.
         activation = (
-            output_tensor.detach().to(self.on_device)
+            output[0].detach().to(self.on_device)
             if self.on_device
-            else output_tensor.detach()
+            else output[0].detach()
         )
         self.FV.analyze_activation(
             activation, self.layer_name, self.concept, s_indices, targets
@@ -101,10 +102,14 @@ class FeatVisHook:
 
         @functools.wraps(self.backward)
         def wrapper(grad):
-            return hook_ref().backward(module, grad)
-
-        if not isinstance(output, tuple):
-            output = (output,)
+            # Handle tuple grads (multi-output gradient functions) same as MaskHook.
+            if isinstance(grad, tuple):
+                for g in grad:
+                    if g is not None:
+                        hook_ref().backward(module, g)
+            else:
+                hook_ref().backward(module, grad)
+            return grad
 
         if output[0].grad_fn is not None:
             # only if gradient required
