@@ -241,17 +241,19 @@ class AttentionHeadConcept(ChannelConcept):
 
             head_dim = hidden_dim // num_heads
 
-            mask = torch.zeros_like(grad[batch_id])
-
-            for head_id in concept_ids:
-                if head_id < 0 or head_id >= num_heads:
+            if concept_ids:
+                min_id, max_id = min(concept_ids), max(concept_ids)
+                if min_id < 0 or max_id >= num_heads:
+                    bad = next(h for h in concept_ids if h < 0 or h >= num_heads)
                     raise IndexError(
-                        f"Attention head index {head_id} out of range for layer '{layer_name}' "
+                        f"Attention head index {bad} out of range for layer '{layer_name}' "
                         f"with {num_heads} heads."
                     )
-                start = head_id * head_dim
-                end = (head_id + 1) * head_dim
-                mask[..., start:end] = 1
+
+            ids = torch.tensor(concept_ids, device=grad.device)
+            head_mask = torch.zeros(num_heads, device=grad.device, dtype=grad.dtype)
+            head_mask[ids] = 1
+            mask = head_mask.repeat_interleave(head_dim)  # [hidden_dim]
 
             grad[batch_id] = grad[batch_id] * mask
 
