@@ -265,7 +265,7 @@ def _patched_basic_hook_forward(self, module, input, output):
 
 def _patched_basic_hook_backward(self, module, grad_input, grad_output):
     """Backward hook: implement gradient*input LRP framework for transformers."""
-    from zennit.core import ParamMod, stabilize
+    from zennit.core import mod_params, stabilize
 
     if len(grad_output) != 1:
         raise NotImplementedError("Only single output supported for now!")
@@ -279,7 +279,9 @@ def _patched_basic_hook_backward(self, module, grad_input, grad_output):
         self.input_modifiers, self.param_modifiers, self.output_modifiers
     ):
         inp = in_mod(original_input).requires_grad_()
-        with ParamMod.ensure(param_mod)(module) as modified, torch.autograd.enable_grad():
+        _mod = param_mod if param_mod is not None else lambda p, _: p
+        _keys = [] if param_mod is None else None
+        with mod_params(module, _mod, param_keys=_keys) as modified, torch.autograd.enable_grad():
             out = modified.forward(inp)
             out = out_mod(out)
         inputs.append(inp)
