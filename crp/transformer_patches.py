@@ -166,7 +166,6 @@ def patch_attention(module):
     new_fwd = wrap_attention_forward(module.eager_attention_forward)
     if _check_already_patched(module.eager_attention_forward, new_fwd):
         return False
-    module.eager_attention_forward = new_fwd
 
     new_map = {}
     for key, value in module.ALL_ATTENTION_FUNCTIONS.items():
@@ -174,6 +173,8 @@ def patch_attention(module):
         if _check_already_patched(value, wrapped):
             return False
         new_map[key] = wrapped
+
+    module.eager_attention_forward = new_fwd
     module.ALL_ATTENTION_FUNCTIONS = new_map
     return True
 
@@ -205,13 +206,16 @@ def patch_cp_attention(module):
     new_fwd = cp_wrap_attention_forward(module.eager_attention_forward)
     if _check_already_patched(module.eager_attention_forward, new_fwd):
         return False
-    module.eager_attention_forward = new_fwd
 
+    new_map = {}
     for key, value in module.ALL_ATTENTION_FUNCTIONS.items():
         wrapped = cp_wrap_attention_forward(value)
         if _check_already_patched(value, wrapped):
             return False
-        module.ALL_ATTENTION_FUNCTIONS[key] = wrapped
+        new_map[key] = wrapped
+
+    module.eager_attention_forward = new_fwd
+    module.ALL_ATTENTION_FUNCTIONS = new_map
     return True
 
 
@@ -263,7 +267,8 @@ def _patched_basic_hook_backward(self, module, grad_input, grad_output):
     """Backward hook: implement gradient*input LRP framework for transformers."""
     from zennit.core import ParamMod, stabilize
 
-    assert len(grad_output) == 1, "Only single output supported for now!"
+    if len(grad_output) != 1:
+        raise NotImplementedError("Only single output supported for now!")
     grad_output = (grad_output[0] * self.stored_tensors["output"],)
     grad_output[0].requires_grad = True
 
