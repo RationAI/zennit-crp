@@ -2,6 +2,28 @@
 
 Branch: `transformer-multi-concept` (off `transformer` by Jiri Hofirek). PR target: `main`/`master` (TBC).
 
+## Added in this branch (vs. `transformer`)
+
+- `crp/attention_concepts.py` — `_BaseAttentionConcept` + four granularities
+  (`HeadConcept`, `KQVConcept`, `KQVHeadConcept`, `HeadDimConcept`), all
+  hooking the same named tap (`attn.qkv_tap`).
+- `crp/transformer_patches.py` — `inject_qkv_taps`, `timm_attention_forward`,
+  `prepare_timm_vit`, plus a `default_map` entry for `timm.vision_transformer`.
+- `tests/test_attention_concepts.py` — pure-tensor unit tests for mask shape,
+  aggregation axes, conservation, registration.
+- `tests/test_vit_integration.py` — end-to-end ViT integration tests
+  (`importorskip` timm and zennit).
+- `tutorials/vit_crp/demo.py` — comparative-heatmap demo across the four
+  granularities, top-k by per-concept relevance under a target class.
+- `tutorials/vit_crp/metrics.py` — deletion / insertion AUC faithfulness
+  metrics with a random-concept baseline.
+- `tutorials/vit_crp/README.md` — usage and roadmap.
+- `pyproject.toml` — relaxed dep pins for uv-based dev workflow.
+- `CURRENT_STATE.md`, `IMPLEMENTATION_PLAN.md` — this and the plan.
+
+The legacy `crp.concepts.AttentionHeadConcept` is intentionally untouched;
+its semantic-correctness divergence is documented in this file.
+
 ## What exists on `transformer` branch
 
 ### POC: attention-head as concept detector

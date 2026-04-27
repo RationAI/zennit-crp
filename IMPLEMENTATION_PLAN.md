@@ -2,6 +2,12 @@
 
 End-to-end plan for the `transformer-multi-concept` branch. Phases sequence; sub-tasks within a phase may parallelise.
 
+> **Status (2026-04-27)**: Phases 0 (partial — env setup deferred to glibc host),
+> 1 (refactor), 2 (KQV concept), 3 (HeadDim concept), 4 (visualisation),
+> 5 (faithfulness metrics + random baseline) are **implemented**. Still TODO:
+> γ-LRP composite (Phase 1 step 5), stability metric, localisation metric, README
+> integration, PR open.
+
 Conventions:
 - Target ViT: `timm`'s `vit_base_patch16_224` (or HF `google/vit-base-patch16-224`). `attn` modules expose `qkv` (fused `Linear(D, 3D)`), `proj` (output `Linear(D, D)`), `num_heads`, `head_dim`.
 - Hyperparameter defaults: ε=1e-6, γ=0.25 for ViT-Linear (Phase 1), uniform factors (4, 4, 2) for (Q, K, V), abs_norm=True in `Concept.attribute`.

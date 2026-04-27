@@ -174,6 +174,31 @@ Basic tests are implemented with [`pytest`](https://docs.pytest.org/).
 
 We are open to any improvements (:
 
+## Vision-Transformer Extensions (RationAI fork)
+
+This fork extends CRP to vision transformers (ViT) with four concept-detector
+granularities, all hooking the same named tap (`attn.qkv_tap`):
+
+| Concept class       | Granularity                                          | `attribute()` shape           |
+|---------------------|------------------------------------------------------|-------------------------------|
+| `HeadConcept`       | one concept per attention head                       | `(B, num_heads)`              |
+| `KQVConcept`        | three concepts per block (whole Q / K / V)           | `(B, 3)`                      |
+| `KQVHeadConcept`    | per `(part, head)` — `3 × num_heads`                 | `(B, 3, num_heads)`           |
+| `HeadDimConcept`    | per `(part, head, dim)` — `3 × num_heads × head_dim` | `(B, 3, num_heads, head_dim)` |
+
+The four classes live in [`crp/attention_concepts.py`](crp/attention_concepts.py).
+Setup, demo, and quantitative comparison are documented in
+[`tutorials/vit_crp/README.md`](tutorials/vit_crp/README.md). Audit findings
+about the legacy POC and the roadmap for follow-up work are in
+[`CURRENT_STATE.md`](CURRENT_STATE.md) and
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
+
+Theory references: AttnLRP (Achtibat et al., ICML 2024;
+[arXiv 2402.05602](https://arxiv.org/abs/2402.05602)) and PA-LRP (Bakish et
+al., NeurIPS 2025; [arXiv 2506.02138](https://arxiv.org/abs/2506.02138)) on
+top of CRP (Achtibat et al., Nature MI 2023;
+[arXiv 2206.03208](https://arxiv.org/abs/2206.03208)).
+
 ## License
 
 BSD 3-Clause Clear License
