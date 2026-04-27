@@ -105,28 +105,36 @@ class TestEndToEndShapes:
         c.register_from_model(patched_vit)
         conditions = [{self.LAYER_NAME: [0], "y": [42]}]  # head 0, target class 42
         result = _attribute(patched_vit, c, conditions, img_batch)
-        assert result.heatmap.shape == img_batch.shape[1:]  # (3, 224, 224)
+        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        B, _, H, W = img_batch.shape
+        assert result.heatmap.shape == (B, H, W)
 
     def test_kqv_concept(self, patched_vit, img_batch):
         c = KQVConcept()
         c.register_from_model(patched_vit)
         conditions = [{self.LAYER_NAME: ["q"], "y": [42]}]
         result = _attribute(patched_vit, c, conditions, img_batch)
-        assert result.heatmap.shape == img_batch.shape[1:]
+        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        B, _, H, W = img_batch.shape
+        assert result.heatmap.shape == (B, H, W)
 
     def test_kqv_head_concept(self, patched_vit, img_batch):
         c = KQVHeadConcept()
         c.register_from_model(patched_vit)
         conditions = [{self.LAYER_NAME: [("k", 1)], "y": [42]}]
         result = _attribute(patched_vit, c, conditions, img_batch)
-        assert result.heatmap.shape == img_batch.shape[1:]
+        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        B, _, H, W = img_batch.shape
+        assert result.heatmap.shape == (B, H, W)
 
     def test_head_dim_concept(self, patched_vit, img_batch):
         c = HeadDimConcept()
         c.register_from_model(patched_vit)
         conditions = [{self.LAYER_NAME: [("v", 0, 0)], "y": [42]}]
         result = _attribute(patched_vit, c, conditions, img_batch)
-        assert result.heatmap.shape == img_batch.shape[1:]
+        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        B, _, H, W = img_batch.shape
+        assert result.heatmap.shape == (B, H, W)
 
 
 # ── per-concept relevance shapes ──────────────────────────────────────────────

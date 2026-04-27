@@ -45,7 +45,6 @@ from crp.attention_concepts import (
     PARTS,
 )
 from crp.attribution import CondAttribution
-from crp.image import imgify
 from crp.transformer_patches import prepare_timm_vit
 
 
@@ -156,12 +155,24 @@ def conditional_heatmap(
     return heatmap.detach().cpu().numpy()
 
 
+def _denormalize(image: torch.Tensor, model: torch.nn.Module) -> np.ndarray:
+    """Reverse the timm preprocessing transform for display."""
+    cfg = resolve_data_config({}, model=model)
+    mean = torch.tensor(cfg["mean"]).view(1, -1, 1, 1)
+    std = torch.tensor(cfg["std"]).view(1, -1, 1, 1)
+    img = image.detach().cpu()
+    img = img * std + mean
+    img = img.clamp(0, 1)[0].permute(1, 2, 0).numpy()
+    return img
+
+
 def make_figure(
     image: torch.Tensor,
     rows: dict,
     out_path: Path,
     layer_name: str,
     target_class: int,
+    model: torch.nn.Module,
 ):
     """rows: {concept_def_name: [(label, heatmap_np), ...]}"""
     n_cols = max(len(items) for items in rows.values()) + 1  # +1 for input image col
@@ -170,7 +181,7 @@ def make_figure(
     if n_rows == 1:
         axes = np.array([axes])
 
-    img_pil = imgify(image[0].detach().cpu(), denormalize=True)
+    img_pil = _denormalize(image, model)
 
     for r, (name, items) in enumerate(rows.items()):
         axes[r, 0].imshow(img_pil)
@@ -262,7 +273,7 @@ def main():
         rows[name] = items
 
     out_path = Path(args.out)
-    make_figure(data, rows, out_path, layer_name, args.target_class)
+    make_figure(data, rows, out_path, layer_name, args.target_class, model)
 
 
 if __name__ == "__main__":

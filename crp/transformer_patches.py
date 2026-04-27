@@ -358,8 +358,12 @@ def inject_qkv_taps(model):
     return tapped
 
 
-def timm_attention_forward(self, x):
+def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
     """Patched timm ``Attention.forward`` for AttnLRP + concept hooking.
+
+    Tracks the upstream timm ``Attention.forward`` signature
+    (``x, attn_mask=None, is_causal=False``) so it remains a drop-in
+    replacement across timm versions ≥ 1.0.
 
     Differences from upstream timm forward:
 
@@ -381,33 +385,55 @@ def timm_attention_forward(self, x):
         # named-resolvable in this case but forward still runs correctly.
         self.qkv_tap = nn.Identity()
 
-    B, N, C = x.shape
-    qkv_flat = self.qkv(x)              # (B, N, 3*C)
+    B, N, _ = x.shape
+    qkv_flat = self.qkv(x)              # (B, N, 3*num_heads*head_dim)
     qkv_flat = self.qkv_tap(qkv_flat)   # ← hook tap
     qkv = qkv_flat.reshape(B, N, 3, self.num_heads, self.head_dim).permute(
         2, 0, 3, 1, 4
     )                                   # (3, B, H, N, d_h)
     q, k, v = qkv.unbind(0)
-
-    if hasattr(self, "q_norm"):
-        q = self.q_norm(q)
-    if hasattr(self, "k_norm"):
-        k = self.k_norm(k)
+    q, k = self.q_norm(q), self.k_norm(k)
 
     # AttnLRP uniform rule on the two bilinears (QK^T and attn·V).
     q = divide_gradient(q, 4)
     k = divide_gradient(k, 4)
     v = divide_gradient(v, 2)
 
-    attn = (q @ k.transpose(-2, -1)) * self.scale
-    attn = attn.softmax(dim=-1)
-    if hasattr(self, "attn_drop"):
-        attn = self.attn_drop(attn)
+    q = q * self.scale
+    attn = q @ k.transpose(-2, -1)
 
-    x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+    # Apply optional attention mask / causal bias the same way timm does.
+    try:
+        from timm.models.vision_transformer import (
+            resolve_self_attn_mask,
+            maybe_add_mask,
+        )
+        attn_bias = resolve_self_attn_mask(N, attn, attn_mask, is_causal)
+        attn = maybe_add_mask(attn, attn_bias)
+    except ImportError:
+        # Older timm without these helpers — fall back to a direct add.
+        if attn_mask is not None:
+            attn = attn + attn_mask
+        if is_causal:
+            mask = torch.triu(
+                torch.full((N, N), float("-inf"), device=attn.device, dtype=attn.dtype),
+                diagonal=1,
+            )
+            attn = attn + mask
+
+    attn = attn.softmax(dim=-1)
+    attn = self.attn_drop(attn)
+    x = attn @ v
+
+    # Reshape back. Newer timm exposes ``attn_dim`` (== num_heads*head_dim and
+    # generally == embed_dim, but kept distinct to support architectures with
+    # head_dim ≠ embed_dim/num_heads). Older timm uses C, the input feature dim.
+    out_dim = getattr(self, "attn_dim", self.num_heads * self.head_dim)
+    x = x.transpose(1, 2).reshape(B, N, out_dim)
+    if hasattr(self, "norm"):
+        x = self.norm(x)
     x = self.proj(x)
-    if hasattr(self, "proj_drop"):
-        x = self.proj_drop(x)
+    x = self.proj_drop(x)
     return x
 
 
