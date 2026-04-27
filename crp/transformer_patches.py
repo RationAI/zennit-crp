@@ -320,6 +320,114 @@ def monkey_patch_zennit(verbose=False):
             print(f"Patched Zennit BasicHook's {name}")
 
 
+# ─── timm ViT Attention Patch ─────────────────────────────────────────────────
+
+
+def inject_qkv_taps(model):
+    """Insert ``qkv_tap = nn.Identity()`` into every timm-style ``Attention``
+    submodule of ``model``.
+
+    The tap is the named hook point used by :class:`crp.attention_concepts._BaseAttentionConcept`
+    and its subclasses (HeadConcept, KQVConcept, KQVHeadConcept, HeadDimConcept).
+    Its output is the post-``qkv``-Linear pre-attention tensor of shape
+    ``(B, N, 3*num_heads*head_dim)``, with layout ``[Q | K | V]`` along the last
+    axis (and contiguous head-stripes within each part).
+
+    Detection: a module qualifies as timm-style ``Attention`` iff it exposes
+    ``qkv`` (a Linear), ``num_heads``, and ``head_dim``. Idempotent — re-injection
+    is a no-op when ``qkv_tap`` is already an ``nn.Identity``.
+
+    Returns the list of ``(name, module)`` pairs that were tapped.
+    """
+    import torch.nn as nn
+
+    tapped = []
+    for name, module in model.named_modules():
+        if (
+            hasattr(module, "qkv")
+            and isinstance(getattr(module, "qkv"), nn.Linear)
+            and hasattr(module, "num_heads")
+            and hasattr(module, "head_dim")
+        ):
+            existing = getattr(module, "qkv_tap", None)
+            if existing is None:
+                module.qkv_tap = nn.Identity()
+            elif not isinstance(existing, nn.Identity):
+                continue
+            tapped.append((name, module))
+    return tapped
+
+
+def timm_attention_forward(self, x):
+    """Patched timm ``Attention.forward`` for AttnLRP + concept hooking.
+
+    Differences from upstream timm forward:
+
+    * After ``self.qkv(x)`` and before the reshape, the tensor is passed
+      through ``self.qkv_tap`` (created by :func:`inject_qkv_taps`). This is
+      the named hook point for HeadConcept / KQVConcept / KQVHeadConcept /
+      HeadDimConcept.
+    * Q, K, V each pass through :func:`divide_gradient` (factors 4, 4, 2)
+      to implement AttnLRP's uniform rule for the bilinear ``QK^T`` and
+      attention-weighted-V matmuls (Eq. 14–15 of arXiv:2402.05602).
+    * The fused ``F.scaled_dot_product_attention`` path is bypassed in favour
+      of the explicit softmax + matmul path so the autograd graph contains
+      the operations whose backward LRP rules apply.
+    """
+    import torch.nn as nn
+
+    if not hasattr(self, "qkv_tap"):
+        # Lazy creation; user did not run inject_qkv_taps. Hooks won't be
+        # named-resolvable in this case but forward still runs correctly.
+        self.qkv_tap = nn.Identity()
+
+    B, N, C = x.shape
+    qkv_flat = self.qkv(x)              # (B, N, 3*C)
+    qkv_flat = self.qkv_tap(qkv_flat)   # ← hook tap
+    qkv = qkv_flat.reshape(B, N, 3, self.num_heads, self.head_dim).permute(
+        2, 0, 3, 1, 4
+    )                                   # (3, B, H, N, d_h)
+    q, k, v = qkv.unbind(0)
+
+    if hasattr(self, "q_norm"):
+        q = self.q_norm(q)
+    if hasattr(self, "k_norm"):
+        k = self.k_norm(k)
+
+    # AttnLRP uniform rule on the two bilinears (QK^T and attn·V).
+    q = divide_gradient(q, 4)
+    k = divide_gradient(k, 4)
+    v = divide_gradient(v, 2)
+
+    attn = (q @ k.transpose(-2, -1)) * self.scale
+    attn = attn.softmax(dim=-1)
+    if hasattr(self, "attn_drop"):
+        attn = self.attn_drop(attn)
+
+    x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+    x = self.proj(x)
+    if hasattr(self, "proj_drop"):
+        x = self.proj_drop(x)
+    return x
+
+
+def prepare_timm_vit(model, verbose=False):
+    """One-shot setup for a timm ViT: inject taps, monkey-patch the timm
+    ``vision_transformer`` module, and patch zennit's ``BasicHook``.
+
+    After this call, the model is ready for CRP attribution with any of the
+    concept classes in :mod:`crp.attention_concepts`.
+    """
+    from timm.models import vision_transformer as timm_vit
+
+    tapped = inject_qkv_taps(model)
+    monkey_patch(timm_vit, verbose=verbose)
+    monkey_patch_zennit(verbose=verbose)
+    if verbose:
+        print(f"Injected qkv_tap into {len(tapped)} attention modules.")
+    return tapped
+
+
 # ─── Default Patch Maps ───────────────────────────────────────────────────────
 
 
@@ -340,6 +448,23 @@ def _build_default_map():
             nn.MultiheadAttention: partial(
                 patch_method, cp_multi_head_attention_forward, keep_original=True
             ),
+        }
+    except ImportError:
+        pass
+
+    # ViT (timm) — exposes attn.qkv as a separate Linear, enabling
+    # qkv_tap-based concept hooks (HeadConcept, KQVConcept, KQVHeadConcept,
+    # HeadDimConcept). See crp/attention_concepts.py.
+    try:
+        import torch.nn as nn
+        from timm.models import vision_transformer as timm_vit
+        from timm.models.vision_transformer import Attention as TimmAttention
+
+        default_map[timm_vit] = {
+            nn.GELU: partial(patch_method, non_linear_forward, keep_original=True),
+            nn.LayerNorm: partial(patch_method, layer_norm_forward),
+            nn.Dropout: partial(patch_method, dropout_forward),
+            TimmAttention: partial(patch_method, timm_attention_forward),
         }
     except ImportError:
         pass
