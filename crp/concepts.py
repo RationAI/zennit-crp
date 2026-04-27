@@ -225,15 +225,18 @@ class AttentionHeadConcept(ChannelConcept):
 
             if num_heads is None:
                 raise ValueError(
-                    f"Could not resolve number of attention heads for layer '{layer_name}'. "
-                    "Register layer head counts via head_concept.register_from_model(model) "
-                    "or head_concept.register_num_heads(layer_name, num_heads)."
+                    f"AttentionHeadConcept: could not resolve num_heads for layer '{layer_name}'. "
+                    "Call register_from_model(model) or register_num_heads(layer_name, num_heads) "
+                    "before running attribution."
                 )
 
             if hidden_dim % num_heads != 0:
                 raise ValueError(
-                    f"hidden_dim ({hidden_dim}) is not divisible by num_heads ({num_heads}) "
-                    f"for layer '{layer_name}'."
+                    f"AttentionHeadConcept: hidden_dim ({hidden_dim}) not divisible by "
+                    f"num_heads ({num_heads}) for layer '{layer_name}'. "
+                    "This likely means a gradient with an unexpected layout reached the mask "
+                    "(e.g. attention weights instead of the projected output). "
+                    "Verify registration via register_from_model() or register_num_heads()."
                 )
 
             head_dim = hidden_dim // num_heads
