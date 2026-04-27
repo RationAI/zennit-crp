@@ -269,8 +269,8 @@ def _patched_basic_hook_backward(self, module, grad_input, grad_output):
 
     if len(grad_output) != 1:
         raise NotImplementedError("Only single output supported for now!")
-    grad_output = (grad_output[0] * self.stored_tensors["output"],)
-    grad_output[0].requires_grad = True
+    orig_grad = grad_output[0]
+    grad_out_leaf = (orig_grad * self.stored_tensors["output"]).detach().requires_grad_(orig_grad.requires_grad)
 
     original_input = self.stored_tensors["input"][0].clone()
     inputs = []
@@ -287,12 +287,12 @@ def _patched_basic_hook_backward(self, module, grad_input, grad_output):
         inputs.append(inp)
         outputs.append(out)
 
-    grad_outputs = self.gradient_mapper(grad_output[0], outputs)
+    grad_outputs = self.gradient_mapper(grad_out_leaf, outputs)
     gradients = torch.autograd.grad(
         outputs,
         inputs,
         grad_outputs=grad_outputs,
-        create_graph=grad_output[0].requires_grad,
+        create_graph=orig_grad.requires_grad,
     )
     relevance = self.reducer(inputs, gradients)
     relevance = relevance / stabilize(original_input, epsilon=1e-10)
