@@ -1,6 +1,14 @@
 ### zennit-crp
 tests/results/
 
+### vit_crp tutorial artifacts (downloaded data + computed indices)
+tutorials/vit_crp/data/
+tutorials/vit_crp/FeatureVisualization/
+tutorials/vit_crp/FeatureVisualization_smoke/
+
+### uv (uv.lock is committed for reproducibility)
+.python-version
+
 ### VSCODE
 .vscode
 

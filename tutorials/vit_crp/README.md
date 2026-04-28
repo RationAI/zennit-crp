@@ -15,14 +15,47 @@ by `inject_qkv_taps`) so they can be compared on equal footing.
 
 ## Setup
 
+Dependencies are managed with `uv`. From the repo root:
+
 ```bash
-uv venv --python 3.11
-uv pip install -e ".[vit,dev]"
+uv sync --extra vit --extra dev --extra notebook
 ```
 
-The `vit` extra adds `timm` and `transformers`; `dev` adds `pytest`.
+The optional extras: `vit` pulls in `timm` and `transformers`; `dev` adds
+`pytest`/`ruff`; `notebook` adds Jupyter and `torchvision` (used by the
+walkthrough notebook for its dataset wrapper).
 
-## Demo: comparative heatmaps
+To add a new dependency, prefer `uv add`:
+
+```bash
+uv add some-package                # runtime dep
+uv add --optional dev some-package # dev-only
+```
+
+`uv sync` then re-resolves and rewrites `uv.lock`, which is committed for
+reproducibility.
+
+## Walkthrough notebook (start here)
+
+[`walkthrough.ipynb`](walkthrough.ipynb) is the recommended entry point. It:
+
+1. Downloads an Imagenette subset (~98 MB) — real ImageNet images, ten
+   classes, mapped back to ImageNet-1k indices.
+2. Builds a `FeatureVisualization` index for each of the four concept
+   granularities, all hooking the same `qkv_tap`.
+3. For one target image, ranks each granularity's concepts by relevance
+   under the true class, then displays top-k reference samples and
+   conditional heatmaps.
+
+Defaults to `vit_base_patch16_224` and 64 indexed images. The first cell of
+section 2 is the only place you should need to override (model / sample
+count / device).
+
+The notebook source lives in [`_build_notebook.py`](_build_notebook.py) for
+reviewable diffs; re-emit `walkthrough.ipynb` with
+`uv run python tutorials/vit_crp/_build_notebook.py`.
+
+## Standalone demo (CLI): comparative heatmaps
 
 `demo.py` runs the four concept granularities on a single image, picks the
 top-`k` concepts per granularity (ranked by absolute relevance under the

@@ -187,11 +187,19 @@ granularities, all hooking the same named tap (`attn.qkv_tap`):
 | `HeadDimConcept`    | per `(part, head, dim)` — `3 × num_heads × head_dim` | `(B, 3, num_heads, head_dim)` |
 
 The four classes live in [`crp/attention_concepts.py`](crp/attention_concepts.py).
-Setup, demo, and quantitative comparison are documented in
-[`tutorials/vit_crp/README.md`](tutorials/vit_crp/README.md). Audit findings
-about the legacy POC and the roadmap for follow-up work are in
-[`CURRENT_STATE.md`](CURRENT_STATE.md) and
+The recommended entry point is the
+[**walkthrough notebook**](tutorials/vit_crp/walkthrough.ipynb), which
+covers setup, Imagenette download, FeatureVisualization indexing, and a
+side-by-side comparison of the four granularities on a target image.
+Setup, CLI demo, and the quantitative deletion/insertion-AUC benchmark are
+documented in [`tutorials/vit_crp/README.md`](tutorials/vit_crp/README.md).
+Audit findings about the legacy POC and the roadmap for follow-up work are
+in [`CURRENT_STATE.md`](CURRENT_STATE.md) and
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
+
+Dependencies are managed with [`uv`](https://docs.astral.sh/uv/) — see
+`pyproject.toml` (extras: `vit`, `dev`, `notebook`, `fast_img`). The lockfile
+`uv.lock` is committed for reproducibility.
 
 Theory references: AttnLRP (Achtibat et al., ICML 2024;
 [arXiv 2402.05602](https://arxiv.org/abs/2402.05602)) and PA-LRP (Bakish et
