@@ -125,10 +125,19 @@ class _BaseAttentionConcept(ChannelConcept):
     ) -> List[slice]:
         raise NotImplementedError
 
+    def _per_token_relevance(
+        self, relevance: torch.Tensor, num_heads: int, head_dim: int
+    ) -> torch.Tensor:
+        """Reshape ``(B, N, 3*D)`` to ``(B, N, *concept_axes)`` — per-token,
+        per-concept-id relevance. Used by both :meth:`_aggregate` (which sums
+        out the sequence dim) and :meth:`reference_sampling` (which keeps it
+        for receptive-field neuron lookup)."""
+        raise NotImplementedError
+
     def _aggregate(
         self, relevance: torch.Tensor, num_heads: int, head_dim: int
     ) -> torch.Tensor:
-        raise NotImplementedError
+        return self._per_token_relevance(relevance, num_heads, head_dim).sum(dim=1)
 
     # ── mask ──────────────────────────────────────────────────────────────────
 
@@ -178,6 +187,50 @@ class _BaseAttentionConcept(ChannelConcept):
 
         return rel_l
 
+    # ── FeatureVisualization compatibility ────────────────────────────────────
+
+    def reference_sampling(
+        self,
+        relevance: torch.Tensor,
+        layer_name: str = None,
+        max_target: str = "sum",
+        abs_norm: bool = True,
+    ):
+        """Sort the batch dim by per-concept relevance — required by
+        :class:`crp.maximization.Maximization` (and therefore
+        :class:`crp.visualization.FeatureVisualization`).
+
+        Returns ``(d_c_sorted, rel_c_sorted, rf_c_sorted)`` each of shape
+        ``(batch, num_concepts)``, where ``num_concepts`` is the row-major
+        flatten of the concept axes (matching the layout of
+        :meth:`attribute`). ``rf_c_sorted`` holds, per (sample-rank, concept),
+        the **token (sequence) index** at which the concept's relevance peaks
+        — the closest analogue of the "receptive field neuron" used by
+        :class:`~crp.concepts.ChannelConcept` for 2D conv layers.
+        """
+        num_heads, head_dim = self._resolve_dims(layer_name)
+        B = relevance.shape[0]
+        rel_pt = self._per_token_relevance(relevance, num_heads, head_dim)
+        N = rel_pt.shape[1]
+        flat = rel_pt.reshape(B, N, -1)  # (B, N, num_concepts)
+
+        rf_neuron = torch.argmax(flat, dim=1)  # (B, num_concepts)
+
+        if max_target == "sum":
+            rel_c = flat.sum(dim=1)
+        elif max_target == "max":
+            rel_c = torch.gather(flat, 1, rf_neuron.unsqueeze(1)).squeeze(1)
+        else:
+            raise ValueError("'max_target' supports only 'max' or 'sum'.")
+
+        if abs_norm:
+            rel_c = rel_c / (rel_c.abs().sum(-1, keepdim=True) + 1e-10)
+
+        d_c_sorted = torch.argsort(rel_c, dim=0, descending=True)
+        rel_c_sorted = torch.gather(rel_c, 0, d_c_sorted)
+        rf_c_sorted = torch.gather(rf_neuron, 0, d_c_sorted)
+        return d_c_sorted, rel_c_sorted, rf_c_sorted
+
 
 # ── (A) head as concept ──────────────────────────────────────────────────────
 
@@ -212,10 +265,10 @@ class HeadConcept(_BaseAttentionConcept):
             slice(2 * D + s, 2 * D + e),
         ]
 
-    def _aggregate(self, relevance, num_heads, head_dim):
+    def _per_token_relevance(self, relevance, num_heads, head_dim):
         B, N, _ = relevance.shape
         rel = relevance.view(B, N, 3, num_heads, head_dim)
-        return rel.sum(dim=(1, 2, 4))  # -> (B, num_heads)
+        return rel.sum(dim=(2, 4))  # -> (B, N, num_heads)
 
 
 # ── (B1) whole Q / K / V as a concept ────────────────────────────────────────
@@ -243,11 +296,11 @@ class KQVConcept(_BaseAttentionConcept):
         offset = PART_OFFSETS[part] * D
         return [slice(offset, offset + D)]
 
-    def _aggregate(self, relevance, num_heads, head_dim):
+    def _per_token_relevance(self, relevance, num_heads, head_dim):
         B, N, _ = relevance.shape
         D = num_heads * head_dim
         rel = relevance.view(B, N, 3, D)
-        return rel.sum(dim=(1, 3))  # -> (B, 3)
+        return rel.sum(dim=3)  # -> (B, N, 3)
 
 
 # ── (B2) per-head Q / K / V — a (part, head) concept ─────────────────────────
@@ -263,11 +316,20 @@ class KQVHeadConcept(_BaseAttentionConcept):
     """
 
     def _concept_to_slices(self, concept_id, num_heads, head_dim):
-        if not isinstance(concept_id, (tuple, list)) or len(concept_id) != 2:
+        if isinstance(concept_id, (int, np.integer)):
+            # Flat index in row-major (3, num_heads): part = i // H, head = i % H
+            flat = int(concept_id)
+            if not 0 <= flat < 3 * num_heads:
+                raise IndexError(
+                    f"flat concept index {flat} out of range [0, {3*num_heads})"
+                )
+            raw_part, head_id = divmod(flat, num_heads)
+        elif isinstance(concept_id, (tuple, list)) and len(concept_id) == 2:
+            raw_part, head_id = concept_id
+        else:
             raise ValueError(
-                f"KQVHeadConcept expects (part, head_id); got {concept_id!r}"
+                f"KQVHeadConcept expects (part, head_id) or flat int; got {concept_id!r}"
             )
-        raw_part, head_id = concept_id
         part = _coerce_part(raw_part)
         head_id = int(head_id)
         if not 0 <= head_id < num_heads:
@@ -276,10 +338,10 @@ class KQVHeadConcept(_BaseAttentionConcept):
         offset = PART_OFFSETS[part] * D + head_id * head_dim
         return [slice(offset, offset + head_dim)]
 
-    def _aggregate(self, relevance, num_heads, head_dim):
+    def _per_token_relevance(self, relevance, num_heads, head_dim):
         B, N, _ = relevance.shape
         rel = relevance.view(B, N, 3, num_heads, head_dim)
-        return rel.sum(dim=(1, 4))  # -> (B, 3, num_heads)
+        return rel.sum(dim=4)  # -> (B, N, 3, num_heads)
 
 
 # ── (C) per-(part, head, dim) — a single column of W_Q/W_K/W_V ───────────────
@@ -301,11 +363,23 @@ class HeadDimConcept(_BaseAttentionConcept):
     """
 
     def _concept_to_slices(self, concept_id, num_heads, head_dim):
-        if not isinstance(concept_id, (tuple, list)) or len(concept_id) != 3:
+        if isinstance(concept_id, (int, np.integer)):
+            # Flat index in row-major (3, num_heads, head_dim).
+            flat = int(concept_id)
+            if not 0 <= flat < 3 * num_heads * head_dim:
+                raise IndexError(
+                    f"flat concept index {flat} out of range "
+                    f"[0, {3*num_heads*head_dim})"
+                )
+            raw_part, rem = divmod(flat, num_heads * head_dim)
+            head_id, dim_id = divmod(rem, head_dim)
+        elif isinstance(concept_id, (tuple, list)) and len(concept_id) == 3:
+            raw_part, head_id, dim_id = concept_id
+        else:
             raise ValueError(
-                f"HeadDimConcept expects (part, head_id, dim_id); got {concept_id!r}"
+                f"HeadDimConcept expects (part, head_id, dim_id) or flat int; "
+                f"got {concept_id!r}"
             )
-        raw_part, head_id, dim_id = concept_id
         part = _coerce_part(raw_part)
         head_id = int(head_id)
         dim_id = int(dim_id)
@@ -317,10 +391,10 @@ class HeadDimConcept(_BaseAttentionConcept):
         offset = PART_OFFSETS[part] * D + head_id * head_dim + dim_id
         return [slice(offset, offset + 1)]
 
-    def _aggregate(self, relevance, num_heads, head_dim):
+    def _per_token_relevance(self, relevance, num_heads, head_dim):
         B, N, _ = relevance.shape
-        rel = relevance.view(B, N, 3, num_heads, head_dim)
-        return rel.sum(dim=1)  # -> (B, 3, num_heads, head_dim)
+        return relevance.view(B, N, 3, num_heads, head_dim)
+        # -> (B, N, 3, num_heads, head_dim)
 
 
 __all__ = [

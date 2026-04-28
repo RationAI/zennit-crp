@@ -259,6 +259,94 @@ class TestConservation:
         assert torch.allclose(kqv_per_head.sum(dim=1), head, atol=1e-5)
 
 
+# ── reference_sampling (FeatureVisualization shim) ────────────────────────────
+
+
+class TestReferenceSampling:
+    """Per-concept ranking of batch samples — required by Maximization /
+    FeatureVisualization."""
+
+    def test_head_concept_shapes(self, relevance):
+        c = _register(HeadConcept())
+        d, r, n = c.reference_sampling(relevance, layer_name=LAYER, abs_norm=False)
+        assert d.shape == (B, NUM_HEADS)
+        assert r.shape == (B, NUM_HEADS)
+        assert n.shape == (B, NUM_HEADS)
+        # rf_neuron is a sequence index in [0, N)
+        assert (n >= 0).all() and (n < N).all()
+
+    def test_kqv_concept_shapes(self, relevance):
+        c = _register(KQVConcept())
+        d, r, _ = c.reference_sampling(relevance, layer_name=LAYER, abs_norm=False)
+        assert d.shape == (B, 3)
+        assert r.shape == (B, 3)
+
+    def test_kqv_head_shapes(self, relevance):
+        c = _register(KQVHeadConcept())
+        d, r, _ = c.reference_sampling(relevance, layer_name=LAYER, abs_norm=False)
+        assert d.shape == (B, 3 * NUM_HEADS)
+        assert r.shape == (B, 3 * NUM_HEADS)
+
+    def test_head_dim_shapes(self, relevance):
+        c = _register(HeadDimConcept())
+        d, r, _ = c.reference_sampling(relevance, layer_name=LAYER, abs_norm=False)
+        assert d.shape == (B, 3 * NUM_HEADS * HEAD_DIM)
+        assert r.shape == (B, 3 * NUM_HEADS * HEAD_DIM)
+
+    def test_descending_order(self, relevance):
+        c = _register(HeadConcept())
+        _, r, _ = c.reference_sampling(relevance, layer_name=LAYER, abs_norm=False)
+        # column-wise descending
+        diffs = r[:-1] - r[1:]
+        assert (diffs >= 0).all()
+
+    def test_aggregation_matches_attribute(self, relevance):
+        """Sum-over-batch of reference_sampling rel_c equals sum-over-batch of
+        attribute (modulo the within-column reordering)."""
+        c = _register(KQVHeadConcept())
+        _, r_sorted, _ = c.reference_sampling(
+            relevance, layer_name=LAYER, abs_norm=False
+        )
+        attr = c.attribute(relevance, layer_name=LAYER, abs_norm=False)
+        # reference_sampling sums per-token relevance → same total as attribute,
+        # but flattened (3, H) → 3*H. attribute returns (B, 3, H).
+        attr_flat = attr.reshape(B, 3 * NUM_HEADS)
+        # column-sum over batch is invariant to row reorder.
+        assert torch.allclose(
+            r_sorted.sum(dim=0), attr_flat.sum(dim=0), atol=1e-5
+        )
+
+
+# ── flat int IDs (FeatureVisualization passes these from argsort) ─────────────
+
+
+class TestFlatIntegerIds:
+    def test_kqv_head_flat_int_matches_tuple(self, relevance):
+        c = _register(KQVHeadConcept())
+        # flat 5 → part = 5 // 4 = 1 (k), head = 5 % 4 = 1
+        m_int = _apply_mask(c, 0, [5], relevance)
+        m_tuple = _apply_mask(c, 0, [("k", 1)], relevance)
+        assert torch.equal(m_int, m_tuple)
+
+    def test_head_dim_flat_int_matches_tuple(self, relevance):
+        c = _register(HeadDimConcept())
+        # head_dim=6, num_heads=4 → 3*4*6 = 72
+        # flat 30 → part = 30 // 24 = 1 (k), rem = 6, head = 6//6 = 1, dim = 0
+        m_int = _apply_mask(c, 0, [30], relevance)
+        m_tuple = _apply_mask(c, 0, [("k", 1, 0)], relevance)
+        assert torch.equal(m_int, m_tuple)
+
+    def test_kqv_head_flat_out_of_range_raises(self):
+        c = _register(KQVHeadConcept())
+        with pytest.raises(IndexError):
+            c.mask(0, [3 * NUM_HEADS], layer_name=LAYER)
+
+    def test_head_dim_flat_out_of_range_raises(self):
+        c = _register(HeadDimConcept())
+        with pytest.raises(IndexError):
+            c.mask(0, [3 * NUM_HEADS * HEAD_DIM], layer_name=LAYER)
+
+
 # ── registration ──────────────────────────────────────────────────────────────
 
 
