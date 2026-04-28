@@ -598,49 +598,34 @@ CELLS.append(code(
 
 
 CELLS.append(md(
-    "### 6.1 Reference samples per concept (one row per granularity)",
+    "### 6.1 Reference samples + per-sample conditional heatmaps",
     "",
-    "`get_max_reference` returns the top-N samples for each requested concept "
-    "id. We pass `composite=None, plot_fn=None` to get raw RGB tensors; "
-    "conditional heatmaps on the **target** image follow in §7.",
+    "`get_max_reference(..., composite=composite, plot_fn=vis_opaque_img)` "
+    "returns, for each requested concept id, the top-N samples that "
+    "maximise its relevance over the dataset, with a conditional heatmap "
+    "rendered as an opacity mask on each — so non-relevant pixels fade "
+    "out and the user sees *which patch of the reference image the "
+    "concept fires on*. This is the canonical RelMax interpretation "
+    "pattern from the CRP paper.",
     "",
-    "(`get_max_reference`'s built-in heatmap path defaults to "
-    "`ChannelConcept.mask` and does not yet accept a `mask_map` override — "
-    "for now we render the heatmap separately. Tracked in `FUTURE_STATE.md`.)"
+    "`vis_opaque_img` is shipped in `crp.image`. `plot_grid` renders "
+    "the resulting `{concept_id: PIL.Image}` dict directly."
 ))
 
 
 CELLS.append(code(
     "REF_RANGE = (0, 4)  # top-1..top-4 reference sample per concept",
     "",
-    "fig, axes = plt.subplots(",
-    "    len(top_ids) * TOP_K, REF_RANGE[1] - REF_RANGE[0],",
-    "    figsize=(2.0 * (REF_RANGE[1] - REF_RANGE[0]),",
-    "             1.8 * len(top_ids) * TOP_K),",
-    ")",
-    "for r, (name, ids) in enumerate(top_ids.items()):",
+    "for name, ids in top_ids.items():",
+    "    print(f'\\n── {name} ──')",
     "    fv = fvs[name]",
     "    ref_c = fv.get_max_reference(",
     "        ids, LAYER_NAME, mode='relevance', r_range=REF_RANGE,",
-    "        composite=None, plot_fn=None,",
+    "        composite=composite, plot_fn=vis_opaque_img,",
     "    )",
-    "    for j, cid in enumerate(ids):",
-    "        row = r * TOP_K + j",
-    "        samples = ref_c[cid]",
-    "        for c in range(REF_RANGE[1] - REF_RANGE[0]):",
-    "            ax = axes[row, c]",
-    "            if c < samples.shape[0]:",
-    "                ax.imshow(denormalize(samples[c]))",
-    "            ax.axis('off')",
-    "            if c == 0:",
-    "                ax.set_title(f'{name}: {label_for(name, cid)}',",
-    "                             fontsize=9, loc='left', pad=2)",
-    "fig.suptitle(",
-    "    f'Top-{REF_RANGE[1] - REF_RANGE[0]} reference samples per concept '",
-    "    f'(ranked by RelMax over the indexed dataset)',",
-    "    fontsize=11,",
-    ")",
-    "plt.tight_layout(); plt.show()"
+    "    pretty = {label_for(name, k): v for k, v in ref_c.items()}",
+    "    plot_grid(pretty, figsize=(7, 1.6 * len(ids)), padding=False)",
+    "    plt.show()"
 ))
 
 

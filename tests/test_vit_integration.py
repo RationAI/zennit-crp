@@ -252,3 +252,80 @@ class TestRelevanceShapes:
             vit_tiny, c, img_batch, LAYER_NAME, ("q", 0, 0)
         )
         assert scores.shape == (1, 3, 3, 64)
+
+
+# ── FeatureVisualization end-to-end on attention concepts ────────────────────
+
+
+class TestFeatureVisualizationOnAttentionConcept:
+    """Exercises ``FeatureVisualization._attribution_on_reference`` — which
+    previously hardcoded ``ChannelConcept.mask`` and would IndexError when
+    handed an attention concept's flat int ids. After the fix it pulls
+    ``mask_map`` from ``self.layer_map[layer_name]``."""
+
+    def _build_index(self, model, concept, layer_name, dataset, tmpdir):
+        from crp.visualization import FeatureVisualization
+        attribution = CondAttribution(model)
+        composite = AttnLRPEpsilonComposite()
+        fv = FeatureVisualization(
+            attribution,
+            dataset,
+            layer_map={layer_name: concept},
+            preprocess_fn=lambda x: x,
+            path=str(tmpdir),
+        )
+        fv.run(composite, 0, len(dataset), batch_size=2, checkpoint=10)
+        return fv, composite
+
+    def _make_dataset(self, n=4):
+        from torch.utils.data import Dataset
+
+        class _RandDS(Dataset):
+            def __init__(self, n):
+                torch.manual_seed(0)
+                self.x = torch.randn(n, 3, 224, 224)
+                self.y = torch.randint(0, 1000, (n,))
+
+            def __len__(self):
+                return len(self.x)
+
+            def __getitem__(self, i):
+                return self.x[i], int(self.y[i])
+
+        return _RandDS(n)
+
+    def test_get_max_reference_with_composite_on_kqv_head(self, vit_tiny, tmp_path):
+        """Reproduces the previously-failing path:
+        ``get_max_reference([flat_int], composite=composite, plot_fn=None)``
+        with a flat int id from KQVHeadConcept."""
+        c = KQVHeadConcept()
+        c.register_from_model(vit_tiny)
+        ds = self._make_dataset(n=4)
+        fv, composite = self._build_index(vit_tiny, c, LAYER_NAME, ds, tmp_path)
+
+        # 5 = (k, head=1) for vit_tiny (3 heads): part = 5//3 = 1, head = 5%3 = 2.
+        # The exact decoding doesn't matter — the test is that the composite path
+        # *runs* end to end and returns sample + heatmap of the right shapes.
+        ref_c = fv.get_max_reference(
+            [5], LAYER_NAME, mode="relevance", r_range=(0, 2),
+            composite=composite, plot_fn=None,
+        )
+        samples, heatmaps = ref_c[5]
+        assert samples.shape[1:] == (3, 224, 224)
+        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        assert heatmaps.shape[1:] == (224, 224)
+
+    def test_get_max_reference_with_composite_on_head_dim(self, vit_tiny, tmp_path):
+        """Same but for HeadDimConcept (3 × 3 × 64 = 576 concepts; pick id 100)."""
+        c = HeadDimConcept()
+        c.register_from_model(vit_tiny)
+        ds = self._make_dataset(n=4)
+        fv, composite = self._build_index(vit_tiny, c, LAYER_NAME, ds, tmp_path)
+
+        ref_c = fv.get_max_reference(
+            [100], LAYER_NAME, mode="relevance", r_range=(0, 2),
+            composite=composite, plot_fn=None,
+        )
+        samples, heatmaps = ref_c[100]
+        assert samples.shape[1:] == (3, 224, 224)
+        assert heatmaps.shape[1:] == (224, 224)

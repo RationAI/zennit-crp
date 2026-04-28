@@ -87,7 +87,8 @@ Dependency management is `uv add` / `uv sync`. Optional extras: `vit` (timm + tr
 | 3b | `841fd35` | Override `reference_sampling` on `_BaseAttentionConcept` (FV compatibility) |
 | 3c | `a760d0f` | Walkthrough notebook + uv-managed deps |
 | 4  | `e055e48` | Replace monkey-patching with Canonizer + Hook + Composite (idiomatic zennit) |
-| 5  | (this commit) | γ-LRP variant (`GTIGamma` / `AttnLRPGammaComposite`) + drop legacy classes + state docs refresh |
+| 5  | `8019975` / `3c80950` | γ-LRP variant (`GTIGamma` / `AttnLRPGammaComposite`) + drop legacy classes + state docs refresh |
+| 6  | (this commit) | Generalise `FeatureVisualization._attribution_on_reference` — pull `mask_map` from `self.layer_map[layer_name]` instead of hardcoded `ChannelConcept.{mask,mask_rf}`. Restores per-reference-sample conditional heatmaps for the four attention concepts. |
 
 ## Public API (post-iter-5)
 

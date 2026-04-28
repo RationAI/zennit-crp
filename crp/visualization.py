@@ -441,19 +441,26 @@ class FeatureVisualization:
         if rf and (len(neuron_ids) != n_samples):
             raise ValueError("length of 'neuron_ids' must be equal to the length of 'data'")
 
+        # Use the concept registered for this layer in self.layer_map. Previously
+        # this path hardcoded ChannelConcept.{mask,mask_rf}, which broke any non-
+        # ChannelConcept layer (e.g. attention concepts where the concept_id is
+        # not a channel index but a flat (part, head[, dim]) decode).
+        concept = self.layer_map[layer_name]
+        mask_map = concept.mask_rf if rf else concept.mask
+
         heatmaps = []
         for b in range(batches):
             data_batch = data[b * batch_size: (b + 1) * batch_size].detach().requires_grad_()
-            
+
             if rf:
                 batch_neuron_ids = neuron_ids[b * batch_size: (b + 1) * batch_size]
                 conditions = [{layer_name: {concept_id: n_index}} for n_index in batch_neuron_ids]
-                attr = self.attribution(data_batch, conditions, composite, mask_map=ChannelConcept.mask_rf, start_layer=layer_name, on_device=self.device, 
+                attr = self.attribution(data_batch, conditions, composite, mask_map=mask_map, start_layer=layer_name, on_device=self.device,
                     exclude_parallel=False)
             else:
-                conditions = [{layer_name: [concept_id]}] 
+                conditions = [{layer_name: [concept_id]}]
                 # initialize relevance with activation before non-linearity (could be changed in a future release)
-                attr = self.attribution(data_batch, conditions, composite, start_layer=layer_name, on_device=self.device, exclude_parallel=False)
+                attr = self.attribution(data_batch, conditions, composite, mask_map=mask_map, start_layer=layer_name, on_device=self.device, exclude_parallel=False)
 
             heatmaps.append(attr.heatmap)
 

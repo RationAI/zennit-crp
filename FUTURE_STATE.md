@@ -42,10 +42,9 @@ The original AttnLRP paper (Eq. 1) requires `R_input.sum() ≈ R_output.sum()`; 
 
 ## Milestone E — visualisation polish
 
-16. **Generalise `FeatureVisualization._attribution_on_reference`** — it currently hardcodes `ChannelConcept.mask` / `ChannelConcept.mask_rf` regardless of the concept registered in `self.layer_map`, which means `get_max_reference(..., composite=composite, plot_fn=vis_opaque_img)` raises `IndexError` for our attention concepts (the flat int id is interpreted as a sequence-position index by `ChannelConcept.mask`). Structurally solvable (~5 LOC): pull the concept from `self.layer_map[layer_name]` and pass `mask_map=concept.mask` (or `concept.mask_rf` if `rf=True`). **Interpretability impact**: until this lands, the walkthrough notebook can't render per-reference-sample conditional heatmaps — which is the canonical "what does this concept look like" RelMax output (the eye-age example in the CRP paper). The workaround in the notebook (raw RGB samples + conditional heatmap only on the **target** image) is functional for ranking and target-image localisation but loses the localisation on each reference sample. Recommended priority: do this alongside Milestone A.
-17. **Multi-block comparison figure** in the walkthrough notebook: same image, top-k concepts at blocks {3, 6, 9, 11} side-by-side. Demonstrates concept progression through the network. Closes Phase 4.4 of `IMPLEMENTATION_PLAN.md`.
-18. **Class-conditional reference samples**: integrate `FeatureVisualization.get_stats_reference` into the notebook (currently uses only `get_max_reference`).
-19. **Activation vs. relevance maximisation** comparison cell — the original CRP paper makes a point of this; we currently use only RelMax.
+16. **Multi-block comparison figure** in the walkthrough notebook: same image, top-k concepts at blocks {3, 6, 9, 11} side-by-side. Demonstrates concept progression through the network. Closes Phase 4.4 of `IMPLEMENTATION_PLAN.md`.
+17. **Class-conditional reference samples**: integrate `FeatureVisualization.get_stats_reference` into the notebook (currently uses only `get_max_reference`).
+18. **Activation vs. relevance maximisation** comparison cell — the original CRP paper makes a point of this; we currently use only RelMax.
 
 ## Milestone F — release
 
