@@ -35,7 +35,6 @@ from PIL import Image
 
 import timm
 from timm.data import resolve_data_config, create_transform
-from zennit.composites import EpsilonPlusFlat
 
 from crp.attention_concepts import (
     HeadConcept,
@@ -45,7 +44,7 @@ from crp.attention_concepts import (
     PARTS,
 )
 from crp.attribution import CondAttribution
-from crp.transformer_patches import prepare_timm_vit
+from crp.transformer_patches import AttnLRPEpsilonComposite
 
 
 # ── concept registry for the demo ─────────────────────────────────────────────
@@ -228,7 +227,8 @@ def main():
 
     print(f"loading {args.model} (pretrained=True) on {device}")
     model = timm.create_model(args.model, pretrained=True).eval().to(device)
-    prepare_timm_vit(model)
+    # No model-time patching needed — AttnLRPEpsilonComposite registers a
+    # canonizer on composite.context() that does it scoped to the attribution.
 
     print(f"loading image: {args.image}")
     data = load_image(args.image, model).to(device)
@@ -248,7 +248,7 @@ def main():
     layer_name = f"blocks.{args.block}.attn.qkv_tap"
     print(f"layer={layer_name}  num_heads={num_heads}  head_dim={head_dim}")
 
-    composite = EpsilonPlusFlat()
+    composite = AttnLRPEpsilonComposite()
     attribution = CondAttribution(model, device=torch.device(device))
 
     rows = {}

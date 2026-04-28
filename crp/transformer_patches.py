@@ -1,23 +1,64 @@
-"""
-Transformer LRP patches for zennit-crp.
+"""AttnLRP for vision transformers — idiomatic zennit Canonizer + Hook + Composite.
 
-Ported from LRP-eXplains-Transformers (LXT) by Achtibat et al.
-Paper: AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for Transformers. ICML 2024.
-https://arxiv.org/abs/2402.05602
+This module implements the AttnLRP rules of Achtibat et al. (ICML 2024,
+arXiv:2402.05602) on top of zennit, exposing them as the standard zennit
+abstractions:
+
+* :class:`QKVTapCanonizer` / :class:`TimmViTCanonizer` — model-graph and
+  forward-method changes needed for AttnLRP, registered on
+  ``composite.context()`` enter and reverted on exit.
+* :class:`GradientTimesInputBasicHook` — a :class:`zennit.core.BasicHook`
+  subclass that runs the LRP backward in the gradient×input formulation
+  ``R = grad·output / input`` (the framework into which AttnLRP's
+  identity / uniform rules are embedded). Pure subclass; no global side
+  effects.
+* :class:`AttnLRPEpsilonComposite` — drop-in composite that combines the
+  canonizer with the LRP rule hooks. Mapped via
+  :class:`zennit.composites.LayerMapComposite`.
+
+The four ViT concept classes in :mod:`crp.attention_concepts` hook the
+named tap ``…attn.qkv_tap`` that :class:`QKVTapCanonizer` adds.
+
+Usage::
+
+    from zennit.composites import EpsilonPlusFlat
+    from crp.transformer_patches import AttnLRPEpsilonComposite
+    from crp.attention_concepts import HeadConcept
+    from crp.attribution import CondAttribution
+
+    composite = AttnLRPEpsilonComposite()      # canonizer pre-bundled
+    attribution = CondAttribution(model)
+    concept = HeadConcept()
+    concept.register_from_model(model)
+    result = attribution(
+        data, [{"blocks.6.attn.qkv_tap": [0], "y": [281]}],
+        composite, mask_map=concept.mask,
+    )
 """
-from functools import partial
-from warnings import warn
+from __future__ import annotations
+
+from typing import Optional
 
 import torch
+import torch.nn as nn
 from torch.autograd import Function
 
+from zennit.canonizers import AttributeCanonizer, Canonizer, CompositeCanonizer
+from zennit.composites import LayerMapComposite
+from zennit.core import BasicHook, ParamMod, Stabilizer, stabilize
+from zennit.rules import Pass
 
-# ─── LRP Rules ───────────────────────────────────────────────────────────────
+
+# ─── 1. Autograd Functions encoding AttnLRP rules ────────────────────────────
 
 
 class _IdentityRuleFn(Function):
-    """Identity rule (Eq. 9 in AttnLRP paper) via gradient*input framework.
-    Used on element-wise non-linear activations.
+    """Identity rule (AttnLRP §3.1, Eq. 9): backward returns ``(out / in) * grad_out``.
+
+    Used on element-wise non-linearities (GELU, ReLU, …) where LRP relevance
+    flows through unchanged up to the input/output ratio. Inlined into the
+    forward pass via a Canonizer-installed forward method, so the autograd
+    graph carries it without any global mutation.
     """
 
     @staticmethod
@@ -34,8 +75,11 @@ class _IdentityRuleFn(Function):
 
 
 class _DivideGradientFn(Function):
-    """Uniform rule (Eq. 7 in AttnLRP paper) via gradient*input framework.
-    Used after matmul or element-wise multiplication.
+    """Uniform rule (AttnLRP §3.1, Eq. 7): backward divides incoming grad by ``factor``.
+
+    Used after bilinear ops (matmul, ⊙) to allocate relevance equally among
+    operands. ``factor=2`` per bilinear; in attention Q×4, K×4 (each enters
+    two bilinears via softmax(QKᵀ)) and V×2 (one bilinear via attn·V).
     """
 
     @staticmethod
@@ -49,352 +93,69 @@ class _DivideGradientFn(Function):
 
 
 def identity_rule_implicit(fn, input):
-    """Apply fn(input) with identity LRP rule in the backward pass."""
+    """Apply ``fn(input)`` with the AttnLRP identity rule inlined into backward."""
     return _IdentityRuleFn.apply(fn, input)
 
 
 def divide_gradient(input, factor=2):
-    """Identity in forward; divide relevance by factor in backward."""
+    """Identity in forward; divide incoming relevance by ``factor`` on backward."""
     return _DivideGradientFn.apply(input, factor)
 
 
 def stop_gradient(input):
-    """Stop gradient flow (used in CP-LRP)."""
+    """Detach ``input`` from the autograd graph (CP-LRP variant on normalisations)."""
     return input.detach()
 
 
-# ─── Patch Utilities ──────────────────────────────────────────────────────────
-
-
-def _check_already_patched(target_fn, new_fn):
-    if target_fn.__module__ == new_fn.__module__:
-        name = getattr(target_fn, "__name__", str(target_fn))
-        warn(f"{name} already patched.")
-        return True
-    return False
-
-
-def patch_method(fn, module, method_name="forward", keep_original=False):
-    """Replace a method on a class with fn.
-
-    Parameters
-    ----------
-    fn : callable
-    module : class or module
-    method_name : str
-    keep_original : bool
-        If True, saves original as ``original_<method_name>``.
-
-    Returns
-    -------
-    bool
-        True if patched successfully.
-    """
-    if _check_already_patched(getattr(module, method_name), fn):
-        return False
-    if keep_original:
-        setattr(module, f"original_{method_name}", getattr(module, method_name))
-    setattr(module, method_name, fn)
-    return True
-
-
-def replace_module(patched_module, original_module):
-    """Copy all non-dunder attributes from patched_module onto original_module."""
-    if original_module == patched_module:
-        return False
-    for attr in dir(patched_module):
-        if not attr.startswith("__"):
-            setattr(original_module, attr, getattr(patched_module, attr))
-    return True
-
-
-# ─── AttnLRP Forward Patches ─────────────────────────────────────────────────
-
-
-def rms_norm_forward(self, hidden_states):
-    """Identity rule for RMSNorm — stop gradient through variance."""
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    variance = hidden_states.pow(2).mean(-1, keepdim=True)
-    hidden_states = hidden_states * stop_gradient(
-        torch.rsqrt(variance + self.variance_epsilon)
-    )
-    return self.weight * hidden_states.to(input_dtype)
+# ─── 2. Replacement forward methods (installed per-instance by Canonizer) ────
 
 
 def layer_norm_forward(self, x):
-    """Identity rule for LayerNorm — stop gradient through std."""
+    """LayerNorm with stop-gradient on the std. Identity rule on the
+    normalised output (AttnLRP §3.2.2)."""
     mean = x.mean(dim=-1, keepdim=True)
     var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
     std = (var + self.eps).sqrt()
     y = (x - mean) / stop_gradient(std)
     if self.weight is not None:
-        y *= self.weight
+        y = y * self.weight
     if self.bias is not None:
-        y += self.bias
+        y = y + self.bias
     return y
 
 
-def gated_mlp_forward(self, x):
-    """Identity rule on activation + uniform rule on element-wise multiplication."""
-    gate_out = self.gate_proj(x)
-    gate_out = identity_rule_implicit(self.act_fn, gate_out)
-    weighted = gate_out * self.up_proj(x)
-    weighted = divide_gradient(weighted, 2)
-    return self.down_proj(weighted)
-
-
-def mlp_forward(self, x):
-    """Identity rule on activation for standard (non-gated) MLP."""
-    up_out = self.up_proj(x)
-    up_out = identity_rule_implicit(self.act_fn, up_out)
-    return self.down_proj(up_out)
-
-
-def non_linear_forward(self, x):
-    """Identity rule for standalone non-linear modules (e.g. GELU, ReLU)."""
-    return identity_rule_implicit(self.original_forward, x)
-
-
-def dropout_forward(self, x):
-    """Disable dropout during LRP (required when model is in train mode)."""
+def dropout_passthrough_forward(self, x):
+    """Disable dropout during attribution (model may be in train mode)."""
     return x
 
 
-def patch_attention(module):
-    """Patch all attention functions in module with uniform rule on Q, K, V."""
-    new_fwd = wrap_attention_forward(module.eager_attention_forward)
-    if _check_already_patched(module.eager_attention_forward, new_fwd):
-        return False
-    module.eager_attention_forward = new_fwd
-
-    new_map = {}
-    for key, value in module.ALL_ATTENTION_FUNCTIONS.items():
-        wrapped = wrap_attention_forward(value)
-        if _check_already_patched(value, wrapped):
-            return False
-        new_map[key] = wrapped
-    module.ALL_ATTENTION_FUNCTIONS = new_map
-    return True
-
-
-def wrap_attention_forward(forward_fn):
-    def attention_forward(module, query, key, value, *args, **kwargs):
-        query = divide_gradient(query, 4)
-        key = divide_gradient(key, 4)
-        value = divide_gradient(value, 2)
-        if "dropout" in kwargs:
-            kwargs["dropout"] = 0.0
-        return forward_fn(module, query, key, value, *args, **kwargs)
-    return attention_forward
-
-
-# ─── CP-LRP Patches ───────────────────────────────────────────────────────────
-
-
-def cp_gated_mlp_forward(self, x):
-    """CP-LRP: stop gradient through gating before activation."""
-    gate_out = stop_gradient(self.gate_proj(x))
-    gate_out = self.act_fn(gate_out)
-    weighted = gate_out * self.up_proj(x)
-    return self.down_proj(weighted)
-
-
-def patch_cp_attention(module):
-    """Patch attention functions in module with CP-LRP (stop gradient on Q, K)."""
-    new_fwd = cp_wrap_attention_forward(module.eager_attention_forward)
-    if _check_already_patched(module.eager_attention_forward, new_fwd):
-        return False
-    module.eager_attention_forward = new_fwd
-
-    for key, value in module.ALL_ATTENTION_FUNCTIONS.items():
-        wrapped = cp_wrap_attention_forward(value)
-        if _check_already_patched(value, wrapped):
-            return False
-        module.ALL_ATTENTION_FUNCTIONS[key] = wrapped
-    return True
-
-
-def cp_wrap_attention_forward(forward_fn):
-    def cp_attention_forward(module, query, key, value, *args, **kwargs):
-        query = stop_gradient(query)
-        key = stop_gradient(key)
-        if "dropout" in kwargs:
-            kwargs["dropout"] = 0.0
-        return forward_fn(module, query, key, value, *args, **kwargs)
-    return cp_attention_forward
-
-
-def cp_multi_head_attention_forward(self, query, key, value, *args, **kwargs):
-    """CP-LRP patch for torch.nn.MultiheadAttention."""
-    query = stop_gradient(query)
-    key = stop_gradient(key)
-    return self.original_forward(query, key, value, *args, **kwargs)
-
-
-# ─── Gemma3-specific patch ────────────────────────────────────────────────────
-
-
-def gemma3_norm_forward(self, x):
-    """Identity rule for Gemma3RMSNorm._norm."""
-    return x * stop_gradient(torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps))
-
-
-# ─── GPT-2 MLP patch (inline, identity rule on activation) ───────────────────
-
-
-def gpt2_mlp_forward(self, hidden_states):
-    hidden_states = self.c_fc(hidden_states)
-    hidden_states = identity_rule_implicit(self.act, hidden_states)
-    hidden_states = self.c_proj(hidden_states)
-    return hidden_states
-
-
-# ─── Zennit BasicHook Patch ───────────────────────────────────────────────────
-
-
-def _patched_basic_hook_forward(self, module, input, output):
-    """Forward hook: save both input and output for backward use."""
-    self.stored_tensors["input"] = input
-    self.stored_tensors["output"] = output
-
-
-def _patched_basic_hook_backward(self, module, grad_input, grad_output):
-    """Backward hook: implement gradient*input LRP framework for transformers."""
-    from zennit.core import ParamMod, stabilize
-
-    assert len(grad_output) == 1, "Only single output supported for now!"
-    grad_output = (grad_output[0] * self.stored_tensors["output"],)
-    grad_output[0].requires_grad = True
-
-    original_input = self.stored_tensors["input"][0].clone()
-    inputs = []
-    outputs = []
-    for in_mod, param_mod, out_mod in zip(
-        self.input_modifiers, self.param_modifiers, self.output_modifiers
-    ):
-        inp = in_mod(original_input).requires_grad_()
-        with ParamMod.ensure(param_mod)(module) as modified, torch.autograd.enable_grad():
-            out = modified.forward(inp)
-            out = out_mod(out)
-        inputs.append(inp)
-        outputs.append(out)
-
-    grad_outputs = self.gradient_mapper(grad_output[0], outputs)
-    gradients = torch.autograd.grad(
-        outputs,
-        inputs,
-        grad_outputs=grad_outputs,
-        create_graph=grad_output[0].requires_grad,
-    )
-    relevance = self.reducer(inputs, gradients)
-    relevance = relevance / stabilize(original_input, epsilon=1e-10)
-
-    return tuple(
-        relevance if original.shape == relevance.shape else None
-        for original in grad_input
-    )
-
-
-def monkey_patch_zennit(verbose=False):
-    """Patch zennit's BasicHook to support gradient*input LRP for transformers.
-
-    1. Forward hook saves module output.
-    2. Backward hook multiplies grad_output by saved output, then divides
-       relevance by input to implement the gradient*input framework.
-    """
-    try:
-        from zennit.core import BasicHook
-    except ImportError:
-        warn("'zennit' not available. Install it to use transformer LRP.")
-        return
-
-    for method, name in [
-        (_patched_basic_hook_forward, "forward"),
-        (_patched_basic_hook_backward, "backward"),
-    ]:
-        success = patch_method(method, BasicHook, method_name=name)
-        if not success:
-            warn(f"Failed to patch Zennit BasicHook's {name}. Skipping...")
-        elif verbose:
-            print(f"Patched Zennit BasicHook's {name}")
-
-
-# ─── timm ViT Attention Patch ─────────────────────────────────────────────────
-
-
-def inject_qkv_taps(model):
-    """Insert ``qkv_tap = nn.Identity()`` into every timm-style ``Attention``
-    submodule of ``model``.
-
-    The tap is the named hook point used by :class:`crp.attention_concepts._BaseAttentionConcept`
-    and its subclasses (HeadConcept, KQVConcept, KQVHeadConcept, HeadDimConcept).
-    Its output is the post-``qkv``-Linear pre-attention tensor of shape
-    ``(B, N, 3*num_heads*head_dim)``, with layout ``[Q | K | V]`` along the last
-    axis (and contiguous head-stripes within each part).
-
-    Detection: a module qualifies as timm-style ``Attention`` iff it exposes
-    ``qkv`` (a Linear), ``num_heads``, and ``head_dim``. Idempotent — re-injection
-    is a no-op when ``qkv_tap`` is already an ``nn.Identity``.
-
-    Returns the list of ``(name, module)`` pairs that were tapped.
-    """
-    import torch.nn as nn
-
-    tapped = []
-    for name, module in model.named_modules():
-        if (
-            hasattr(module, "qkv")
-            and isinstance(getattr(module, "qkv"), nn.Linear)
-            and hasattr(module, "num_heads")
-            and hasattr(module, "head_dim")
-        ):
-            existing = getattr(module, "qkv_tap", None)
-            if existing is None:
-                module.qkv_tap = nn.Identity()
-            elif not isinstance(existing, nn.Identity):
-                continue
-            tapped.append((name, module))
-    return tapped
-
-
 def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
-    """Patched timm ``Attention.forward`` for AttnLRP + concept hooking.
+    """timm ``Attention.forward`` replacement for AttnLRP + concept hooking.
 
-    Tracks the upstream timm ``Attention.forward`` signature
-    (``x, attn_mask=None, is_causal=False``) so it remains a drop-in
-    replacement across timm versions ≥ 1.0.
+    Tracks the upstream timm signature ``(self, x, attn_mask=None,
+    is_causal=False)`` so it remains a drop-in across timm ≥ 1.0.
 
     Differences from upstream timm forward:
 
-    * After ``self.qkv(x)`` and before the reshape, the tensor is passed
-      through ``self.qkv_tap`` (created by :func:`inject_qkv_taps`). This is
-      the named hook point for HeadConcept / KQVConcept / KQVHeadConcept /
-      HeadDimConcept.
-    * Q, K, V each pass through :func:`divide_gradient` (factors 4, 4, 2)
-      to implement AttnLRP's uniform rule for the bilinear ``QK^T`` and
-      attention-weighted-V matmuls (Eq. 14–15 of arXiv:2402.05602).
-    * The fused ``F.scaled_dot_product_attention`` path is bypassed in favour
-      of the explicit softmax + matmul path so the autograd graph contains
-      the operations whose backward LRP rules apply.
+    * Routes ``self.qkv(x)`` through ``self.qkv_tap`` (an ``nn.Identity``
+      submodule installed by :class:`QKVTapCanonizer`) — the named hook
+      point used by :mod:`crp.attention_concepts`.
+    * Q, K, V each pass through :func:`divide_gradient` (factors 4, 4, 2) —
+      AttnLRP uniform rule on the ``QKᵀ`` and ``attn·V`` bilinears
+      (Eq. 14–15 of arXiv:2402.05602).
+    * Bypasses the fused ``F.scaled_dot_product_attention`` path so the
+      autograd graph contains the explicit softmax + matmul ops where the
+      rules apply.
     """
-    import torch.nn as nn
-
-    if not hasattr(self, "qkv_tap"):
-        # Lazy creation; user did not run inject_qkv_taps. Hooks won't be
-        # named-resolvable in this case but forward still runs correctly.
-        self.qkv_tap = nn.Identity()
-
     B, N, _ = x.shape
     qkv_flat = self.qkv(x)              # (B, N, 3*num_heads*head_dim)
-    qkv_flat = self.qkv_tap(qkv_flat)   # ← hook tap
+    qkv_flat = self.qkv_tap(qkv_flat)   # ← named hook tap
     qkv = qkv_flat.reshape(B, N, 3, self.num_heads, self.head_dim).permute(
         2, 0, 3, 1, 4
-    )                                   # (3, B, H, N, d_h)
+    )
     q, k, v = qkv.unbind(0)
     q, k = self.q_norm(q), self.k_norm(k)
 
-    # AttnLRP uniform rule on the two bilinears (QK^T and attn·V).
     q = divide_gradient(q, 4)
     k = divide_gradient(k, 4)
     v = divide_gradient(v, 2)
@@ -402,21 +163,20 @@ def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
     q = q * self.scale
     attn = q @ k.transpose(-2, -1)
 
-    # Apply optional attention mask / causal bias the same way timm does.
     try:
         from timm.models.vision_transformer import (
-            resolve_self_attn_mask,
-            maybe_add_mask,
+            resolve_self_attn_mask, maybe_add_mask,
         )
         attn_bias = resolve_self_attn_mask(N, attn, attn_mask, is_causal)
         attn = maybe_add_mask(attn, attn_bias)
     except ImportError:
-        # Older timm without these helpers — fall back to a direct add.
         if attn_mask is not None:
             attn = attn + attn_mask
         if is_causal:
             mask = torch.triu(
-                torch.full((N, N), float("-inf"), device=attn.device, dtype=attn.dtype),
+                torch.full(
+                    (N, N), float("-inf"), device=attn.device, dtype=attn.dtype
+                ),
                 diagonal=1,
             )
             attn = attn + mask
@@ -425,9 +185,6 @@ def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
     attn = self.attn_drop(attn)
     x = attn @ v
 
-    # Reshape back. Newer timm exposes ``attn_dim`` (== num_heads*head_dim and
-    # generally == embed_dim, but kept distinct to support architectures with
-    # head_dim ≠ embed_dim/num_heads). Older timm uses C, the input feature dim.
     out_dim = getattr(self, "attn_dim", self.num_heads * self.head_dim)
     x = x.transpose(1, 2).reshape(B, N, out_dim)
     if hasattr(self, "norm"):
@@ -437,167 +194,244 @@ def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
     return x
 
 
-def prepare_timm_vit(model, verbose=False):
-    """One-shot setup for a timm ViT: inject taps, monkey-patch the timm
-    ``vision_transformer`` module, and patch zennit's ``BasicHook``.
+# ─── 3. Canonizers — register on composite.context() enter, revert on exit ──
 
-    After this call, the model is ready for CRP attribution with any of the
-    concept classes in :mod:`crp.attention_concepts`.
+
+class QKVTapCanonizer(Canonizer):
+    """Inject ``qkv_tap = nn.Identity()`` into every timm-style ``Attention``
+    submodule. Detection: presence of ``qkv`` (a ``nn.Linear``), ``num_heads``,
+    ``head_dim``.
+
+    The tap is the named hook point used by :mod:`crp.attention_concepts`.
+    Registers on apply, removes on :meth:`remove` (so the model is reverted
+    when ``composite.context()`` exits).
     """
-    from timm.models import vision_transformer as timm_vit
 
-    tapped = inject_qkv_taps(model)
-    monkey_patch(timm_vit, verbose=verbose)
-    monkey_patch_zennit(verbose=verbose)
-    if verbose:
-        print(f"Injected qkv_tap into {len(tapped)} attention modules.")
-    return tapped
+    def __init__(self):
+        self.module: Optional[nn.Module] = None
+
+    def apply(self, root_module):
+        instances = []
+        for _name, module in root_module.named_modules():
+            if (
+                hasattr(module, "qkv")
+                and isinstance(getattr(module, "qkv"), nn.Linear)
+                and hasattr(module, "num_heads")
+                and hasattr(module, "head_dim")
+            ):
+                inst = self.copy()
+                inst.register(module)
+                instances.append(inst)
+        return instances
+
+    def register(self, module):
+        existing = getattr(module, "qkv_tap", None)
+        if isinstance(existing, nn.Identity):
+            # User pre-injected; respect that, do not auto-remove.
+            self.module = None
+            return
+        self.module = module
+        module.add_module("qkv_tap", nn.Identity())
+
+    def remove(self):
+        if self.module is None:
+            return
+        del self.module._modules["qkv_tap"]
+
+    def copy(self):
+        return type(self)()
 
 
-# ─── Default Patch Maps ───────────────────────────────────────────────────────
-
-
-def _build_default_map():
-    """Build a mapping from Python module → patch_map.
-    Each entry is loaded lazily so missing optional deps don't break imports.
-    """
-    default_map = {}
-
-    # ViT (torchvision) — always available if torchvision is installed
+def _attn_attribute_map(_name, module):
+    """AttributeCanonizer attribute_map: swap ``forward`` on timm Attention."""
     try:
-        import torch.nn as nn
-        from torchvision.models import vision_transformer
-
-        default_map[vision_transformer] = {
-            nn.GELU: partial(patch_method, non_linear_forward, keep_original=True),
-            nn.LayerNorm: partial(patch_method, layer_norm_forward),
-            nn.MultiheadAttention: partial(
-                patch_method, cp_multi_head_attention_forward, keep_original=True
-            ),
-        }
-    except ImportError:
-        pass
-
-    # ViT (timm) — exposes attn.qkv as a separate Linear, enabling
-    # qkv_tap-based concept hooks (HeadConcept, KQVConcept, KQVHeadConcept,
-    # HeadDimConcept). See crp/attention_concepts.py.
-    try:
-        import torch.nn as nn
-        from timm.models import vision_transformer as timm_vit
         from timm.models.vision_transformer import Attention as TimmAttention
-
-        default_map[timm_vit] = {
-            nn.GELU: partial(patch_method, non_linear_forward, keep_original=True),
-            nn.LayerNorm: partial(patch_method, layer_norm_forward),
-            nn.Dropout: partial(patch_method, dropout_forward),
-            TimmAttention: partial(patch_method, timm_attention_forward),
-        }
     except ImportError:
-        pass
+        return None
+    if isinstance(module, TimmAttention):
+        bound = timm_attention_forward.__get__(module, type(module))
+        return {"forward": bound}
+    return None
 
-    # LLaMA
-    try:
-        from torch.nn import Dropout
-        from transformers.models.llama import modeling_llama
-        from transformers.models.llama.modeling_llama import LlamaMLP, LlamaRMSNorm
 
-        default_map[modeling_llama] = {
-            LlamaMLP: partial(patch_method, gated_mlp_forward),
-            LlamaRMSNorm: partial(patch_method, rms_norm_forward),
-            Dropout: partial(patch_method, dropout_forward),
-            modeling_llama: patch_attention,
-        }
-    except ImportError:
-        pass
+def _layer_norm_attribute_map(_name, module):
+    """AttributeCanonizer attribute_map: swap ``forward`` on LayerNorm."""
+    if isinstance(module, nn.LayerNorm):
+        bound = layer_norm_forward.__get__(module, type(module))
+        return {"forward": bound}
+    return None
 
-    # Qwen2
-    try:
-        from torch.nn import Dropout
-        from transformers.models.qwen2 import modeling_qwen2
-        from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP, Qwen2RMSNorm
 
-        default_map[modeling_qwen2] = {
-            Qwen2MLP: partial(patch_method, gated_mlp_forward),
-            Qwen2RMSNorm: partial(patch_method, rms_norm_forward),
-            Dropout: partial(patch_method, dropout_forward),
-            modeling_qwen2: patch_attention,
-        }
-    except ImportError:
-        pass
+def _gelu_attribute_map(_name, module):
+    """AttributeCanonizer attribute_map: route GELU through identity-rule autograd."""
+    if isinstance(module, nn.GELU):
+        # Capture the unmodified class-level forward for the inner call.
+        original_forward = type(module).forward
 
-    # GPT-2
-    try:
-        from torch.nn import Dropout
-        from transformers.models.gpt2 import modeling_gpt2
-        from transformers.models.gpt2.modeling_gpt2 import GPT2MLP
+        def patched(self, x):
+            return identity_rule_implicit(lambda inp: original_forward(self, inp), x)
 
-        default_map[modeling_gpt2] = {
-            GPT2MLP: partial(patch_method, gpt2_mlp_forward),
-            modeling_gpt2.nn.LayerNorm: partial(patch_method, layer_norm_forward),
-            Dropout: partial(patch_method, dropout_forward),
-            modeling_gpt2: patch_cp_attention,
-        }
-    except ImportError:
-        pass
+        return {"forward": patched.__get__(module, type(module))}
+    return None
 
-    # Gemma3
-    try:
-        from torch.nn import Dropout
-        from transformers.models.gemma3 import modeling_gemma3
-        from transformers.models.gemma3.modeling_gemma3 import Gemma3MLP, Gemma3RMSNorm
 
-        default_map[modeling_gemma3] = {
-            Gemma3MLP: partial(patch_method, gated_mlp_forward),
-            Gemma3RMSNorm: partial(
-                patch_method, gemma3_norm_forward, method_name="_norm"
+def _dropout_attribute_map(_name, module):
+    """AttributeCanonizer attribute_map: pass-through on Dropout."""
+    if isinstance(module, nn.Dropout):
+        bound = dropout_passthrough_forward.__get__(module, type(module))
+        return {"forward": bound}
+    return None
+
+
+class TimmViTCanonizer(CompositeCanonizer):
+    """All graph + forward changes needed for AttnLRP on a timm ViT, in one
+    canonizer. Composes:
+
+    * :class:`QKVTapCanonizer` — install ``qkv_tap`` Identity submodule.
+    * ``AttributeCanonizer`` — swap ``forward`` on ``Attention``,
+      ``LayerNorm``, ``GELU``, ``Dropout`` instances.
+
+    All mutations are instance-level and reversible. Bundled into
+    :class:`AttnLRPEpsilonComposite`; pass it explicitly to other
+    composites if you want a custom rule map.
+    """
+
+    def __init__(self):
+        super().__init__([
+            QKVTapCanonizer(),
+            AttributeCanonizer(_attn_attribute_map),
+            AttributeCanonizer(_layer_norm_attribute_map),
+            AttributeCanonizer(_gelu_attribute_map),
+            AttributeCanonizer(_dropout_attribute_map),
+        ])
+
+
+# ─── 4. Custom Hook — gradient×input LRP backward ────────────────────────────
+
+
+class GradientTimesInputBasicHook(BasicHook):
+    """Subclass of :class:`zennit.core.BasicHook` that runs LRP backward in
+    the gradient×input framework: ``R = grad·output / input``.
+
+    This is the formulation into which AttnLRP's identity / uniform rules
+    (encoded as autograd Functions in the forward) are designed to fit.
+    Standard zennit hooks return ``R = inputs * gradients`` directly; this
+    subclass instead
+
+    1. multiplies ``grad_output`` by the saved forward output before the
+       backward,
+    2. runs the standard zennit backward through the modified module,
+    3. divides the resulting relevance by the saved input.
+
+    Pure subclass — no monkey-patching of zennit. Plug into any
+    :class:`zennit.core.Composite` via the standard mapping API.
+    """
+
+    def forward(self, module, input, output):
+        # Match zennit's "no kwargs" forward signature so register detects 3 params.
+        self.stored_tensors["input"] = input
+        self.stored_tensors["output"] = output
+
+    def backward(self, module, grad_input, grad_output):
+        assert len(grad_output) == 1, "single-output module required"
+
+        original_input = self.stored_tensors["input"][0].clone()
+        gti_grad = grad_output[0] * self.stored_tensors["output"]
+        gti_grad = gti_grad.requires_grad_(True)
+
+        inputs, outputs = [], []
+        for in_mod, param_mod, out_mod in zip(
+            self.input_modifiers, self.param_modifiers, self.output_modifiers
+        ):
+            inp = in_mod(original_input).requires_grad_()
+            with ParamMod.ensure(param_mod)(module) as modified, torch.autograd.enable_grad():
+                out = modified.forward(inp)
+                out = out_mod(out)
+            inputs.append(inp)
+            outputs.append(out)
+
+        grad_outputs = self.gradient_mapper(gti_grad, outputs)
+        gradients = torch.autograd.grad(
+            outputs,
+            inputs,
+            grad_outputs=grad_outputs,
+            create_graph=gti_grad.requires_grad,
+        )
+        relevance = self.reducer(inputs, gradients)
+        relevance = relevance / stabilize(original_input, epsilon=1e-10)
+
+        return tuple(
+            relevance if original.shape == relevance.shape else None
+            for original in grad_input
+        )
+
+
+# ─── 5. Convenience rule + composite ─────────────────────────────────────────
+
+
+class GTIEpsilon(GradientTimesInputBasicHook):
+    """ε-LRP in the gradient×input formulation. Drop-in for
+    :class:`zennit.rules.Epsilon` inside an
+    :class:`AttnLRPEpsilonComposite`."""
+
+    def __init__(self, epsilon=1e-6, zero_params=None):
+        stabilizer_fn = Stabilizer.ensure(epsilon)
+        super().__init__(
+            input_modifiers=[lambda input: input],
+            param_modifiers=[ParamMod(lambda param, _: param, zero_params=zero_params)],
+            output_modifiers=[lambda output: output],
+            gradient_mapper=(
+                lambda out_grad, outputs: out_grad / stabilizer_fn(outputs[0])
             ),
-            Dropout: partial(patch_method, dropout_forward),
-            modeling_gemma3: patch_attention,
-        }
-    except ImportError:
-        pass
-
-    return default_map
+            reducer=(lambda inputs, gradients: inputs[0] * gradients[0]),
+        )
 
 
-def get_default_map(module):
-    """Return the default patch map for the given Python module.
+class AttnLRPEpsilonComposite(LayerMapComposite):
+    """AttnLRP (ε-LRP variant) for ViTs. Drop-in replacement for
+    ``EpsilonPlusFlat`` when attributing through a timm ViT.
 
-    Raises ValueError for unsupported modules.
+    Maps:
+
+    * ``nn.Linear`` → :class:`GTIEpsilon` (ε-LRP, gradient×input form).
+    * ``nn.Conv2d`` → :class:`GTIEpsilon` (covers the patch-embed Conv2d).
+    * ``nn.GELU`` / ``nn.LayerNorm`` / ``nn.Dropout`` / ``nn.Identity``
+      → :class:`zennit.rules.Pass` — handled in-graph by the embedded
+      autograd functions installed by :class:`TimmViTCanonizer`.
+
+    :class:`TimmViTCanonizer` is pre-bundled. Pass extra canonizers via
+    the ``canonizers`` kwarg if you also need (for example) a
+    ``SequentialMergeBatchNorm`` for a hybrid model.
     """
-    default_map = _build_default_map()
-    if module in default_map:
-        return default_map[module]
-    supported = ", ".join(m.__name__ for m in default_map)
-    raise ValueError(
-        f"{module.__name__} not supported. Supported: {supported}. "
-        "Provide a custom patch_map argument."
-    )
+
+    def __init__(self, epsilon=1e-6, canonizers=None):
+        canonizers = list(canonizers or []) + [TimmViTCanonizer()]
+        layer_map = [
+            (nn.Linear, GTIEpsilon(epsilon)),
+            (nn.Conv2d, GTIEpsilon(epsilon)),
+            (nn.GELU, Pass()),
+            (nn.LayerNorm, Pass()),
+            (nn.Dropout, Pass()),
+            (nn.Identity, Pass()),
+        ]
+        super().__init__(layer_map=layer_map, canonizers=canonizers)
 
 
-# ─── Public API ───────────────────────────────────────────────────────────────
-
-
-def monkey_patch(module, patch_map=None, verbose=False):
-    """Patch a module's classes to implement LRP-aware forward passes.
-
-    Parameters
-    ----------
-    module : Python module
-        The module to patch (e.g. ``torchvision.models.vision_transformer``).
-    patch_map : dict, optional
-        Maps target classes to patch functions. Uses built-in defaults if None.
-    verbose : bool
-        Print each patched class name.
-    """
-    if patch_map is None:
-        patch_map = get_default_map(module)
-
-    for target, patch in patch_map.items():
-        success = patch(target)
-        if not success:
-            name = getattr(target, "__name__", str(target))
-            warn(f"Failed to patch {name}. Skipping...")
-        elif verbose:
-            name = getattr(target, "__name__", str(target))
-            print(f"Patched {name}")
+__all__ = [
+    # autograd Functions (AttnLRP rule kernels)
+    "identity_rule_implicit",
+    "divide_gradient",
+    "stop_gradient",
+    # forward replacements (advanced use; Canonizer installs them automatically)
+    "layer_norm_forward",
+    "dropout_passthrough_forward",
+    "timm_attention_forward",
+    # Canonizers
+    "QKVTapCanonizer",
+    "TimmViTCanonizer",
+    # Hooks
+    "GradientTimesInputBasicHook",
+    "GTIEpsilon",
+    # Composite
+    "AttnLRPEpsilonComposite",
+]

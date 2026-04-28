@@ -113,7 +113,6 @@ CELLS.append(code(
     "import timm",
     "from timm.data import resolve_data_config, create_transform",
     "from torch.utils.data import Dataset",
-    "from zennit.composites import EpsilonPlusFlat",
     "",
     "from crp.attention_concepts import (",
     "    HeadConcept,",
@@ -123,7 +122,7 @@ CELLS.append(code(
     "    PARTS,",
     ")",
     "from crp.attribution import CondAttribution",
-    "from crp.transformer_patches import prepare_timm_vit",
+    "from crp.transformer_patches import AttnLRPEpsilonComposite",
     "from crp.visualization import FeatureVisualization",
     "",
     "torch.set_grad_enabled(True)",
@@ -261,20 +260,22 @@ CELLS.append(code(
 
 
 CELLS.append(md(
-    "## 4. Model + LRP patches",
+    "## 4. Model + AttnLRP composite",
     "",
-    "`prepare_timm_vit` does three things in one call:",
-    "1. injects an `nn.Identity()` named `qkv_tap` into every `Attention` module — "
-    "the named hook point used by all four concept classes",
-    "2. patches `timm.models.vision_transformer.Attention.forward` to add the "
-    "AttnLRP uniform rule on Q/K/V (factors 4, 4, 2)",
-    "3. patches zennit's `BasicHook` to use the gradient×input LRP framework"
+    "Idiomatic zennit: no model-time patching. The composite carries a "
+    "`TimmViTCanonizer` that, when registered on `composite.context()`, ",
+    "1. installs a child `qkv_tap = nn.Identity()` on every timm `Attention` "
+    "(the named hook point used by all four concept classes), ",
+    "2. swaps `forward` per-instance on `Attention` / `LayerNorm` / `GELU` / "
+    "`Dropout` to embed the AttnLRP autograd rules (Q/K/V uniform-rule factors "
+    "4, 4, 2; identity rule on activations).  ",
+    "All mutations are reversed when `composite.context()` exits — no "
+    "process-global state."
 ))
 
 
 CELLS.append(code(
     "model = timm.create_model(MODEL_NAME, pretrained=True).eval().to(DEVICE)",
-    "prepare_timm_vit(model)",
     "",
     "block = model.blocks[BLOCK_INDEX].attn",
     "NUM_HEADS, HEAD_DIM = block.num_heads, block.head_dim",
@@ -414,7 +415,7 @@ CELLS.append(code(
     "    'head_dim': HeadDimConcept,",
     "}",
     "",
-    "composite = EpsilonPlusFlat()",
+    "composite = AttnLRPEpsilonComposite()",
     "attribution = CondAttribution(model, device=torch.device(DEVICE))",
     "",
     "concepts = {}",
@@ -643,12 +644,12 @@ CELLS.append(md(
     "* Read [`tutorials/vit_crp/metrics.py`](metrics.py) for the deletion / "
     "insertion AUC faithfulness benchmark across the four granularities.",
     "",
-    "**Faithfulness caveat**: with the bare `EpsilonPlusFlat` composite, the "
-    "AttnLRP rules on Q/K/V are wired in but the linear layers in MLPs and "
-    "patch-embed don't get the γ-LRP variant recommended by AttnLRP §3.2.1 "
-    "(γ ≈ 0.25). On vit_tiny we see random-concept baselines beat true top-k "
-    "on deletion AUC for the finer granularities — adding γ-LRP is iteration 3 "
-    "in [`IMPLEMENTATION_PLAN.md`](../../IMPLEMENTATION_PLAN.md)."
+    "**Faithfulness caveat**: `AttnLRPEpsilonComposite` wires in the AttnLRP "
+    "uniform rule on Q/K/V and the identity rule on activations, but the "
+    "Linear layers in MLPs and the patch-embed Conv use plain ε-LRP rather "
+    "than the γ-LRP variant recommended by AttnLRP §3.2.1 (γ ≈ 0.25). On "
+    "vit_tiny we see random-concept baselines beat true top-k on deletion AUC "
+    "for the finer granularities — adding a γ rule is the next iteration."
 ))
 
 

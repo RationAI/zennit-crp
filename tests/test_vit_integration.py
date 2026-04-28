@@ -1,12 +1,12 @@
-"""ViT integration tests for the new attention concept classes.
+"""ViT integration tests for the AttnLRP Canonizer + Hook + Composite stack.
 
-These exercise the full pipeline: model load → tap injection → monkey-patch →
-CRP attribution → shape and basic-conservation checks.
+Exercise the full pipeline: model load → composite (canonizer applies) →
+CondAttribution → mask hook on ``qkv_tap`` → shape checks. The composite is
+context-managed so each test starts and ends with a clean (uncanonised) model.
 
-Skipped if ``timm`` and/or ``zennit`` are not installed (e.g. on dev hosts
-without those optional dependencies).
+Skipped if ``timm`` / ``zennit`` are missing.
 
-Run with::
+Run::
 
     uv run pytest tests/test_vit_integration.py -v
 """
@@ -25,28 +25,24 @@ from crp.attention_concepts import (
     HeadDimConcept,
 )
 from crp.attribution import CondAttribution
-from crp.transformer_patches import inject_qkv_taps, prepare_timm_vit
+from crp.transformer_patches import (
+    AttnLRPEpsilonComposite,
+    QKVTapCanonizer,
+    TimmViTCanonizer,
+    timm_attention_forward,
+)
 
 
-# ── module-scope fixtures (one model load per session) ────────────────────────
+# ── module-scope fixtures ─────────────────────────────────────────────────────
 
 
 @pytest.fixture(scope="module")
 def vit_tiny():
-    """Smallest readily-available ViT variant for fast tests.
-
-    `vit_tiny_patch16_224` has 12 blocks, num_heads=3, head_dim=64. Avoids the
-    pretrained-weight download by initialising randomly.
-    """
+    """Smallest readily-available ViT for fast tests. ``vit_tiny_patch16_224``:
+    12 blocks, num_heads=3, head_dim=64. Random init avoids weight download."""
     model = timm.create_model("vit_tiny_patch16_224", pretrained=False)
     model.eval()
     return model
-
-
-@pytest.fixture(scope="module")
-def patched_vit(vit_tiny):
-    prepare_timm_vit(vit_tiny)
-    return vit_tiny
 
 
 @pytest.fixture
@@ -55,84 +51,129 @@ def img_batch():
     return torch.randn(1, 3, 224, 224, requires_grad=True)
 
 
-# ── tap injection ─────────────────────────────────────────────────────────────
+# ── canonizer mechanics: register / remove cycle ──────────────────────────────
 
 
-class TestTapInjection:
-    def test_taps_added_to_every_attention(self, vit_tiny):
-        # Use a fresh copy so other tests aren't affected
-        model = timm.create_model("vit_tiny_patch16_224", pretrained=False)
-        tapped = inject_qkv_taps(model)
-        # vit_tiny has 12 blocks
-        assert len(tapped) == 12
-        for name, _ in tapped:
-            module = dict(model.named_modules())[name]
-            assert isinstance(module.qkv_tap, torch.nn.Identity)
+class TestQKVTapCanonizer:
+    def test_register_adds_qkv_tap_to_every_attention(self, vit_tiny):
+        canonizer = QKVTapCanonizer()
+        instances = canonizer.apply(vit_tiny)
+        try:
+            # vit_tiny has 12 attention blocks
+            assert len(instances) == 12
+            attn_modules = [
+                m for m in vit_tiny.modules()
+                if hasattr(m, "qkv") and isinstance(m.qkv, torch.nn.Linear)
+                and hasattr(m, "num_heads") and hasattr(m, "head_dim")
+            ]
+            for m in attn_modules:
+                assert isinstance(m.qkv_tap, torch.nn.Identity)
+        finally:
+            for inst in instances:
+                inst.remove()
 
-    def test_idempotent(self, vit_tiny):
-        first = inject_qkv_taps(vit_tiny)
-        second = inject_qkv_taps(vit_tiny)
-        assert len(first) == len(second)
+    def test_remove_reverts_qkv_tap(self, vit_tiny):
+        canonizer = QKVTapCanonizer()
+        instances = canonizer.apply(vit_tiny)
+        for inst in instances:
+            inst.remove()
+        attn = vit_tiny.blocks[0].attn
+        assert not hasattr(attn, "qkv_tap")
+
+    def test_idempotent_with_pre_injected_tap(self, vit_tiny):
+        # User pre-injects a tap manually; canonizer must respect it and not
+        # delete it on remove.
+        attn = vit_tiny.blocks[0].attn
+        attn.add_module("qkv_tap", torch.nn.Identity())
+        canonizer = QKVTapCanonizer()
+        instances = canonizer.apply(vit_tiny)
+        for inst in instances:
+            inst.remove()
+        # block 0 had pre-existing tap → still present.
+        assert isinstance(attn.qkv_tap, torch.nn.Identity)
+        # other blocks had canonizer-added taps → removed.
+        attn_other = vit_tiny.blocks[1].attn
+        assert not hasattr(attn_other, "qkv_tap")
+        # Cleanup for downstream tests.
+        del attn._modules["qkv_tap"]
 
 
-# ── forward parity ────────────────────────────────────────────────────────────
+class TestTimmViTCanonizer:
+    def test_forward_swap_is_reversible(self, vit_tiny):
+        attn = vit_tiny.blocks[0].attn
+        original_class_forward = type(attn).forward
+        canonizer = TimmViTCanonizer()
+        instances = canonizer.apply(vit_tiny)
+        try:
+            # forward attribute on instance points at our patched function
+            assert attn.forward.__func__ is timm_attention_forward
+        finally:
+            for inst in instances:
+                inst.remove()
+        # After remove: instance attribute deleted, class-level forward returns.
+        assert "forward" not in attn.__dict__
+        assert type(attn).forward is original_class_forward
 
 
-def test_patched_forward_runs(patched_vit, img_batch):
-    """Patched forward must complete without error and yield correct shape."""
-    out = patched_vit(img_batch)
-    assert out.shape == (1, 1000)  # ImageNet head
+# ── forward parity (model still callable inside composite context) ────────────
+
+
+def test_forward_runs_under_composite(vit_tiny, img_batch):
+    composite = AttnLRPEpsilonComposite()
+    with composite.context(vit_tiny) as modified:
+        out = modified(img_batch)
+    assert out.shape == (1, 1000)
 
 
 # ── concept attribution end-to-end ────────────────────────────────────────────
 
 
+LAYER_NAME = "blocks.6.attn.qkv_tap"
+
+
 def _attribute(model, concept, conditions, data):
     attribution = CondAttribution(model)
-    composite = None  # default zennit composite from the user; not strictly needed for this smoke
+    composite = AttnLRPEpsilonComposite()
     return attribution(data, conditions, composite, mask_map=concept.mask)
 
 
 class TestEndToEndShapes:
-    """One conditional pass per concept def. Verifies the pipeline doesn't blow
-    up and returns a heatmap of input shape. Numerical correctness is a
-    follow-on task (see ``IMPLEMENTATION_PLAN.md`` Phase 5)."""
+    """One conditional pass per concept granularity. Verifies the pipeline
+    runs end-to-end and returns a pixel-space heatmap of the right shape."""
 
-    LAYER_NAME = "blocks.6.attn.qkv_tap"
-
-    def test_head_concept(self, patched_vit, img_batch):
+    def test_head_concept(self, vit_tiny, img_batch):
         c = HeadConcept()
-        c.register_from_model(patched_vit)
-        conditions = [{self.LAYER_NAME: [0], "y": [42]}]  # head 0, target class 42
-        result = _attribute(patched_vit, c, conditions, img_batch)
-        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        c.register_from_model(vit_tiny)
+        # Note: register_from_model walks named_modules, but qkv_tap doesn't
+        # exist yet (canonizer hasn't applied). The concept registers under
+        # both "blocks.X.attn" and "blocks.X.attn.qkv_tap" based on parent
+        # match — see _BaseAttentionConcept.register_from_model.
+        conditions = [{LAYER_NAME: [0], "y": [42]}]
+        result = _attribute(vit_tiny, c, conditions, img_batch)
         B, _, H, W = img_batch.shape
         assert result.heatmap.shape == (B, H, W)
 
-    def test_kqv_concept(self, patched_vit, img_batch):
+    def test_kqv_concept(self, vit_tiny, img_batch):
         c = KQVConcept()
-        c.register_from_model(patched_vit)
-        conditions = [{self.LAYER_NAME: ["q"], "y": [42]}]
-        result = _attribute(patched_vit, c, conditions, img_batch)
-        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        c.register_from_model(vit_tiny)
+        conditions = [{LAYER_NAME: ["q"], "y": [42]}]
+        result = _attribute(vit_tiny, c, conditions, img_batch)
         B, _, H, W = img_batch.shape
         assert result.heatmap.shape == (B, H, W)
 
-    def test_kqv_head_concept(self, patched_vit, img_batch):
+    def test_kqv_head_concept(self, vit_tiny, img_batch):
         c = KQVHeadConcept()
-        c.register_from_model(patched_vit)
-        conditions = [{self.LAYER_NAME: [("k", 1)], "y": [42]}]
-        result = _attribute(patched_vit, c, conditions, img_batch)
-        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        c.register_from_model(vit_tiny)
+        conditions = [{LAYER_NAME: [("k", 1)], "y": [42]}]
+        result = _attribute(vit_tiny, c, conditions, img_batch)
         B, _, H, W = img_batch.shape
         assert result.heatmap.shape == (B, H, W)
 
-    def test_head_dim_concept(self, patched_vit, img_batch):
+    def test_head_dim_concept(self, vit_tiny, img_batch):
         c = HeadDimConcept()
-        c.register_from_model(patched_vit)
-        conditions = [{self.LAYER_NAME: [("v", 0, 0)], "y": [42]}]
-        result = _attribute(patched_vit, c, conditions, img_batch)
-        # zennit-crp heatmaps are (B, H, W) — channels summed.
+        c.register_from_model(vit_tiny)
+        conditions = [{LAYER_NAME: [("v", 0, 0)], "y": [42]}]
+        result = _attribute(vit_tiny, c, conditions, img_batch)
         B, _, H, W = img_batch.shape
         assert result.heatmap.shape == (B, H, W)
 
@@ -141,37 +182,33 @@ class TestEndToEndShapes:
 
 
 class TestRelevanceShapes:
-    """Verify the per-concept relevance scores from each concept's attribute()
-    have the right shape after a real backward pass."""
-
-    LAYER_NAME = "blocks.6.attn.qkv_tap"
+    """Per-concept relevance from ``concept.attribute()`` after a real backward."""
 
     def _record_relevance(self, model, concept, data, layer_name, raw_concept_id):
         attribution = CondAttribution(model)
+        composite = AttnLRPEpsilonComposite()
         conditions = [{layer_name: [raw_concept_id], "y": [42]}]
         result = attribution(
             data,
             conditions,
-            composite=None,
+            composite,
             mask_map=concept.mask,
             record_layer=[layer_name],
         )
         rel = result.relevances[layer_name]
         return concept.attribute(rel, layer_name=layer_name, abs_norm=False)
 
-    def test_head_concept_shape(self, patched_vit, img_batch):
+    def test_head_concept_shape(self, vit_tiny, img_batch):
         c = HeadConcept()
-        c.register_from_model(patched_vit)
-        scores = self._record_relevance(
-            patched_vit, c, img_batch, self.LAYER_NAME, 0
-        )
+        c.register_from_model(vit_tiny)
+        scores = self._record_relevance(vit_tiny, c, img_batch, LAYER_NAME, 0)
         # vit_tiny has 3 heads
         assert scores.shape == (1, 3)
 
-    def test_head_dim_shape(self, patched_vit, img_batch):
+    def test_head_dim_shape(self, vit_tiny, img_batch):
         c = HeadDimConcept()
-        c.register_from_model(patched_vit)
+        c.register_from_model(vit_tiny)
         scores = self._record_relevance(
-            patched_vit, c, img_batch, self.LAYER_NAME, ("q", 0, 0)
+            vit_tiny, c, img_batch, LAYER_NAME, ("q", 0, 0)
         )
         assert scores.shape == (1, 3, 3, 64)

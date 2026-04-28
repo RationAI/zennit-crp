@@ -318,34 +318,44 @@ class CondAttribution:
                     if l_name not in cond_l_names:
                         cond_l_names.append(l_name)
 
-        handles, layer_out = self._append_recording_layer_hooks(record_layer, start_layer, cond_l_names)
-
         name_map = [([name], hook) for name, hook in hook_map.items()]
         mask_composite = NameMapComposite(name_map)
 
         if composite is None:
             composite = Composite()
 
-        with mask_composite.context(self.model), composite.context(self.model) as modified:
+        # Order rationale:
+        # - Enter user `composite` first so its canonizers (e.g.
+        #   QKVTapCanonizer adding ``qkv_tap`` Identity submodules) run before
+        #   any module-name lookup downstream.
+        # - Recording-layer forward hooks are registered *inside* this context,
+        #   so they can find canonizer-created submodules; they're cleared on
+        #   exit before the canonizer reverts.
+        # - ``mask_composite`` (NameMapComposite) is entered last for the same
+        #   name-resolution reason.
+        with composite.context(self.model) as modified:
+            handles, layer_out = self._append_recording_layer_hooks(
+                record_layer, start_layer, cond_l_names
+            )
+            with mask_composite.context(self.model):
+                if start_layer:
+                    _ = modified(data)
+                    pred = layer_out[start_layer]
+                    grad_mask = self.relevance_init(pred.detach().clone(), None, init_rel)
+                    if start_layer in cond_l_names:
+                        cond_l_names.remove(start_layer)
+                    self.backward(pred, grad_mask, exclude_parallel, cond_l_names, layer_out)
 
-            if start_layer:
-                _ = modified(data)
-                pred = layer_out[start_layer]
-                grad_mask = self.relevance_init(pred.detach().clone(), None, init_rel)
-                if start_layer in cond_l_names:
-                    cond_l_names.remove(start_layer)
-                self.backward(pred, grad_mask, exclude_parallel, cond_l_names, layer_out)
+                else:
+                    pred = modified(data)
+                    grad_mask = self.relevance_init(pred.detach().clone(), y_targets, init_rel)
+                    self.backward(pred, grad_mask, exclude_parallel, cond_l_names, layer_out)
 
-            else:
-                pred = modified(data)
-                grad_mask = self.relevance_init(pred.detach().clone(), y_targets, init_rel)
-                self.backward(pred, grad_mask, exclude_parallel, cond_l_names, layer_out)
-
-            attribution = self.heatmap_modifier(data, on_device)
-            activations, relevances = {}, {}
-            if len(layer_out) > 0:
-                activations, relevances = self._collect_hook_activation_relevance(layer_out, on_device)
-            [h.remove() for h in handles]
+                attribution = self.heatmap_modifier(data, on_device)
+                activations, relevances = {}, {}
+                if len(layer_out) > 0:
+                    activations, relevances = self._collect_hook_activation_relevance(layer_out, on_device)
+                [h.remove() for h in handles]
 
         return attrResult(attribution, activations, relevances, pred)
 
@@ -379,8 +389,6 @@ class CondAttribution:
                 if l_name != self.MODEL_OUTPUT_NAME and l_name not in cond_l_names:
                     cond_l_names.append(l_name)
 
-        handles, layer_out = self._append_recording_layer_hooks(record_layer, start_layer, cond_l_names)
-
         name_map = [([name], hook) for name, hook in hook_map.items()]
         mask_composite = NameMapComposite(name_map)
 
@@ -399,58 +407,64 @@ class CondAttribution:
         data_batch.retain_grad()
         retain_graph = True
 
-        with mask_composite.context(self.model), composite.context(self.model) as modified:
+        # Order rationale (see ``_attribute``): canonizer in ``composite``
+        # registers first so name-based lookups in recording-layer hooks and
+        # ``mask_composite`` resolve newly-added submodules.
+        with composite.context(self.model) as modified:
+            handles, layer_out = self._append_recording_layer_hooks(
+                record_layer, start_layer, cond_l_names
+            )
+            with mask_composite.context(self.model):
+                if start_layer:
+                    _ = modified(data_batch)
+                    pred = layer_out[start_layer]
+                    if start_layer in cond_l_names:
+                        cond_l_names.remove(start_layer)
 
-            if start_layer:
-                _ = modified(data_batch)
-                pred = layer_out[start_layer]
-                if start_layer in cond_l_names:
-                    cond_l_names.remove(start_layer)
-
-            else:
-                pred = modified(data_batch)
-
-            if verbose:
-                pbar = tqdm(total=batches, dynamic_ncols=True)
-
-            for b in range(batches):
+                else:
+                    pred = modified(data_batch)
 
                 if verbose:
-                    pbar.update(1)
+                    pbar = tqdm(total=batches, dynamic_ncols=True)
 
-                cond_batch = conditions[b * batch_size: (b + 1) * batch_size]
+                for b in range(batches):
 
-                y_targets = []
-                for i, cond in enumerate(cond_batch):
-                    for l_name, indices in cond.items():
-                        if l_name == self.MODEL_OUTPUT_NAME:
-                            y_targets.append(indices)
-                        else:
-                            self._register_mask_fn(hook_map[l_name], mask_map, i, indices, l_name)
+                    if verbose:
+                        pbar.update(1)
 
-                if b == batches-1:
-                    # last batch may have len(y_targets) != batch_size. Padded part is ignored later.
-                    # and backward graph is freed with retain_graph=False
-                    if not start_layer:
-                        y_targets.extend([y_targets[0] for i in range(batch_size-len(y_targets))])
-                    batch_size = len(cond_batch)
-                    retain_graph = False
+                    cond_batch = conditions[b * batch_size: (b + 1) * batch_size]
 
-                grad_mask = self.relevance_init(pred.detach().clone(), y_targets, init_rel)
-                self.backward(pred, grad_mask, exclude_parallel, cond_l_names, layer_out, retain_graph)
+                    y_targets = []
+                    for i, cond in enumerate(cond_batch):
+                        for l_name, indices in cond.items():
+                            if l_name == self.MODEL_OUTPUT_NAME:
+                                y_targets.append(indices)
+                            else:
+                                self._register_mask_fn(hook_map[l_name], mask_map, i, indices, l_name)
 
-                heatmap = self.heatmap_modifier(data_batch)
-                activations, relevances = {}, {}
-                if len(layer_out) > 0:
-                    activations, relevances = self._collect_hook_activation_relevance(
-                        layer_out, on_device, batch_size)
+                    if b == batches-1:
+                        # last batch may have len(y_targets) != batch_size. Padded part is ignored later.
+                        # and backward graph is freed with retain_graph=False
+                        if not start_layer:
+                            y_targets.extend([y_targets[0] for i in range(batch_size-len(y_targets))])
+                        batch_size = len(cond_batch)
+                        retain_graph = False
 
-                yield attrResult(heatmap[:batch_size], activations, relevances, pred[:batch_size])
+                    grad_mask = self.relevance_init(pred.detach().clone(), y_targets, init_rel)
+                    self.backward(pred, grad_mask, exclude_parallel, cond_l_names, layer_out, retain_graph)
 
-                self._reset_gradients(data_batch)
-                [hook.fn_list.clear() for hook in hook_map.values()]
+                    heatmap = self.heatmap_modifier(data_batch)
+                    activations, relevances = {}, {}
+                    if len(layer_out) > 0:
+                        activations, relevances = self._collect_hook_activation_relevance(
+                            layer_out, on_device, batch_size)
 
-        [h.remove() for h in handles]
+                    yield attrResult(heatmap[:batch_size], activations, relevances, pred[:batch_size])
+
+                    self._reset_gradients(data_batch)
+                    [hook.fn_list.clear() for hook in hook_map.values()]
+
+            [h.remove() for h in handles]
 
         if verbose:
             pbar.close()

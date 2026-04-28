@@ -44,8 +44,6 @@ import torch.nn.functional as F
 import timm
 from timm.data import resolve_data_config, create_transform
 from PIL import Image
-from zennit.composites import EpsilonPlusFlat
-
 from crp.attention_concepts import (
     HeadConcept,
     KQVConcept,
@@ -54,7 +52,7 @@ from crp.attention_concepts import (
     PARTS,
 )
 from crp.attribution import CondAttribution
-from crp.transformer_patches import prepare_timm_vit
+from crp.transformer_patches import AttnLRPEpsilonComposite
 
 
 CONCEPT_DEFS = {
@@ -275,14 +273,15 @@ def main():
 
     print(f"loading {args.model}")
     model = timm.create_model(args.model, pretrained=True).eval().to(device)
-    prepare_timm_vit(model)
 
     block = model.blocks[args.block].attn
     num_heads, head_dim = block.num_heads, block.head_dim
     layer_name = f"blocks.{args.block}.attn.qkv_tap"
     print(f"layer={layer_name}  num_heads={num_heads}  head_dim={head_dim}")
 
-    composite = EpsilonPlusFlat()
+    # Composite bundles TimmViTCanonizer (qkv_tap injection + AttnLRP forward
+    # swaps) — applied scoped on composite.context(), reverted on exit.
+    composite = AttnLRPEpsilonComposite()
     attribution = CondAttribution(model, device=torch.device(device))
 
     image_paths = sorted(
