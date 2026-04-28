@@ -27,6 +27,7 @@ from crp.attention_concepts import (
 from crp.attribution import CondAttribution
 from crp.transformer_patches import (
     AttnLRPEpsilonComposite,
+    AttnLRPGammaComposite,
     QKVTapCanonizer,
     TimmViTCanonizer,
     timm_attention_forward,
@@ -123,6 +124,45 @@ def test_forward_runs_under_composite(vit_tiny, img_batch):
     with composite.context(vit_tiny) as modified:
         out = modified(img_batch)
     assert out.shape == (1, 1000)
+
+
+def test_forward_runs_under_gamma_composite(vit_tiny, img_batch):
+    composite = AttnLRPGammaComposite()
+    with composite.context(vit_tiny) as modified:
+        out = modified(img_batch)
+    assert out.shape == (1, 1000)
+
+
+def test_gamma_composite_attribution_end_to_end(vit_tiny, img_batch):
+    """γ-LRP composite must produce a pixel-space heatmap of the right shape
+    when paired with a HeadConcept mask."""
+    c = HeadConcept()
+    c.register_from_model(vit_tiny)
+    attribution = CondAttribution(vit_tiny)
+    composite = AttnLRPGammaComposite()
+    conditions = [{LAYER_NAME: [0], "y": [42]}]
+    result = attribution(img_batch, conditions, composite, mask_map=c.mask)
+    B, _, H, W = img_batch.shape
+    assert result.heatmap.shape == (B, H, W)
+
+
+def test_gamma_differs_from_epsilon(vit_tiny, img_batch):
+    """Numerical sanity: γ-LRP and ε-LRP should produce different heatmaps
+    on the same input + concept (γ biases toward positive contributions)."""
+    c = HeadConcept()
+    c.register_from_model(vit_tiny)
+    attribution = CondAttribution(vit_tiny)
+    conditions = [{LAYER_NAME: [0], "y": [42]}]
+
+    img_eps = img_batch.detach().clone().requires_grad_(True)
+    eps_result = attribution(
+        img_eps, conditions, AttnLRPEpsilonComposite(), mask_map=c.mask
+    )
+    img_gam = img_batch.detach().clone().requires_grad_(True)
+    gam_result = attribution(
+        img_gam, conditions, AttnLRPGammaComposite(gamma=0.25), mask_map=c.mask
+    )
+    assert not torch.allclose(eps_result.heatmap, gam_result.heatmap, atol=1e-6)
 
 
 # ── concept attribution end-to-end ────────────────────────────────────────────

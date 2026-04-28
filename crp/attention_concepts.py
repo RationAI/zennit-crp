@@ -15,10 +15,11 @@ Four concept granularities are provided, all sharing the same hook tap:
 * :class:`HeadDimConcept` — ``3 × num_heads × head_dim`` concepts; one per
   ``(part, head, dim)`` (i.e. one column of W_Q / W_K / W_V).
 
-These classes deliberately do NOT replace the existing
-:class:`crp.concepts.AttentionHeadConcept`. The legacy class hooks at
-``attn`` module output (post-``proj``); see ``CURRENT_STATE.md`` for the
-correctness discussion.
+A previous POC class :class:`AttentionHeadConcept` (in :mod:`crp.concepts`)
+hooked at the post-``proj`` attention output, which mixes all heads via the
+output Linear so a head-stripe mask there does **not** isolate head ``h``.
+That class has been removed; the four classes here replace it. See
+``CURRENT_STATE.md`` for the audit finding.
 """
 
 from typing import Dict, List, Tuple, Union

@@ -46,7 +46,7 @@ from torch.autograd import Function
 from zennit.canonizers import AttributeCanonizer, Canonizer, CompositeCanonizer
 from zennit.composites import LayerMapComposite
 from zennit.core import BasicHook, ParamMod, Stabilizer, stabilize
-from zennit.rules import Pass
+from zennit.rules import GammaMod, NoMod, Pass
 
 
 # ─── 1. Autograd Functions encoding AttnLRP rules ────────────────────────────
@@ -378,7 +378,41 @@ class GTIEpsilon(GradientTimesInputBasicHook):
         stabilizer_fn = Stabilizer.ensure(epsilon)
         super().__init__(
             input_modifiers=[lambda input: input],
-            param_modifiers=[ParamMod(lambda param, _: param, zero_params=zero_params)],
+            param_modifiers=[NoMod(zero_params=zero_params)],
+            output_modifiers=[lambda output: output],
+            gradient_mapper=(
+                lambda out_grad, outputs: out_grad / stabilizer_fn(outputs[0])
+            ),
+            reducer=(lambda inputs, gradients: inputs[0] * gradients[0]),
+        )
+
+
+class GTIGamma(GradientTimesInputBasicHook):
+    """γ-LRP in the gradient×input formulation, single-branch (positive
+    weight clamp).
+
+    AttnLRP §3.2.1 recommends γ ≈ 0.25 on ViT linear layers to mitigate
+    gradient shattering. The rule modifies the weights as
+    ``W' = W + γ·max(W, 0)`` per backward pass and runs the LRP backward
+    through the modified module — wrapped in the GTI framework
+    (multiply grad_output by output, divide relevance by input) so the
+    AttnLRP autograd Functions further down the graph compose correctly.
+
+    Parameters
+    ----------
+    gamma : float
+        Scaling for the positive-weight branch. Default 0.25.
+    epsilon : float
+        ε-stabilizer in the denominator. Default 1e-6.
+    zero_params : list[str] | None
+        Names of parameters to zero in the modified module (e.g. ``["bias"]``).
+    """
+
+    def __init__(self, gamma=0.25, epsilon=1e-6, zero_params=None):
+        stabilizer_fn = Stabilizer.ensure(epsilon)
+        super().__init__(
+            input_modifiers=[lambda input: input],
+            param_modifiers=[GammaMod(gamma, min=0, zero_params=zero_params)],
             output_modifiers=[lambda output: output],
             gradient_mapper=(
                 lambda out_grad, outputs: out_grad / stabilizer_fn(outputs[0])
@@ -417,6 +451,40 @@ class AttnLRPEpsilonComposite(LayerMapComposite):
         super().__init__(layer_map=layer_map, canonizers=canonizers)
 
 
+class AttnLRPGammaComposite(LayerMapComposite):
+    """AttnLRP with γ-LRP on ViT linears (AttnLRP §3.2.1).
+
+    Same structure as :class:`AttnLRPEpsilonComposite` but maps
+    ``nn.Linear`` and ``nn.Conv2d`` to :class:`GTIGamma` instead of
+    :class:`GTIEpsilon`. Recommended over the ε-only variant when
+    attributing through a deep ViT — the γ rule biases relevance toward
+    positive contributions and reduces gradient-shattering noise that
+    shows up as a deletion/insertion-AUC anomaly on finer concept
+    granularities under the bare ε-LRP composite.
+
+    Parameters
+    ----------
+    gamma : float
+        γ scaling. Default 0.25 per AttnLRP §3.2.1.
+    epsilon : float
+        ε-stabilizer in the LRP denominator. Default 1e-6.
+    canonizers : list[Canonizer] | None
+        Extra canonizers to apply alongside :class:`TimmViTCanonizer`.
+    """
+
+    def __init__(self, gamma=0.25, epsilon=1e-6, canonizers=None):
+        canonizers = list(canonizers or []) + [TimmViTCanonizer()]
+        layer_map = [
+            (nn.Linear, GTIGamma(gamma=gamma, epsilon=epsilon)),
+            (nn.Conv2d, GTIGamma(gamma=gamma, epsilon=epsilon)),
+            (nn.GELU, Pass()),
+            (nn.LayerNorm, Pass()),
+            (nn.Dropout, Pass()),
+            (nn.Identity, Pass()),
+        ]
+        super().__init__(layer_map=layer_map, canonizers=canonizers)
+
+
 __all__ = [
     # autograd Functions (AttnLRP rule kernels)
     "identity_rule_implicit",
@@ -432,6 +500,8 @@ __all__ = [
     # Hooks
     "GradientTimesInputBasicHook",
     "GTIEpsilon",
-    # Composite
+    "GTIGamma",
+    # Composites
     "AttnLRPEpsilonComposite",
+    "AttnLRPGammaComposite",
 ]
