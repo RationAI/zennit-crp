@@ -69,17 +69,17 @@ The 6 legacy tests in `tests/test_attribution.py` and `tests/test_integration.py
 
 User-facing capabilities only — minimal, focused, committed-as-they-are:
 
-* `walkthrough.ipynb` — end-to-end notebook (Imagenette download → composite → FV index per granularity → top-concept identification → reference samples → conditional heatmap). Tracked directly in the repo; edit in Jupyter.
-* `demo.py` — single-image CLI comparing the four granularities side-by-side.
+* `walkthrough.ipynb` — end-to-end notebook (dataset selection → composite → FV index per granularity → top-concept identification → reference samples → conditional heatmap → single-image comparative heatmaps across the four granularities, the previous `demo.py` content folded in). Tracked directly; edit in Jupyter.
 
 ### 6. Experiments — `experiments/`
 
 Sweeps and audits that drove design decisions; **not** prerequisites for using the library. Each script reads/writes under `data/` (gitignored).
 
+* `datasets.py` — uniform loader. ``load("imagenette", n_per_class=16, classes=[217,482,569,701])`` → 64-image dev/CI subset; ``load("imagenet_val", n_per_class=1)`` → 1000-image class-balanced benchmark sample. Imagenette auto-downloads; imagenet_val is gated and expects manual setup. Ships the canonical 1000-WordNet-ID list at `_data/imagenet_synsets.txt`.
 * `metrics.py` — Petsiuk deletion/insertion AUC machinery (per-granularity top-k, random-concept baseline, ε / γ composite factory). Imported by all milestone drivers; also runnable as a single-config CLI.
-* `run_milestone_a.py` — γ-LRP sweep on `vit_base_patch16_224` (Milestone A).
-* `run_milestone_d.py` — multi-model PA-LRP sweep on vit_small/base/large (Milestone D).
-* `run_milestone_g.py` — multi-model residual-LRP (symmetric / ratio) sweep (Milestone G).
+* `run_milestone_a.py` — γ-LRP sweep on `vit_base_patch16_224` (Milestone A). `--dataset {imagenette|imagenet_val}` switch.
+* `run_milestone_d.py` — multi-model PA-LRP sweep on vit_small/base/large (Milestone D). Same dataset switch.
+* `run_milestone_g.py` — multi-model residual-LRP (symmetric / ratio) sweep (Milestone G). Same dataset switch.
 * `aggregate_milestone_a.py` — turn the milestone-A CSV into a markdown table for the PR description.
 * `conservation_check.py` — diagnostic CLI that complements `tests/test_vit_integration.py::TestConservation`.
 
@@ -123,7 +123,8 @@ Dependency management is `uv add` / `uv sync`. `timm` and `Pillow` are pinned in
 | 8  | `4835c3c` | Milestone D — conservation test + PA-LRP. `PALRPCanonizer` (uniform rule at `x + pos_embed`, factor 2). `TimmViTCanonizer(palrp=…)`, both composites take `palrp` kwarg. Conservation diagnostic in `tests/test_vit_integration.py` and `tutorials/vit_crp/conservation_check.py`. Multi-model sweep `run_milestone_d.py` on `vit_small/base/large` × ± PA-LRP. Findings: PA-LRP halves heatmap uniformly → AUC unchanged (Pearson=1.0, argsort identical empirically). kqv_head failure persists at every model scale (vit_large worst, vit_small mildest — opposite of saturation hypothesis). |
 | 9  | `c38923e` | Milestone G — residual-LRP. `_ResidualRatioFn` (Otsuki ratio split, ∝ `|x|` vs `|branch|`) + `vit_block_forward_{symmetric,ratio}` swaps + `TimmViTCanonizer(residual_lrp=…)` toggle. `run_milestone_g.py` sweep. Symmetric is AUC-inert (Pearson=1.0, like PA-LRP). **Ratio fixes the kqv_head AUC anomaly at all three model sizes and gets vit_small to 4/4 OK** (was 2/4). Trade-off: breaks `head` on vit_base (del_gap −0.0075) and degrades vit_large further. Default kept off; opt-in via `residual_lrp='ratio'`. |
 | 10 | `c608a8e` | Concept refactor per design review. **Removed `KQVConcept`** (per-block coarse Q/K/V wasn't a meaningful concept detector). **Renamed old `HeadDimConcept` → `KQVHeadDimConcept`** and introduced **new `HeadConcept` and `HeadDimConcept` reading at the per-head output tokens**: a new `attn_out_tap` (`nn.Identity` between `attn @ v` and `self.proj`) is now the default tap for output-side concepts. Single `_AttentionConcept` base class with two boolean flags `KQV_SPLIT` and `DIM_SPLIT`; the four concrete classes are flag-only. `AttentionTapsCanonizer` (rename of `QKVTapCanonizer`) installs both taps; back-compat alias kept. Concepts auto-register attention dims when constructed with the model: `HeadConcept(model)`. Tests fully rewritten; tutorials, demo CLI, milestone drivers, walkthrough notebook, README updated. |
-| 11 | (this commit) | Repo layout cleanup. **Top-level `data/`** (single `.gitignore` entry) replaces nested `tutorials/vit_crp/data/` + `tutorials/vit_crp/FeatureVisualization/`. **`experiments/`** dir holds milestone drivers + metrics + conservation_check + aggregator (moved from `tutorials/vit_crp/`); `tutorials/vit_crp/` keeps only `walkthrough.ipynb` + `demo.py`. `_build_notebook.py` deleted — the notebook is tracked directly going forward. New `experiments/README.md`; `tutorials/vit_crp/README.md` rewritten to focus on the notebook + demo. Path defaults in scripts derive `<repo>/data/` from `__file__`; the notebook walks up to `pyproject.toml` to find the repo root. |
+| 11 | `66129e8` | Repo layout cleanup. **Top-level `data/`** (single `.gitignore` entry) replaces nested `tutorials/vit_crp/data/` + `tutorials/vit_crp/FeatureVisualization/`. **`experiments/`** dir holds milestone drivers + metrics + conservation_check + aggregator (moved from `tutorials/vit_crp/`); `tutorials/vit_crp/` keeps only `walkthrough.ipynb` + `demo.py`. `_build_notebook.py` deleted — the notebook is tracked directly going forward. New `experiments/README.md`; `tutorials/vit_crp/README.md` rewritten to focus on the notebook + demo. Path defaults in scripts derive `<repo>/data/` from `__file__`; the notebook walks up to `pyproject.toml` to find the repo root. |
+| 12 | (this commit) | Dataset abstraction (phase 1 of full-ImageNet support). New `experiments/datasets.py` exposes `load("imagenette", ...)` (auto-downloaded) and `load("imagenet_val", ...)` (gated; manual setup expected, code-ready, **not auto-downloaded**). Both yield a `CuratedDataset` (PIL image + ImageNet-1k class idx, also a `torch.utils.data.Dataset`). Canonical 1000-WordNet-ID list shipped at `experiments/_data/imagenet_synsets.txt`. All milestone drivers gain `--dataset {imagenette\|imagenet_val}` + `--n-per-class` + `--classes` flags; the old symlink-farm `build_curated_subset` is gone. `demo.py` deleted (single-image comparison folds into the walkthrough notebook in phase 2). |
 
 ## Public API (post-iter-10)
 

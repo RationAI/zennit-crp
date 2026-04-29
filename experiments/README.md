@@ -11,6 +11,15 @@ Run them from the repo root via `uv run python experiments/<script>.py`.
 
 ## Shared machinery
 
+* [`datasets.py`](datasets.py) — uniform loader for the two evaluation
+  sources. ``load("imagenette", ...)`` returns a 10-class fast.ai subset
+  (~98 MB, auto-downloaded); ``load("imagenet_val", ...)`` returns the
+  full 50 K-image ImageNet-1k val split (gated; expects manual setup
+  under `data/imagenet_val/`). Both yield a `CuratedDataset` whose
+  ``items`` is a list of ``(image_path, imagenet_class_idx)`` and which
+  is also a ``torch.utils.data.Dataset`` ready for FV indexing. The
+  canonical 1000-WordNet-ID list ships at
+  [`_data/imagenet_synsets.txt`](_data/imagenet_synsets.txt).
 * [`metrics.py`](metrics.py) — Petsiuk deletion / insertion AUC,
   random-concept baseline, per-granularity top-k resolver, image-class
   iteration helper, ε / γ composite factory. Imported by every milestone
@@ -55,9 +64,14 @@ Run them from the repo root via `uv run python experiments/<script>.py`.
 
 * All scripts target ε-LRP as default and accept knobs (`--gamma`,
   `--palrp`, `--rules`) for the milestone-specific sweep variants.
-* Curated image subset = Imagenette WordNet-IDs `n02102040`, `n02979186`,
-  `n03417042`, `n03888257` (English springer / cassette player / garbage
-  truck / parachute), 16 images each. Reproducible via `--seed`.
+* `--dataset {imagenette|imagenet_val}` selects the source. Defaults to
+  `imagenette` everywhere; switch to `imagenet_val` for a final pre-PR
+  benchmark run (gated; see [`datasets.py`](datasets.py)).
+* `--n-per-class` and `--classes` further subset the dataset.
+  `--n-per-class` defaults to **16** for imagenette (4 default classes ×
+  16 imgs ≈ 64-image sweep, ~10 min on an A100 MIG slice) and **1** for
+  imagenet_val (1000 classes × 1 img = 1000-image class-balanced sweep,
+  ~1 hour for ε-LRP on vit_base).
 * Top-k is per-granularity by default: `head: 4, head_dim: 8,
   kqv_head: 8, kqv_head_dim: 8`. Override with `--top-k <int>` to apply
   one value (clamped to the granularity's concept count). Petsiuk-style

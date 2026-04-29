@@ -40,12 +40,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from crp.attribution import CondAttribution
 from crp.transformer_patches import AttnLRPEpsilonComposite
+from datasets import load as load_dataset  # noqa: E402
 from metrics import (  # noqa: E402
     PER_GRANULARITY_TOP_K,
-    iter_image_classes,
     run_one_config,
 )
-from run_milestone_a import build_curated_subset  # noqa: E402
+from run_milestone_a import _resolve_dataset_kwargs  # noqa: E402
 
 
 # Mid-network block per model (where attention concepts are most informative).
@@ -62,16 +62,21 @@ def main():
     )
     data_dir = Path(__file__).resolve().parents[1] / "data"
     p.add_argument(
-        "--imagenette-root",
-        type=Path,
-        default=data_dir / "imagenette2-160",
+        "--dataset",
+        choices=("imagenette", "imagenet_val"),
+        default="imagenette",
     )
     p.add_argument(
-        "--curated-dir",
-        type=Path,
-        default=data_dir / "curated_milestone_a",
+        "--n-per-class",
+        type=int,
+        default=None,
+        help="Default 16 for imagenette, 1 for imagenet_val.",
     )
-    p.add_argument("--n-per-class", type=int, default=16)
+    p.add_argument(
+        "--classes",
+        default="",
+        help="comma-separated ImageNet-1k class indices to restrict to.",
+    )
     p.add_argument("--steps", type=int, default=14)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
@@ -95,14 +100,14 @@ def main():
 
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
 
-    print("building curated subset")
-    build_curated_subset(
-        args.imagenette_root, args.curated_dir, args.n_per_class, args.seed
-    )
-    image_class_pairs = iter_image_classes(args.curated_dir)
+    print(f"loading dataset: {args.dataset}")
+    ds_kwargs = _resolve_dataset_kwargs(args)
+    dataset = load_dataset(args.dataset, **ds_kwargs)
+    image_class_pairs = list(dataset.items)
     print(
-        f"  curated: {len(image_class_pairs)} images from "
-        f"{len(set(c for _, c in image_class_pairs))} class(es)"
+        f"  {dataset.name}: {len(image_class_pairs)} images from "
+        f"{dataset.num_classes} class(es) "
+        f"(n_per_class={ds_kwargs['n_per_class']})"
     )
 
     palrp_settings = {"off": [False], "on": [True], "both": [False, True]}[args.palrp]

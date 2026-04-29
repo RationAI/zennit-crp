@@ -39,63 +39,47 @@ from pathlib import Path
 
 import torch
 import timm
-from PIL import Image  # noqa: F401  (used transitively via metrics)
 
-# Allow `import metrics` regardless of CWD (tutorials/ is not a package).
+# Allow sibling-module imports regardless of CWD.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from crp.attribution import CondAttribution
+from datasets import load as load_dataset  # noqa: E402
 from metrics import (  # noqa: E402
     PER_GRANULARITY_TOP_K,
     build_composite,
-    iter_image_classes,
     run_one_config,
 )
 
 
-# ── Imagenette WordNet → ImageNet-1k class index (subset of notebook map) ────
+# ── default class subsets per dataset ─────────────────────────────────────────
 
 
-# Picked to be visually + semantically distinct and to cover enough img/class.
-CURATED_CLASSES = {
-    217: "n02102040",  # English springer
-    482: "n02979186",  # cassette player
-    569: "n03417042",  # garbage truck
-    701: "n03888257",  # parachute
-}
+# Imagenette has 10 classes; we pick a 4-class subset that's visually and
+# semantically distinct so even short sweeps see meaningful variance.
+IMAGENETTE_DEFAULT_CLASSES = (
+    217,  # English springer
+    482,  # cassette player
+    569,  # garbage truck
+    701,  # parachute
+)
 
 
-def build_curated_subset(
-    imagenette_root: Path, dest: Path, n_per_class: int = 16, seed: int = 0
-) -> None:
-    """Symlink ``n_per_class`` images per ``CURATED_CLASSES`` from imagenette
-    val/ into ``dest/<class_idx>/``. Idempotent."""
-    val = imagenette_root / "val"
-    if not val.is_dir():
-        raise SystemExit(
-            f"imagenette val/ not found at {val}. "
-            "Run the walkthrough notebook section 2 to download it, or "
-            "extract imagenette2-160.tgz under data/."
-        )
-    rng = random.Random(seed)
-    dest.mkdir(parents=True, exist_ok=True)
-    for cls_idx, wnid in CURATED_CLASSES.items():
-        cls_dir = dest / str(cls_idx)
-        cls_dir.mkdir(exist_ok=True)
-        existing = list(cls_dir.glob("*.JPEG"))
-        if len(existing) >= n_per_class:
-            print(f"  class {cls_idx} ({wnid}): {len(existing)} symlinks already present")
-            continue
-        src = val / wnid
-        if not src.is_dir():
-            raise SystemExit(f"missing imagenette class dir: {src}")
-        candidates = sorted(src.glob("*.JPEG"))
-        chosen = rng.sample(candidates, k=min(n_per_class, len(candidates)))
-        for p in chosen:
-            link = cls_dir / p.name
-            if not link.exists():
-                link.symlink_to(p.resolve())
-        print(f"  class {cls_idx} ({wnid}): {len(list(cls_dir.glob('*.JPEG')))} images")
+def _resolve_dataset_kwargs(args) -> dict:
+    """Build kwargs for ``datasets.load`` from CLI args, applying sensible
+    per-dataset defaults when the user hasn't overridden them."""
+    classes = (
+        [int(c) for c in args.classes.split(",") if c]
+        if args.classes
+        else (list(IMAGENETTE_DEFAULT_CLASSES) if args.dataset == "imagenette" else None)
+    )
+    n_per_class = args.n_per_class
+    if n_per_class is None:
+        # Default: 16 imgs/class for imagenette (4 classes × 16 = 64), and
+        # 1 img/class for the full-imagenet sweep (~1000-img class-balanced
+        # set). Override via --n-per-class.
+        n_per_class = 16 if args.dataset == "imagenette" else 1
+    return dict(classes=classes, n_per_class=n_per_class, seed=args.seed)
 
 
 # ── summary table ─────────────────────────────────────────────────────────────
@@ -157,21 +141,30 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    repo_root = Path(__file__).resolve().parents[1]
-    data_dir = repo_root / "data"
+    data_dir = Path(__file__).resolve().parents[1] / "data"
     p.add_argument(
-        "--imagenette-root",
-        type=Path,
-        default=data_dir / "imagenette2-160",
-        help="extracted imagenette2-160 directory (containing train/ + val/)",
+        "--dataset",
+        choices=("imagenette", "imagenet_val"),
+        default="imagenette",
+        help="evaluation set source. ``imagenette`` (default) is fast and "
+             "auto-downloads (~98 MB); ``imagenet_val`` requires a manually "
+             "populated <repo>/data/imagenet_val/ tree (see "
+             "experiments/datasets.py docstring).",
     )
     p.add_argument(
-        "--curated-dir",
-        type=Path,
-        default=data_dir / "curated_milestone_a",
-        help="class-keyed dir of evaluation images",
+        "--n-per-class",
+        type=int,
+        default=None,
+        help="images per class. Default 16 for imagenette (4 classes × 16 = "
+             "64 imgs), 1 for imagenet_val (1000 classes × 1 = 1000 imgs).",
     )
-    p.add_argument("--n-per-class", type=int, default=16)
+    p.add_argument(
+        "--classes",
+        default="",
+        help="comma-separated ImageNet-1k class indices to restrict to. "
+             "Default: a 4-class Imagenette subset for --dataset=imagenette, "
+             "all classes for imagenet_val.",
+    )
     p.add_argument("--block", type=int, default=6)
     p.add_argument(
         "--top-k",
@@ -204,15 +197,15 @@ def main():
 
     device = "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
 
-    # 1. Build curated subset (idempotent).
-    print("building curated subset")
-    build_curated_subset(
-        args.imagenette_root, args.curated_dir, args.n_per_class, args.seed
-    )
-    image_class_pairs = iter_image_classes(args.curated_dir)
+    # 1. Resolve evaluation set.
+    print(f"loading dataset: {args.dataset}")
+    ds_kwargs = _resolve_dataset_kwargs(args)
+    dataset = load_dataset(args.dataset, **ds_kwargs)
+    image_class_pairs = list(dataset.items)
     print(
-        f"  curated: {len(image_class_pairs)} images from "
-        f"{len(set(c for _, c in image_class_pairs))} class(es)"
+        f"  {dataset.name}: {len(image_class_pairs)} images from "
+        f"{dataset.num_classes} class(es) "
+        f"(n_per_class={ds_kwargs['n_per_class']})"
     )
 
     # 2. Model + attribution (re-used across composites).

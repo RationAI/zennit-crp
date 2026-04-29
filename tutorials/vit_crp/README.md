@@ -89,27 +89,21 @@ The notebook is committed directly; edit it in Jupyter. To rebuild from
 scratch, delete `data/feature_visualization/` (and optionally
 `data/imagenette2-160*` to re-download).
 
-## Standalone demo (CLI): comparative heatmaps
+## Single-image comparative heatmaps
 
-[`demo.py`](demo.py) runs the four concept granularities on a single
-image, picks the top-`k` concepts per granularity (ranked by absolute
-relevance under the target class), and renders a comparison grid.
-
-```bash
-uv run python tutorials/vit_crp/demo.py \
-    --image path/to/image.jpg \
-    --target-class 281 \
-    --block 6 \
-    --top-k 4 \
-    --out figures/comparison.png
-```
+The notebook also runs the four concept granularities on one selected
+image, picks the top-k concepts per granularity (ranked by absolute
+relevance under the target class), and renders a comparison grid — same
+content as the previous standalone `demo.py`, now folded into the
+walkthrough so all results are presented in one notebook.
 
 ImageNet target-class indices: 281 is *tabby cat*, 207 is *golden
 retriever*, 817 is *sports car*, etc. (full list at
 `https://github.com/anishathalye/imagenet-simple-labels`).
 
-The `--block` flag chooses the ViT attention block to attribute through;
-each concept hooks the right tap on that block automatically. For
+The notebook's `BLOCK_INDEX` cell chooses which ViT attention block to
+attribute through; each concept class auto-resolves the right tap
+(`attn_out_tap` or `qkv_tap`) on that block. For
 `vit_base_patch16_224` (12 blocks), mid-network blocks (5–9) tend to carry
 the most class-relevant structure.
 
