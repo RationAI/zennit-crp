@@ -14,9 +14,10 @@ transfer to attention-concept granularities under the union-of-top-k
 Petsiuk methodology and consistently makes most cells worse.
 
 Decision: **escalate to Milestone D** (conservation + PA-LRP) before any
-further γ tuning. PA-LRP is the highest-likelihood fix for `kqv_head`
-since the residual relevance leak through `pos_embed` is exactly the kind
-of constant-energy term the union-of-top-8 mask would saturate first.
+further γ tuning. *(Iter-8 follow-up: D ran. PA-LRP halves the heatmap
+uniformly so it cannot change rank → AUC; saturation is also disproven by
+cross-scale data — vit_large is **worse** than vit_base on kqv_head, not
+better. Next high-likelihood fix is residual-LRP, tracked as Milestone G.)*
 
 Done in iter 7:
 
@@ -54,13 +55,79 @@ A richer benchmark beyond the current deletion / insertion AUC + random-concept 
 
 This is the heaviest milestone (~few hundred LOC + a non-trivial dataset call), and is somewhat independent of milestones A and B. Defer if Milestone A turns up surprises.
 
-## Milestone D — conservation + PA-LRP (gated)
+## Milestone D — conservation + PA-LRP (closed; PA-LRP shipped, AUC anomaly unaffected)
 
-The original AttnLRP paper (Eq. 1) requires `R_input.sum() ≈ R_output.sum()`; positional encodings are treated as constants in the LXT reference impl, which can violate conservation when the positional energy is non-trivial. PA-LRP (Bakish et al., NeurIPS 2025; arXiv 2506.02138) defines an additive rule for positional encodings.
+Done in iter 8 (`run_milestone_d.py`, 3072-row CSV, summary in
+`CURRENT_STATE.md` "Milestone D — conservation + PA-LRP (iter 8)"):
 
-13. **Conservation quantitative test** — measure the ratio `|R_input.sum()| / |R_output.sum()|` per attribution; assert it's within 5 %. Add to `tests/test_vit_integration.py`.
-14. **If 13 fails**: implement PA-LRP as a Canonizer that wraps the additive `pos_embed` step in a `_DivideGradientFn(factor=2)` (uniform-rule allocation between input embedding and positional embedding). New class `PALRPCanonizer`. Update `TimmViTCanonizer` to compose it.
-15. **If 13 passes**: document the conservation check, mark PA-LRP as not needed.
+13. ✅ Conservation diagnostic in `tests/test_vit_integration.py`. ε ratio
+    on real `vit_base` + Imagenette image is **−223** (no PA-LRP), **−112**
+    (with PA-LRP). Far from 1.0 — the leak is dominated by un-hooked
+    residual additions in each block, not by `pos_embed`.
+14. ✅ `PALRPCanonizer` shipped — `vit_pos_embed_palrp` forward swap,
+    `palrp: bool` kwarg on `TimmViTCanonizer` and both composites. Defaults
+    off (rationale below).
+15. ✅ Empirically **PA-LRP halves the heatmap by an exact factor of 2**
+    (Pearson 1.0000 with the no-PA-LRP heatmap, `argsort` identical) →
+    Petsiuk AUC unchanged at every (model, granularity) row of the
+    multi-model sweep. PA-LRP is a conservation-magnitude fix, not an AUC
+    fix; left opt-in to avoid a silent ½× rescale of users' heatmaps.
+
+The `kqv_head` AUC anomaly that motivated escalation A → D is **not**
+fixed by PA-LRP, because PA-LRP cannot change ranking. The cross-scale
+sweep also rules out the saturation hypothesis: vit_large (top-k coverage
+17 %) has the **worst** kqv_head failure (`del_gap` = −0.0165), vit_small
+(coverage 44 %) the **mildest** (−0.0011). Scale amplifies the AUC
+inversion rather than diluting it, pointing at accumulated rule error
+along the per-block backward chain.
+
+## Milestone G — residual-LRP (highest-likelihood fix for the AUC anomaly)
+
+Each transformer block does `x = x + attn(x)` and `x = x + mlp(x)` as
+plain tensor `+`. zennit attaches no hook to a tensor op, so relevance
+flowing back receives the full upstream relevance on **both** branches
+(double-allocation; not conservative; ~2× per block). Conservation
+ratio on a 12-block ViT drifts ~10²× and on a 24-block ViT ~10⁴×, which
+matches the 24-block model's amplified AUC inversion.
+
+PA-LRP at `pos_embed` doesn't address this — the residual additions are
+inside each block, repeated 24 times for vit_large.
+
+Sketch:
+
+23. Add `_BlockResidualFn(Function)` — identity in forward, `divide_gradient`
+    by **2** on the additive output (uniform rule allocates relevance
+    equally between the identity branch `x` and the residual branch
+    `f(x)`). One per `Block.forward`'s two adds.
+24. `vit_block_forward(self, x)` — replicates timm `Block.forward` with
+    each `x = x + branch(x)` rewritten as
+    `x = divide_gradient(x + branch(x), 2)`. Versioned per timm-`Block`
+    layout (`init_values`, `parallel`, `Mlp`/`SwiGLU` variants).
+25. `BlockResidualCanonizer(AttributeCanonizer)` — swaps `forward` per
+    `Block` instance.
+26. Compose into `TimmViTCanonizer` behind a `residual_lrp: bool` kwarg
+    (or default-on if conservation tests confirm it's the right fix).
+27. Re-run `run_milestone_d.py` with the new canonizer enabled. Acceptance:
+    kqv_head and head_dim del/ins gaps positive across all three model
+    sizes.
+
+Risk: residual-LRP can over-correct and flatten the heatmap. If it
+collapses the discriminative signal, fall back to single-branch (only the
+attn residual, not the mlp) and re-measure.
+
+## Milestone H — methodology check (independent investigation)
+
+Even if residual-LRP helps, the union-of-top-k Petsiuk variant is non-standard
+and may have its own pathologies. Worth running once for triangulation:
+
+28. **Pixel-rank Petsiuk on the single top-1 conditional heatmap** — instead
+    of "union of 8 concepts", compute the heatmap conditional on the
+    top-1 concept only, then rank pixels of *that* heatmap. Bypasses the
+    union saturation hypothesis (which we ruled out via cross-scale, but
+    confirmation never hurts).
+29. **Signed top-k vs absolute top-k** — current ranking uses
+    `scores.flatten().abs()`. Try `scores.flatten()` (positive contributions
+    only) and report.
 
 ## Milestone E — visualisation polish
 

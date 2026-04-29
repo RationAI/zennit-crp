@@ -89,7 +89,8 @@ Dependency management is `uv add` / `uv sync`. Optional extras: `vit` (timm + tr
 | 4  | `e055e48` | Replace monkey-patching with Canonizer + Hook + Composite (idiomatic zennit) |
 | 5  | `8019975` / `3c80950` | γ-LRP variant (`GTIGamma` / `AttnLRPGammaComposite`) + drop legacy classes + state docs refresh |
 | 6  | `526c77a` | Generalise `FeatureVisualization._attribution_on_reference` — pull `mask_map` from `self.layer_map[layer_name]` instead of hardcoded `ChannelConcept.{mask,mask_rf}`. Restores per-reference-sample conditional heatmaps for the four attention concepts. |
-| 7  | (this commit) | Milestone A faithfulness sweep on `vit_base_patch16_224` (64 imgs × 4 classes × {ε, γ ∈ 0.0/0.1/0.25/0.5} × 4 granularities × {true, random}, per-granularity top-k). Methodology fix (`resolve_top_k`), per-granularity top-k defaults, `run_milestone_a.py` driver, `aggregate_milestone_a.py` table emitter. Drop stale `IMPLEMENTATION_PLAN.md`. |
+| 7  | `c7cd0d7` | Milestone A faithfulness sweep on `vit_base_patch16_224` (64 imgs × 4 classes × {ε, γ ∈ 0.0/0.1/0.25/0.5} × 4 granularities × {true, random}, per-granularity top-k). Methodology fix (`resolve_top_k`), per-granularity top-k defaults, `run_milestone_a.py` driver, `aggregate_milestone_a.py` table emitter. Drop stale `IMPLEMENTATION_PLAN.md`. |
+| 8  | (this commit) | Milestone D — conservation test + PA-LRP. `PALRPCanonizer` (uniform rule at `x + pos_embed`, factor 2). `TimmViTCanonizer(palrp=…)`, both composites take `palrp` kwarg. Conservation diagnostic in `tests/test_vit_integration.py` and `tutorials/vit_crp/conservation_check.py`. Multi-model sweep `run_milestone_d.py` on `vit_small/base/large` × ± PA-LRP. Findings: PA-LRP halves heatmap uniformly → AUC unchanged (Pearson=1.0, argsort identical empirically). kqv_head failure persists at every model scale (vit_large worst, vit_small mildest — opposite of saturation hypothesis). |
 
 ## Public API (post-iter-5)
 
@@ -173,8 +174,90 @@ contributions in a way that flattens the per-concept ranking specificity.
 `AttnLRPGammaComposite(gamma=0.25)` available for users who want the
 paper-default rule but flag the AUC behaviour. Re-evaluate after Milestone D.
 
+## Milestone D — conservation + PA-LRP (iter 8)
+
+### What landed
+
+* **Conservation diagnostic** — `tests/test_vit_integration.py::TestConservation`
+  (3 tests, gating off — current pipeline is far from conservative; loose
+  assertions for regression detection only). Companion CLI:
+  `tutorials/vit_crp/conservation_check.py`.
+* **PA-LRP**: `vit_pos_embed_palrp` swap, `PALRPCanonizer` integrated
+  through a `palrp: bool` kwarg on `TimmViTCanonizer`,
+  `AttnLRPEpsilonComposite`, `AttnLRPGammaComposite`. Default off — PA-LRP
+  is opt-in until conservation justifies turning it on.
+
+### Conservation finding
+
+`R_input.sum() / target_logit` ratios on a real Imagenette image (target
+class 217), pretrained models:
+
+| model | ε | ε+PA-LRP | γ=0.25 | γ=0.25+PA-LRP |
+|---|---|---|---|---|
+| vit_tiny | −14.6 | −7.3 | −1.7e31 | −8.8e30 |
+| vit_small | 3.0e8 | 1.5e8 | NaN | NaN |
+| vit_base | −223 | −112 | −1.6e35 | −7.8e34 |
+
+PA-LRP halves the ratio **exactly** (mathematical: it halves the gradient
+once at the additive `pos_embed` step). It does not approach 1.0 — the
+remaining ~100× drift is dominated by the unhooked residual additions
+inside each block (`x = x + attn(x)` and `x = x + mlp(x)` are plain
+tensor `+`, no LRP rule applied), which add ~2× per block. γ-LRP magnitudes
+are catastrophic and unfixable by PA-LRP. Documented in test docstrings.
+
+### PA-LRP × AUC finding
+
+Run `tutorials/vit_crp/run_milestone_d.py` (multi-model: vit_small / base /
+large × ε-LRP × {palrp off, on}, same 64-image curated subset and 14-step
+deletion/insertion as milestone A). 3072 rows in
+`tutorials/vit_crp/data/milestone_d_results.csv`.
+
+**PA-LRP changes nothing about AUC** — every (model, granularity) row in
+the summary table reproduces bit-identically across `palrp=False` and
+`palrp=True` (del_AUC, ins_AUC at 4 dp). Independently verified on a
+single image: with PA-LRP the heatmap = baseline × 0.5 at every pixel
+(Pearson 1.0000, `argsort` identical). PA-LRP halves a constant factor;
+AUC is rank-based; rank is preserved. PA-LRP is a conservation-magnitude
+fix, not a faithfulness fix — for the milestone-A AUC anomaly it is
+mathematically inert.
+
+### Multi-scale finding (`kqv_head` AUC anomaly)
+
+`del_gap` for `kqv_head` (ε-LRP, top-8, mid-block):
+
+| model | n_concepts | top_k_coverage | del_gap | ins_gap | verdict |
+|---|---|---|---|---|---|
+| vit_small (12 blocks, 6 heads) | 18 | 8/18 = 44 % | **−0.0011** | +0.0005 | del_FAIL (mildest) |
+| vit_base (12 blocks, 12 heads) | 36 | 8/36 = 22 % | −0.0088 | −0.0120 | del_FAIL + ins_FAIL |
+| vit_large (24 blocks, 16 heads) | 48 | 8/48 = 17 % | **−0.0165** | +0.0026 | del_FAIL (worst) |
+
+The saturation hypothesis (smaller-`n` → more overlap with random) predicted
+**vit_small** would be **worst**. The data shows the opposite: vit_large is
+**worst**, vit_small **mildest**. Saturation is not the cause. Scale
+amplifies the failure, suggesting accumulated LRP-rule error along the
+24-block backward chain rather than concept-set redundancy.
+
+`vit_large` also flips `head_dim` from `OK` (vit_base, +0.060) to
+`del_FAIL` (vit_large, −0.033). The 24-block backward chain accumulates
+enough rule error that the ranking on the 3072 head_dim concepts inverts.
+
+### Decision
+
+* **Default kept as `AttnLRPEpsilonComposite(palrp=False)`**. PA-LRP has
+  no AUC effect; turning it on by default would be an opaque ½×
+  rescaling of every heatmap with no upside.
+* **Milestone D is closed**: PA-LRP is implemented, opt-in, tested. The
+  kqv_head failure mode it was hypothesised to fix is unrelated to
+  pos_embed.
+* **kqv_head and (vit_large) head_dim AUC remain open.** The probable
+  cause — un-hooked residual additions accumulating ~2×/block — is a
+  separate fix (residual-LRP via a `BlockResidualCanonizer` that wraps the
+  `x = x + branch(x)` step in `divide_gradient(2)`). Tracked in
+  FUTURE_STATE.md as the next milestone.
+
 ## Outstanding work
 
-See `FUTURE_STATE.md`. Milestone A is **investigated, not closed** — the
-ordering criterion fails on `kqv_head` regardless of γ, escalating to
-Milestone D (conservation check + PA-LRP).
+See `FUTURE_STATE.md`. Milestone A is **investigated, not closed**;
+Milestone D is **closed** but the underlying AUC anomaly it was meant to
+fix turned out to be unrelated to PA-LRP. The next high-likelihood fix is
+residual-LRP (un-hooked `x = x + f(x)` in each transformer block).

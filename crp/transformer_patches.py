@@ -129,6 +129,58 @@ def dropout_passthrough_forward(self, x):
     return x
 
 
+def vit_pos_embed_palrp(self, x):
+    """timm ``VisionTransformer._pos_embed`` replacement implementing PA-LRP.
+
+    PA-LRP (Bakish et al., NeurIPS 2025; arXiv 2506.02138) treats the
+    additive ``x = x + pos_embed`` step as a bilinear-style operation under
+    the LRP uniform rule (Eq. 7 of AttnLRP) and allocates relevance equally
+    between the two operands. Because ``pos_embed`` is a learned parameter
+    with no upstream input, its half is "absorbed"; the remaining half flows
+    back to ``x``. Without this, the additive step is transparent to
+    backward and ``x`` receives the full upstream relevance, double-counting
+    it against ``pos_embed``.
+
+    Implementation: identical to the upstream ``_pos_embed`` (timm 1.0.x —
+    handles ``cls_token``/``reg_token``, ``no_embed_class`` deit-3 variant,
+    ``dynamic_img_size``) except the result of the additive step is wrapped
+    in :func:`divide_gradient` with ``factor=2``.
+    """
+    to_cat = []
+    if self.cls_token is not None:
+        to_cat.append(self.cls_token.expand(x.shape[0], -1, -1))
+    if self.reg_token is not None:
+        to_cat.append(self.reg_token.expand(x.shape[0], -1, -1))
+
+    if self.pos_embed is None:
+        return torch.cat(to_cat + [x.view(x.shape[0], -1, x.shape[-1])], dim=1)
+
+    if self.dynamic_img_size:
+        from timm.layers.pos_embed import resample_abs_pos_embed
+        B, H, W, C = x.shape
+        prev_grid_size = self.patch_embed.grid_size
+        pos_embed = resample_abs_pos_embed(
+            self.pos_embed,
+            new_size=(H, W),
+            old_size=prev_grid_size,
+            num_prefix_tokens=0 if self.no_embed_class else self.num_prefix_tokens,
+        )
+        x = x.view(B, -1, C)
+    else:
+        pos_embed = self.pos_embed
+
+    if self.no_embed_class:
+        x = divide_gradient(x + pos_embed, 2)
+        if to_cat:
+            x = torch.cat(to_cat + [x], dim=1)
+    else:
+        if to_cat:
+            x = torch.cat(to_cat + [x], dim=1)
+        x = divide_gradient(x + pos_embed, 2)
+
+    return self.pos_drop(x)
+
+
 def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
     """timm ``Attention.forward`` replacement for AttnLRP + concept hooking.
 
@@ -283,27 +335,56 @@ def _dropout_attribute_map(_name, module):
     return None
 
 
+def _vit_pos_embed_attribute_map(_name, module):
+    """AttributeCanonizer attribute_map: swap ``_pos_embed`` on timm
+    ``VisionTransformer`` instances to apply PA-LRP."""
+    try:
+        from timm.models.vision_transformer import VisionTransformer
+    except ImportError:
+        return None
+    if isinstance(module, VisionTransformer) and hasattr(module, "_pos_embed"):
+        bound = vit_pos_embed_palrp.__get__(module, type(module))
+        return {"_pos_embed": bound}
+    return None
+
+
 class TimmViTCanonizer(CompositeCanonizer):
     """All graph + forward changes needed for AttnLRP on a timm ViT, in one
     canonizer. Composes:
 
     * :class:`QKVTapCanonizer` — install ``qkv_tap`` Identity submodule.
     * ``AttributeCanonizer`` — swap ``forward`` on ``Attention``,
-      ``LayerNorm``, ``GELU``, ``Dropout`` instances.
+      ``LayerNorm``, ``GELU``, ``Dropout`` instances; optionally swap
+      ``_pos_embed`` on ``VisionTransformer`` for the PA-LRP rule
+      (Bakish et al.).
 
     All mutations are instance-level and reversible. Bundled into
     :class:`AttnLRPEpsilonComposite`; pass it explicitly to other
     composites if you want a custom rule map.
+
+    Parameters
+    ----------
+    palrp : bool
+        If True, also swap the ViT's ``_pos_embed`` to wrap the additive
+        ``x + pos_embed`` step in a uniform-rule ``divide_gradient(., 2)``.
+        Defaults to False because (a) AttnLRP §3 / Achtibat et al. don't use
+        it and the milestone-A audit baseline is without; (b) the
+        ``vit_pos_embed_palrp`` reimplements timm's ``_pos_embed`` and is
+        sensitive to upstream timm changes. Enable per AttnLRP-paper-Eq.-1
+        conservation if needed (see ``FUTURE_STATE.md`` Milestone D).
     """
 
-    def __init__(self):
-        super().__init__([
+    def __init__(self, palrp: bool = False):
+        canonizers = [
             QKVTapCanonizer(),
             AttributeCanonizer(_attn_attribute_map),
             AttributeCanonizer(_layer_norm_attribute_map),
             AttributeCanonizer(_gelu_attribute_map),
             AttributeCanonizer(_dropout_attribute_map),
-        ])
+        ]
+        if palrp:
+            canonizers.append(AttributeCanonizer(_vit_pos_embed_attribute_map))
+        super().__init__(canonizers)
 
 
 # ─── 4. Custom Hook — gradient×input LRP backward ────────────────────────────
@@ -438,8 +519,8 @@ class AttnLRPEpsilonComposite(LayerMapComposite):
     ``SequentialMergeBatchNorm`` for a hybrid model.
     """
 
-    def __init__(self, epsilon=1e-6, canonizers=None):
-        canonizers = list(canonizers or []) + [TimmViTCanonizer()]
+    def __init__(self, epsilon=1e-6, canonizers=None, palrp: bool = False):
+        canonizers = list(canonizers or []) + [TimmViTCanonizer(palrp=palrp)]
         layer_map = [
             (nn.Linear, GTIEpsilon(epsilon)),
             (nn.Conv2d, GTIEpsilon(epsilon)),
@@ -472,8 +553,8 @@ class AttnLRPGammaComposite(LayerMapComposite):
         Extra canonizers to apply alongside :class:`TimmViTCanonizer`.
     """
 
-    def __init__(self, gamma=0.25, epsilon=1e-6, canonizers=None):
-        canonizers = list(canonizers or []) + [TimmViTCanonizer()]
+    def __init__(self, gamma=0.25, epsilon=1e-6, canonizers=None, palrp: bool = False):
+        canonizers = list(canonizers or []) + [TimmViTCanonizer(palrp=palrp)]
         layer_map = [
             (nn.Linear, GTIGamma(gamma=gamma, epsilon=epsilon)),
             (nn.Conv2d, GTIGamma(gamma=gamma, epsilon=epsilon)),
@@ -494,6 +575,7 @@ __all__ = [
     "layer_norm_forward",
     "dropout_passthrough_forward",
     "timm_attention_forward",
+    "vit_pos_embed_palrp",
     # Canonizers
     "QKVTapCanonizer",
     "TimmViTCanonizer",
