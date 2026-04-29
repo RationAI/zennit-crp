@@ -101,10 +101,10 @@ ImageNet target-class indices: 281 is *tabby cat*, 207 is *golden
 retriever*, 817 is *sports car*, etc. (full list at
 `https://github.com/anishathalye/imagenet-simple-labels`).
 
-The notebook's `BLOCK_INDEX` cell chooses which ViT attention block to
+The notebook's `MID_LAYER` cell chooses which ViT attention layer to
 attribute through; each concept class auto-resolves the right tap
-(`attn_out_tap` or `qkv_tap`) on that block. For
-`vit_base_patch16_224` (12 blocks), mid-network blocks (5–9) tend to carry
+(`attn_out_tap` or `qkv_tap`) on that layer. For
+`vit_base_patch16_224` (12 layers), mid-network layers (5–9) tend to carry
 the most class-relevant structure.
 
 ## Hyperparameters that matter
@@ -115,9 +115,9 @@ the most class-relevant structure.
     noise on deep ViTs.
   * `AttnLRPGammaComposite(gamma=0.25)` — γ-LRP on linears (single-branch
     positive-weight clamp). The recommended default for ViT linears.
-* **Block index**: each attention block is independent; the choice is
-  empirical. Mid- to late-network blocks usually carry class-relevant
-  structure; very-early blocks carry low-level features.
+* **Layer index**: each attention layer is independent; the choice is
+  empirical. Mid- to late-network layers usually carry class-relevant
+  structure; very-early layers carry low-level features.
 
 ## What's next (this fork's roadmap)
 

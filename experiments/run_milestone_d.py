@@ -48,8 +48,8 @@ from metrics import (  # noqa: E402
 from run_milestone_a import _resolve_dataset_kwargs  # noqa: E402
 
 
-# Mid-network block per model (where attention concepts are most informative).
-MID_BLOCK = {
+# Mid-network layer per model (where attention concepts are most informative).
+MID_LAYER = {
     "vit_small_patch16_224": 6,
     "vit_base_patch16_224": 6,
     "vit_large_patch16_224": 12,
@@ -116,11 +116,11 @@ def main():
     for model_name in (m.strip() for m in args.models.split(",") if m.strip()):
         print(f"\nloading {model_name}")
         model = timm.create_model(model_name, pretrained=True).eval().to(device)
-        block_idx = MID_BLOCK.get(model_name, len(model.blocks) // 2)
-        attn = model.blocks[block_idx].attn
+        layer_idx = MID_LAYER.get(model_name, len(model.blocks) // 2)
+        attn = model.blocks[layer_idx].attn
         num_heads, head_dim = attn.num_heads, attn.head_dim
         print(
-            f"  block={block_idx}/{len(model.blocks)}  num_heads={num_heads}  "
+            f"  block={layer_idx}/{len(model.blocks)}  num_heads={num_heads}  "
             f"head_dim={head_dim}"
         )
         attribution = CondAttribution(model, device=torch.device(device))
@@ -142,7 +142,7 @@ def main():
                 composite_label=composite_label,
                 gamma_label=None,
                 image_class_pairs=image_class_pairs,
-                block_idx=block_idx,
+                layer_idx=layer_idx,
                 num_heads=num_heads,
                 head_dim=head_dim,
                 top_k=PER_GRANULARITY_TOP_K,
@@ -153,7 +153,7 @@ def main():
             for r in rows:
                 r["model"] = model_name
                 r["palrp"] = palrp
-                r["block"] = block_idx
+                r["layer"] = layer_idx
             all_rows.extend(rows)
 
         del model, attribution

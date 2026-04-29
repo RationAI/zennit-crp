@@ -18,8 +18,9 @@ Metrics
 The four supported concepts each pick their own hook tap: ``HeadConcept`` /
 ``HeadDimConcept`` read at the per-head output tokens (``attn_out_tap``);
 ``KQVHeadConcept`` / ``KQVHeadDimConcept`` read at the K/Q/V projections
-(``qkv_tap``). The caller passes a block index and the layer name is
-resolved per-concept as ``blocks.{block}.attn.{concept.tap_name}``.
+(``qkv_tap``). The caller passes a layer index and the layer name is
+resolved per-concept as ``blocks.{layer_idx}.attn.{concept.tap_name}``
+(``blocks.`` is timm's attribute name for the transformer-layer stack).
 
 Usage
 -----
@@ -27,14 +28,14 @@ Usage
 Flat directory (single target class for every image)::
 
     uv run python experiments/metrics.py \\
-        --image-dir path/to/images --target-class 281 --block 6 \\
+        --image-dir path/to/images --target-class 281 --layer 6 \\
         --composite gamma --gamma 0.25 --top-k 8 --out results.csv
 
 Class-keyed directory tree (subdir name = ImageNet-1k class index, target
 class is auto-resolved per image)::
 
     uv run python experiments/metrics.py \\
-        --image-dir path/to/curated --block 6 \\
+        --image-dir path/to/curated --layer 6 \\
         --composite gamma --gamma 0.25 --top-k 8 --out results.csv
 
 Each row of ``results.csv`` is one ``(image, target_class, concept_def,
@@ -92,15 +93,15 @@ def _enumerate_ids(name: str, num_heads: int, head_dim: int) -> list:
     raise ValueError(name)
 
 
-def _layer_name(block_idx: int, concept) -> str:
-    """Resolve the recording layer name for a concept on a given block.
+def _layer_name(layer_idx: int, concept) -> str:
+    """Resolve the recording layer name for a concept on a given layer.
 
     Each concept knows which tap it reads from (``concept.tap_name`` —
     either ``qkv_tap`` for K/Q/V-side concepts or ``attn_out_tap`` for the
-    output-side ones), so the caller passes the block index and the layer
+    output-side ones), so the caller passes the layer index and the layer
     name follows.
     """
-    return f"blocks.{block_idx}.attn.{concept.tap_name}"
+    return f"blocks.{layer_idx}.attn.{concept.tap_name}"
 
 
 # ── core attribution helpers ──────────────────────────────────────────────────
@@ -385,7 +386,7 @@ def run_one_config(
     composite_label: str,
     gamma_label: float | None,
     image_class_pairs: list[tuple[Path, int]],
-    block_idx: int,
+    layer_idx: int,
     num_heads: int,
     head_dim: int,
     top_k: int | dict[str, int],
@@ -399,7 +400,7 @@ def run_one_config(
     ``(image, granularity, mode)`` triple. ``top_k`` may be a single int
     (applied to every granularity, clamped) or a per-granularity dict.
 
-    Each concept's recording layer is resolved from ``block_idx`` and the
+    Each concept's recording layer is resolved from ``layer_idx`` and the
     concept's own ``tap_name`` (``qkv_tap`` for K/Q/V-side concepts,
     ``attn_out_tap`` for output-side concepts).
     """
@@ -410,7 +411,7 @@ def run_one_config(
 
         for name, cls in CONCEPT_DEFS.items():
             concept = cls(model)
-            layer_name = _layer_name(block_idx, concept)
+            layer_name = _layer_name(layer_idx, concept)
 
             scores = per_concept_scores(
                 attribution, concept, layer_name, data, target_class, composite
@@ -455,7 +456,7 @@ def main():
     p.add_argument("--image-dir", required=True, help="directory of input images (flat or class-keyed)")
     p.add_argument("--target-class", type=int, default=None,
                    help="ImageNet class index for a flat image dir (ignored for class-keyed)")
-    p.add_argument("--block", type=int, default=6)
+    p.add_argument("--layer", type=int, default=6)
     p.add_argument("--top-k", type=int, default=8)
     p.add_argument("--model", default="vit_base_patch16_224")
     p.add_argument("--steps", type=int, default=14)
@@ -475,9 +476,9 @@ def main():
     print(f"loading {args.model}")
     model = timm.create_model(args.model, pretrained=True).eval().to(device)
 
-    block = model.blocks[args.block].attn
-    num_heads, head_dim = block.num_heads, block.head_dim
-    print(f"block={args.block}  num_heads={num_heads}  head_dim={head_dim}")
+    attn = model.blocks[args.layer].attn
+    num_heads, head_dim = attn.num_heads, attn.head_dim
+    print(f"layer={args.layer}  num_heads={num_heads}  head_dim={head_dim}")
 
     composite = build_composite(args.composite, args.gamma, args.epsilon)
     composite_label = type(composite).__name__
@@ -496,7 +497,7 @@ def main():
         composite_label=composite_label,
         gamma_label=gamma_label,
         image_class_pairs=image_class_pairs,
-        block_idx=args.block,
+        layer_idx=args.layer,
         num_heads=num_heads,
         head_dim=head_dim,
         top_k=args.top_k,

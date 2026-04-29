@@ -150,7 +150,7 @@ def _label_id(name: str, cid) -> str:
     raise ValueError(name)
 
 
-# ── concept atlas (single image, all 4 granularities × multiple blocks) ──────
+# ── concept atlas (single image, all 4 granularities × multiple layers) ─────
 
 
 def plot_concept_atlas(
@@ -159,21 +159,21 @@ def plot_concept_atlas(
     attribution,
     composite,
     *,
-    blocks: Sequence[int],
+    layers: Sequence[int],
     target_class: int,
     top_k: int = 4,
     suptitle: Optional[str] = None,
 ) -> plt.Figure:
-    """Single-image multi-granularity multi-block atlas.
+    """Single-image multi-granularity multi-layer atlas.
 
-    Rows: ``(granularity, block)`` pairs, ordered (head, head_dim, kqv_head,
-    kqv_head_dim) × (block_0, block_1, …). Columns: input + the ``top_k``
-    most-relevant concepts of that granularity at that block, ranked by
+    Rows: ``(granularity, layer)`` pairs, ordered (head, head_dim, kqv_head,
+    kqv_head_dim) × (layer_0, layer_1, …). Columns: input + the ``top_k``
+    most-relevant concepts of that granularity at that layer, ranked by
     absolute relevance under ``target_class``. Each heatmap is overlaid on
     the input; subplot titles show the concept id and its raw relevance.
     """
     image_np = denormalize(image, model)
-    n_rows = len(CONCEPT_CLASSES) * len(blocks)
+    n_rows = len(CONCEPT_CLASSES) * len(layers)
     n_cols = top_k + 1
     fig, axes = plt.subplots(
         n_rows, n_cols,
@@ -184,10 +184,10 @@ def plot_concept_atlas(
     row = 0
     for name, cls in CONCEPT_CLASSES.items():
         concept = cls(model)
-        for block_idx in blocks:
-            num_heads = model.blocks[block_idx].attn.num_heads
-            head_dim = model.blocks[block_idx].attn.head_dim
-            layer = f"blocks.{block_idx}.attn.{concept.tap_name}"
+        for layer_idx in layers:
+            num_heads = model.blocks[layer_idx].attn.num_heads
+            head_dim = model.blocks[layer_idx].attn.head_dim
+            layer = f"blocks.{layer_idx}.attn.{concept.tap_name}"
 
             scores = _per_concept_scores(
                 attribution, composite, image, layer, concept, target_class
@@ -200,7 +200,7 @@ def plot_concept_atlas(
             axes[row, 0].imshow(image_np)
             axes[row, 0].set_xticks([]); axes[row, 0].set_yticks([])
             axes[row, 0].set_ylabel(
-                f"{name}\nblk {block_idx}", fontsize=9, rotation=0,
+                f"{name}\nlayer {layer_idx}", fontsize=9, rotation=0,
                 ha="right", va="center", labelpad=22,
             )
             for c_i, (cid, score) in enumerate(top_pairs, start=1):
@@ -224,7 +224,7 @@ def plot_concept_atlas(
     return fig
 
 
-# ── all heads of one block (HeadConcept) ─────────────────────────────────────
+# ── all heads of one layer (HeadConcept) ─────────────────────────────────────
 
 
 def plot_per_head(
@@ -233,7 +233,7 @@ def plot_per_head(
     attribution,
     composite,
     *,
-    block_idx: int,
+    layer_idx: int,
     target_class: int,
     suptitle: Optional[str] = None,
 ) -> plt.Figure:
@@ -241,8 +241,8 @@ def plot_per_head(
     descending |relevance|. Useful to see how heads attend to different
     spatial structures of the same target class."""
     concept = HeadConcept(model)
-    layer = f"blocks.{block_idx}.attn.{concept.tap_name}"
-    num_heads = model.blocks[block_idx].attn.num_heads
+    layer = f"blocks.{layer_idx}.attn.{concept.tap_name}"
+    num_heads = model.blocks[layer_idx].attn.num_heads
     image_np = denormalize(image, model)
 
     scores = _per_concept_scores(
@@ -278,7 +278,7 @@ def plot_per_head(
     return fig
 
 
-# ── one concept across multiple blocks ───────────────────────────────────────
+# ── one concept across multiple layers ──────────────────────────────────────
 
 
 def plot_layer_evolution(
@@ -289,23 +289,23 @@ def plot_layer_evolution(
     *,
     concept_class: type = HeadConcept,
     concept_id=0,
-    blocks: Sequence[int] = (0, 3, 6, 9, 11),
+    layers: Sequence[int] = (0, 3, 6, 9, 11),
     target_class: int = 0,
     suptitle: Optional[str] = None,
 ) -> plt.Figure:
-    """One concept's heatmap across multiple blocks. Demonstrates how the
+    """One concept's heatmap across multiple layers. Demonstrates how the
     same head/dim/(part,head) shifts spatial focus through the network."""
     concept = concept_class(model)
     image_np = denormalize(image, model)
 
-    n_cols = len(blocks) + 1
+    n_cols = len(layers) + 1
     fig, axes = plt.subplots(1, n_cols, figsize=(1.9 * n_cols, 2.5))
     axes[0].imshow(image_np); axes[0].set_xticks([]); axes[0].set_yticks([])
     axes[0].set_title("input", fontsize=9)
 
-    for c_i, block_idx in enumerate(blocks, start=1):
-        layer = f"blocks.{block_idx}.attn.{concept.tap_name}"
-        # Per-image relevance score for this block (so the title is honest).
+    for c_i, layer_idx in enumerate(layers, start=1):
+        layer = f"blocks.{layer_idx}.attn.{concept.tap_name}"
+        # Per-image relevance score for this layer (so the title is honest).
         scores = _per_concept_scores(
             attribution, composite, image, layer, concept, target_class
         )
@@ -314,8 +314,8 @@ def plot_layer_evolution(
             score = scores.flatten()[concept_id].item()
         else:
             # Tuple → look up in the enumerate-ids order.
-            num_heads = model.blocks[block_idx].attn.num_heads
-            head_dim = model.blocks[block_idx].attn.head_dim
+            num_heads = model.blocks[layer_idx].attn.num_heads
+            head_dim = model.blocks[layer_idx].attn.head_dim
             ids = _enumerate_ids(
                 {v: k for k, v in CONCEPT_CLASSES.items()}[concept_class],
                 num_heads, head_dim,
@@ -332,7 +332,7 @@ def plot_layer_evolution(
         overlay(axes[c_i], image_np, hm)
         name = {v: k for k, v in CONCEPT_CLASSES.items()}[concept_class]
         axes[c_i].set_title(
-            f"blk {block_idx}\n{_label_id(name, concept_id)}  r={score:+.2g}",
+            f"blk {layer_idx}\n{_label_id(name, concept_id)}  r={score:+.2g}",
             fontsize=8,
         )
 
@@ -351,16 +351,16 @@ def plot_kqv_split(
     attribution,
     composite,
     *,
-    block_idx: int,
+    layer_idx: int,
     head_id: int,
     target_class: int,
     suptitle: Optional[str] = None,
 ) -> plt.Figure:
-    """For one (block, head): three heatmaps comparing Q / K / V using
+    """For one (layer, head): three heatmaps comparing Q / K / V using
     KQVHeadConcept. Different parts of the same head can highlight different
     aspects of the same image (e.g. K = where to look, V = what to convey)."""
     concept = KQVHeadConcept(model)
-    layer = f"blocks.{block_idx}.attn.{concept.tap_name}"
+    layer = f"blocks.{layer_idx}.attn.{concept.tap_name}"
     image_np = denormalize(image, model)
 
     scores = _per_concept_scores(
@@ -394,20 +394,20 @@ def plot_head_dim_grid(
     attribution,
     composite,
     *,
-    block_idx: int,
+    layer_idx: int,
     head_id: int,
     target_class: int,
     n_dims: int = 8,
     suptitle: Optional[str] = None,
 ) -> plt.Figure:
-    """For one (block, head): the top-``n_dims`` head_dim concepts ranked
+    """For one (layer, head): the top-``n_dims`` head_dim concepts ranked
     by |relevance|. Each cell shows one (head, dim)'s heatmap. Demonstrates
     the per-dim granularity inside one head."""
     concept = HeadDimConcept(model)
-    layer = f"blocks.{block_idx}.attn.{concept.tap_name}"
+    layer = f"blocks.{layer_idx}.attn.{concept.tap_name}"
     image_np = denormalize(image, model)
 
-    head_dim = model.blocks[block_idx].attn.head_dim
+    head_dim = model.blocks[layer_idx].attn.head_dim
     scores = _per_concept_scores(
         attribution, composite, image, layer, concept, target_class
     )
@@ -450,7 +450,7 @@ def plot_reference_samples(
     dataset,
     *,
     concept_name: str,
-    block_idx: int,
+    layer_idx: int,
     target_image: torch.Tensor,
     target_class: int,
     model: torch.nn.Module,
@@ -470,9 +470,9 @@ def plot_reference_samples(
     """
     cls = CONCEPT_CLASSES[concept_name]
     concept = cls(model)
-    layer = f"blocks.{block_idx}.attn.{concept.tap_name}"
-    num_heads = model.blocks[block_idx].attn.num_heads
-    head_dim = model.blocks[block_idx].attn.head_dim
+    layer = f"blocks.{layer_idx}.attn.{concept.tap_name}"
+    num_heads = model.blocks[layer_idx].attn.num_heads
+    head_dim = model.blocks[layer_idx].attn.head_dim
 
     target_np = denormalize(target_image, model)
 

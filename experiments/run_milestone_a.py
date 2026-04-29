@@ -165,7 +165,7 @@ def main():
              "Default: a 4-class Imagenette subset for --dataset=imagenette, "
              "all classes for imagenet_val.",
     )
-    p.add_argument("--block", type=int, default=6)
+    p.add_argument("--layer", type=int, default=6)
     p.add_argument(
         "--top-k",
         type=int,
@@ -211,9 +211,9 @@ def main():
     # 2. Model + attribution (re-used across composites).
     print(f"loading {args.model}")
     model = timm.create_model(args.model, pretrained=True).eval().to(device)
-    attn = model.blocks[args.block].attn
+    attn = model.blocks[args.layer].attn
     num_heads, head_dim = attn.num_heads, attn.head_dim
-    print(f"  block={args.block}  num_heads={num_heads}  head_dim={head_dim}")
+    print(f"  layer={args.layer}  num_heads={num_heads}  head_dim={head_dim}")
     attribution = CondAttribution(model, device=torch.device(device))
 
     # 3. Build sweep configs.
@@ -245,7 +245,7 @@ def main():
             composite_label=composite_label,
             gamma_label=gamma,
             image_class_pairs=image_class_pairs,
-            block_idx=args.block,
+            layer_idx=args.layer,
             num_heads=num_heads,
             head_dim=head_dim,
             top_k=top_k_arg,
