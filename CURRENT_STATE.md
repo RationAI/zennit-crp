@@ -88,7 +88,8 @@ Dependency management is `uv add` / `uv sync`. Optional extras: `vit` (timm + tr
 | 3c | `a760d0f` | Walkthrough notebook + uv-managed deps |
 | 4  | `e055e48` | Replace monkey-patching with Canonizer + Hook + Composite (idiomatic zennit) |
 | 5  | `8019975` / `3c80950` | γ-LRP variant (`GTIGamma` / `AttnLRPGammaComposite`) + drop legacy classes + state docs refresh |
-| 6  | (this commit) | Generalise `FeatureVisualization._attribution_on_reference` — pull `mask_map` from `self.layer_map[layer_name]` instead of hardcoded `ChannelConcept.{mask,mask_rf}`. Restores per-reference-sample conditional heatmaps for the four attention concepts. |
+| 6  | `526c77a` | Generalise `FeatureVisualization._attribution_on_reference` — pull `mask_map` from `self.layer_map[layer_name]` instead of hardcoded `ChannelConcept.{mask,mask_rf}`. Restores per-reference-sample conditional heatmaps for the four attention concepts. |
+| 7  | (this commit) | Milestone A faithfulness sweep on `vit_base_patch16_224` (64 imgs × 4 classes × {ε, γ ∈ 0.0/0.1/0.25/0.5} × 4 granularities × {true, random}, per-granularity top-k). Methodology fix (`resolve_top_k`), per-granularity top-k defaults, `run_milestone_a.py` driver, `aggregate_milestone_a.py` table emitter. Drop stale `IMPLEMENTATION_PLAN.md`. |
 
 ## Public API (post-iter-5)
 
@@ -121,6 +122,59 @@ ref_c = fv.get_max_reference([0, 1, 2], "blocks.6.attn.qkv_tap", "relevance", (0
                               composite=composite)
 ```
 
+## Milestone A — faithfulness sweep finding (iter 7)
+
+Driver: `tutorials/vit_crp/run_milestone_a.py`.
+Aggregator: `tutorials/vit_crp/aggregate_milestone_a.py` →
+`tutorials/vit_crp/data/milestone_a_table.md`.
+Raw CSV: `tutorials/vit_crp/data/milestone_a_results.csv` (2560 rows).
+
+Acceptance criterion (FUTURE_STATE.md A2): `del_AUC(true) < del_AUC(random)`
+**and** `ins_AUC(true) > ins_AUC(random)` for **all four** granularities
+under the chosen composite. Result per rule (3/4 is the best any single rule
+achieves; **no rule satisfies the all-four criterion**):
+
+| rule    | passing granularities | failure |
+|---|---|---|
+| ε-LRP   | head, kqv, head_dim | kqv_head: del_gap **−0.0088**, ins_gap **−0.0120** (random WINS both) |
+| γ=0.0   | head, kqv, head_dim | kqv_head (identical to ε-LRP — sanity-check confirms `GammaMod(0, min=0)` ≡ `NoMod`) |
+| γ=0.1   | head, kqv_head, head_dim | kqv: ins_gap **−0.0005** (within noise) |
+| γ=0.25  | (none) | head, kqv: small del_gaps; kqv_head, head_dim: marginal flips |
+| γ=0.5  | kqv_head | head, kqv, head_dim: most gaps collapse to ±0.000 (γ over-flattens) |
+
+Most informative cell — **head_dim under ε-LRP**: del_gap +0.060, ins_gap
++0.025, the strongest signal in the matrix. Confirms the fine-grained
+concept structure is faithful when given enough room to discriminate.
+
+Most surprising — **kqv_head under ε-LRP fails on both axes**. The 36
+(part, head) concepts at top-8 produce union heatmaps where the 8
+relevance-ranked concepts cover **less** of the model's predictive evidence
+than 8 randomly-selected ones. Reproducible (γ=0.0 reproduces ε exactly).
+Two plausible explanations, both deferred:
+
+1. **Positional-encoding leakage** — relevance flowing through `pos_embed`
+   is treated as a constant by AttnLRP §3 and lost from the conservation
+   accounting. PA-LRP (Bakish et al., NeurIPS 2025; arXiv 2506.02138) adds a
+   uniform-rule canonizer for it. Triggers FUTURE_STATE.md Milestone D.
+2. **Union-of-top-k saturation** — at 8/36 concepts, the 8 random concepts
+   already cover most of the model's spatial attention; the discriminative
+   ranking signal is washed out by the union. Smaller top-k (1, 2) or a
+   pixel-ranked Petsiuk variant (rank pixels of the single top-1
+   conditional heatmap) would test this.
+
+The AttnLRP §3.2.1 γ ≈ 0.25 default does **not** transfer to the four
+attention-concept granularities under the union-of-top-k Petsiuk
+methodology. γ ∈ {0.25, 0.5} consistently makes the gap worse for
+head/kqv/head_dim while only marginally helping kqv_head; the cause is
+plausibly that γ-LRP redistributes relevance toward positive-weight
+contributions in a way that flattens the per-concept ranking specificity.
+
+**Default**: `AttnLRPEpsilonComposite` (3/4 OK, only kqv_head fails). Keep
+`AttnLRPGammaComposite(gamma=0.25)` available for users who want the
+paper-default rule but flag the AUC behaviour. Re-evaluate after Milestone D.
+
 ## Outstanding work
 
-See `FUTURE_STATE.md`.
+See `FUTURE_STATE.md`. Milestone A is **investigated, not closed** — the
+ordering criterion fails on `kqv_head` regardless of γ, escalating to
+Milestone D (conservation check + PA-LRP).

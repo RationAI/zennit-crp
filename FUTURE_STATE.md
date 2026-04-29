@@ -1,22 +1,44 @@
 # Future State — backlog for `transformer-multi-concept`
 
-The implementation in `CURRENT_STATE.md` is complete enough to land as the first review-ready PR. This file enumerates what still needs to be done before the branch is fully aligned with the original `IMPLEMENTATION_PLAN.md`, ranked by impact and ordered into milestones.
+The implementation in `CURRENT_STATE.md` is complete enough to land as the first review-ready PR. This file enumerates what still needs to be done before the branch is review-ready, ranked by impact and ordered into milestones.
 
-## Milestone A — close the AUC anomaly (next iteration)
+## Milestone A — close the AUC anomaly (investigated; escalated to D)
 
-Iteration 3's metrics smoke (vit_tiny + bare ε-LRP) showed the random-concept baseline beating relevance-ranked top-k on deletion / insertion AUC for the finer granularities (`kqv_head`, `head_dim`). This is the single most important open item — without a fix, the faithfulness story for the finer concepts is unconvincing.
+**Status**: ran the full sweep (iter 7); see `CURRENT_STATE.md` "Milestone A
+— faithfulness sweep finding". Acceptance criterion (ordering holds for
+**all four** granularities under one γ) is **not met by any composite**.
+The strongest cell — `head_dim` under ε-LRP — has del_gap +0.060; the
+weakest — `kqv_head` under ε-LRP — has del_gap **−0.009** (random wins),
+reproducible regardless of γ. AttnLRP §3.2.1's γ ≈ 0.25 does not
+transfer to attention-concept granularities under the union-of-top-k
+Petsiuk methodology and consistently makes most cells worse.
 
-1. **Re-run `metrics.py` with `AttnLRPGammaComposite`** on:
-   * a non-trivial sample size (≥ 64 images, ≥ 4 classes per image),
-   * `vit_base_patch16_224` rather than `vit_tiny_patch16_224` (the latter has only 3 heads, making the finer granularities trivially noisy),
-   * a sweep of γ ∈ {0.0, 0.1, 0.25, 0.5}.
-2. **Verify the ordering `deletion_AUC(true) < deletion_AUC(random)` holds** for all four granularities under the chosen γ. If it doesn't, escalate to milestone D (positional-encoding / PA-LRP) before declaring the rule correct.
-3. **Pick the default γ** based on the sweep, document in `tutorials/vit_crp/README.md`, set as the `AttnLRPGammaComposite` default if different from 0.25.
-4. **Acceptance**: a faithfulness table in the PR description with one row per (granularity, composite, γ) and the ordering called out explicitly. Random baseline must lose on deletion AND insertion across all four granularities.
+Decision: **escalate to Milestone D** (conservation + PA-LRP) before any
+further γ tuning. PA-LRP is the highest-likelihood fix for `kqv_head`
+since the residual relevance leak through `pos_embed` is exactly the kind
+of constant-energy term the union-of-top-8 mask would saturate first.
+
+Done in iter 7:
+
+1. ✅ Sweep on `vit_base_patch16_224`, 64 imgs × 4 classes, γ ∈
+   {0.0, 0.1, 0.25, 0.5} + ε-LRP.
+2. ❌ Ordering does not hold for all four under any γ — escalated to D.
+3. **Default**: `AttnLRPEpsilonComposite` (3/4 OK on the criterion). Keep
+   `AttnLRPGammaComposite(gamma=0.25)` available; γ remains the AttnLRP
+   §3.2.1 recommendation for pixel-attribution use cases.
+4. ✅ Faithfulness table at `tutorials/vit_crp/data/milestone_a_table.md`,
+   raw CSV + naïve-top-k=8 archive at `data/milestone_a_results*.csv`.
+
+Open follow-ups within A (gated on Milestone D outcome):
+
+* If D closes the kqv_head gap, re-run the γ sweep and re-pick the default.
+* If D doesn't close it, investigate the methodological alternative noted
+  in CURRENT_STATE.md: pixel-rank Petsiuk on the single top-1 conditional
+  heatmap rather than union-of-top-k mask.
 
 ## Milestone B — additional faithfulness metrics + baselines
 
-`IMPLEMENTATION_PLAN.md` Phase 5 calls for a richer benchmark. Currently only deletion / insertion AUC + random-concept baseline exist.
+A richer benchmark beyond the current deletion / insertion AUC + random-concept baseline.
 
 5. **Stability metric** — cosine similarity of pixel-space relevance maps under input Gaussian noise (σ ∈ {0.01, 0.05, 0.1}). One scalar per (granularity, σ); standard deviation across images. ~50 LOC, no new dataset.
 6. **Gradient-only baseline** — plain input × gradient, no LRP. ~30 LOC.
@@ -42,7 +64,7 @@ The original AttnLRP paper (Eq. 1) requires `R_input.sum() ≈ R_output.sum()`; 
 
 ## Milestone E — visualisation polish
 
-16. **Multi-block comparison figure** in the walkthrough notebook: same image, top-k concepts at blocks {3, 6, 9, 11} side-by-side. Demonstrates concept progression through the network. Closes Phase 4.4 of `IMPLEMENTATION_PLAN.md`.
+16. **Multi-block comparison figure** in the walkthrough notebook: same image, top-k concepts at blocks {3, 6, 9, 11} side-by-side. Demonstrates concept progression through the network.
 17. **Class-conditional reference samples**: integrate `FeatureVisualization.get_stats_reference` into the notebook (currently uses only `get_max_reference`).
 18. **Activation vs. relevance maximisation** comparison cell — the original CRP paper makes a point of this; we currently use only RelMax.
 
@@ -62,6 +84,9 @@ The original AttnLRP paper (Eq. 1) requires `R_input.sum() ≈ R_output.sum()`; 
 
 ## Open design questions
 
-* **Single shared `qkv_tap` vs. three per-part taps (`q_out`, `k_out`, `v_out`)** — the original `IMPLEMENTATION_PLAN.md` Phase 2 spec called for three. The current implementation has one tap covering all three concatenated. Functionally equivalent (mask isolates the part), simpler, fewer hooks. Worth keeping unless there's a strong reason to split.
+* **Single shared `qkv_tap` vs. three per-part taps (`q_out`, `k_out`, `v_out`)** — earlier spec called for three. Current implementation uses one tap covering all three concatenated. Functionally equivalent (mask isolates the part), simpler, fewer hooks. Worth keeping unless there's a strong reason to split.
 * **Should `AttnLRPGammaComposite` be the default**? Per AttnLRP §3.2.1, yes. Once Milestone A confirms, swap the notebook and tutorials default and deprecate `AttnLRPEpsilonComposite` to "for comparison only".
-* **What to do with `tests/test_attribution.py` / `tests/test_integration.py`** (the legacy, non-ViT tests) — they already fail under the current zennit version. Either fix the `EpsilonPlusFlat([SequentialMergeBatchNorm()])` → `EpsilonPlusFlat(canonizers=[...])` API drift, or delete (we don't own those tests). Cheap fix; do as part of release.
+* **What to do with `tests/test_attribution.py` / `tests/test_integration.py`** (the legacy, non-ViT tests) — they already fail under the current zennit version. Two distinct problems:
+  * `test_integration.py` — `EpsilonPlus([SequentialMergeBatchNorm()])` → `EpsilonPlus(canonizers=[...])` (mechanical API drift). Cheap fix.
+  * `test_attribution.py` — `test_parallel_attribution` / `test_parallel_cond_attribution` / `test_seq_cond_attribution` show real numerical regressions (e.g. `relevances["layer1"] == [1, 0]`, expected `[1, 4]`); likely a semantic change in `CondAttribution`'s handling of `{"layerN": []}` (empty-list condition). Not a one-liner; needs a bisect against zennit-crp upstream.
+  Either fix or delete (we don't own those tests). Defer to release.

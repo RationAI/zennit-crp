@@ -195,7 +195,7 @@ Setup, CLI demo, and the quantitative deletion/insertion-AUC benchmark are
 documented in [`tutorials/vit_crp/README.md`](tutorials/vit_crp/README.md).
 Audit findings about the legacy POC and the roadmap for follow-up work are
 in [`CURRENT_STATE.md`](CURRENT_STATE.md) and
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
+[`FUTURE_STATE.md`](FUTURE_STATE.md).
 
 Dependencies are managed with [`uv`](https://docs.astral.sh/uv/) — see
 `pyproject.toml` (extras: `vit`, `dev`, `notebook`, `fast_img`). The lockfile

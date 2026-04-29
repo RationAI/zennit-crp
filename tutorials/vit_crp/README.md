@@ -110,11 +110,12 @@ The CSV has one row per `(image, concept_def, mode)` triple, where `mode ∈
 
 ## Hyperparameters that matter
 
-* **Composite**: `EpsilonPlusFlat` is a reasonable starting choice (Flat
-  z-Box for the patch-embed Conv2d, ε-LRP elsewhere). The AttnLRP paper
-  (§3.2.1) suggests adding γ-LRP for ViT linears with γ ≈ 0.25 to mitigate
-  gradient-shattering — not yet wired here; see `IMPLEMENTATION_PLAN.md`
-  Phase 1 step 5.
+* **Composite**: two choices, both pre-bundled with `TimmViTCanonizer`:
+  * `AttnLRPEpsilonComposite` — ε-LRP on every linear (`Linear`, `Conv2d`).
+    Fast, but per AttnLRP §3.2.1 prone to gradient-shattering noise on deep
+    ViTs.
+  * `AttnLRPGammaComposite(gamma=0.25)` — γ-LRP on linears (single-branch
+    positive-weight clamp). The recommended default for ViT linears.
 * **Block index**: each attention block is independent; the choice is
   empirical. Mid- to late-network blocks usually carry class-relevant
   structure; very-early blocks carry low-level features.
@@ -125,11 +126,11 @@ The CSV has one row per `(image, concept_def, mode)` triple, where `mode ∈
 
 ## What's next (this fork's roadmap)
 
-`IMPLEMENTATION_PLAN.md` lists the planned follow-ups:
+The active backlog lives in [`FUTURE_STATE.md`](../../FUTURE_STATE.md). Headline
+items:
 
-1. γ-LRP composite for ViT linears (Phase 1 step 5).
-2. Stability metric (heatmap cosine sim under input noise).
-3. Localisation metric (pointing game on ImageNet-S or annotation-augmented
+1. Stability metric (heatmap cosine sim under input noise).
+2. Localisation metric (pointing game on ImageNet-S or annotation-augmented
    val) — needs box/segmentation labels.
-4. Optional: PA-LRP positional-encoding rule (Bakish et al., NeurIPS 2025)
-   if conservation checks fail materially.
+3. Conservation quantitative test; optional PA-LRP positional-encoding rule
+   (Bakish et al., NeurIPS 2025) if it fails materially.

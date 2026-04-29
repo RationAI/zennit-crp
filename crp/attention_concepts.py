@@ -355,8 +355,7 @@ class HeadDimConcept(_BaseAttentionConcept):
     Row vs column resolution: in ``Q = X · W_Q`` with ``W_Q ∈ R^{D×D}``, each
     column of W_Q maps to one output feature of Q (i.e. one of the ``head_dim``
     indices within a head). CRP's CNN convention treats one output filter as
-    one concept; the analogue here is one **column**. (See
-    ``IMPLEMENTATION_PLAN.md`` Phase 3.)
+    one concept; the analogue here is one **column**.
 
     Concept id: ``(part, head_id, dim_id)``.
 

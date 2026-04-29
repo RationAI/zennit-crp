@@ -51,6 +51,6 @@ The basis for the XAI is CRP (Concept Relevance Propagation) - originally develo
 - if really unsure, or the incorrect decision may cause significant issues, ask for help.
 - if a problem is non-blocking, defer into a log and move on to the next task.
 - track current state in CURRENT_STATE.md, keep it up to date, and use it to keep an overview of the project and the current progress.
-- keep the planned implementation steps in IMPLEMENTATION_PLAN.md, update it as needed, and use it to keep an overview of the planned implementation that has not happened yet.
+- keep planned/pending implementation steps in FUTURE_STATE.md (milestones + cross-cutting items), update it as work lands or gets re-scoped.
 - after each implementation phase do a sanity checks, try to come up with relevant tests and verify the added changes fit the rest.
 - continue until all the planned implementation steps are done or only the blocking problems remain.
