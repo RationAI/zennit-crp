@@ -26,14 +26,14 @@ Usage
 
 Flat directory (single target class for every image)::
 
-    uv run python tutorials/vit_crp/metrics.py \\
+    uv run python experiments/metrics.py \\
         --image-dir path/to/images --target-class 281 --block 6 \\
         --composite gamma --gamma 0.25 --top-k 8 --out results.csv
 
 Class-keyed directory tree (subdir name = ImageNet-1k class index, target
 class is auto-resolved per image)::
 
-    uv run python tutorials/vit_crp/metrics.py \\
+    uv run python experiments/metrics.py \\
         --image-dir path/to/curated --block 6 \\
         --composite gamma --gamma 0.25 --top-k 8 --out results.csv
 

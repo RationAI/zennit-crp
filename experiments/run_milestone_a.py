@@ -13,22 +13,21 @@ Inputs
 ------
 
 A class-keyed image directory at ``--curated-dir`` (default
-``tutorials/vit_crp/data/curated_milestone_a/<class_idx>/<image>``). If it
-does not exist, this script builds it from the Imagenette ``val/`` split,
-which the walkthrough notebook downloads to
-``tutorials/vit_crp/data/imagenette2-160/``.
+``data/curated_milestone_a/<class_idx>/<image>`` under the repo root).
+If it does not exist, this script builds it from the Imagenette ``val/``
+split that the walkthrough notebook downloads to ``data/imagenette2-160/``.
 
 Outputs
 -------
 
-* ``--out`` (default ``tutorials/vit_crp/data/milestone_a_results.csv``):
-  one row per ``(composite, gamma, image, target_class, concept_def, mode)``.
+* ``--out`` (default ``data/milestone_a_results.csv``): one row per
+  ``(composite, gamma, image, target_class, concept_def, mode)``.
 * A summary table printed to stdout: per-(granularity, composite, γ)
   mean deletion / insertion AUC for ``true`` and ``random`` with the gap.
 
 Run::
 
-    uv run python tutorials/vit_crp/run_milestone_a.py
+    uv run python experiments/run_milestone_a.py
 """
 from __future__ import annotations
 
@@ -76,7 +75,7 @@ def build_curated_subset(
         raise SystemExit(
             f"imagenette val/ not found at {val}. "
             "Run the walkthrough notebook section 2 to download it, or "
-            "extract imagenette2-160.tgz under tutorials/vit_crp/data/."
+            "extract imagenette2-160.tgz under data/."
         )
     rng = random.Random(seed)
     dest.mkdir(parents=True, exist_ok=True)
@@ -158,17 +157,18 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    here = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[1]
+    data_dir = repo_root / "data"
     p.add_argument(
         "--imagenette-root",
         type=Path,
-        default=here / "data" / "imagenette2-160",
+        default=data_dir / "imagenette2-160",
         help="extracted imagenette2-160 directory (containing train/ + val/)",
     )
     p.add_argument(
         "--curated-dir",
         type=Path,
-        default=here / "data" / "curated_milestone_a",
+        default=data_dir / "curated_milestone_a",
         help="class-keyed dir of evaluation images",
     )
     p.add_argument("--n-per-class", type=int, default=16)
@@ -198,7 +198,7 @@ def main():
     p.add_argument(
         "--out",
         type=Path,
-        default=here / "data" / "milestone_a_results.csv",
+        default=data_dir / "milestone_a_results.csv",
     )
     args = p.parse_args()
 

@@ -10,9 +10,9 @@ Reads the CSV produced by :mod:`run_milestone_a` and emits two tables:
 
 Usage::
 
-    uv run python tutorials/vit_crp/aggregate_milestone_a.py \\
-        --in tutorials/vit_crp/data/milestone_a_results.csv \\
-        --out tutorials/vit_crp/data/milestone_a_table.md
+    uv run python experiments/aggregate_milestone_a.py \\
+        --in data/milestone_a_results.csv \\
+        --out data/milestone_a_table.md
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from pathlib import Path
 from statistics import mean
 
 
-GRANULARITIES = ("head", "kqv", "kqv_head", "head_dim")
+GRANULARITIES = ("head", "head_dim", "kqv_head", "kqv_head_dim")
 COMPOSITE_LABEL = {
     ("AttnLRPEpsilonComposite", None): "ε-LRP",
 }
@@ -172,17 +172,17 @@ def emit_markdown(agg: list[dict]) -> str:
 
 def main():
     p = argparse.ArgumentParser()
-    here = Path(__file__).resolve().parent
+    data_dir = Path(__file__).resolve().parents[1] / "data"
     p.add_argument(
         "--in",
         dest="in_path",
         type=Path,
-        default=here / "data" / "milestone_a_results.csv",
+        default=data_dir / "milestone_a_results.csv",
     )
     p.add_argument(
         "--out",
         type=Path,
-        default=here / "data" / "milestone_a_table.md",
+        default=data_dir / "milestone_a_table.md",
     )
     args = p.parse_args()
 

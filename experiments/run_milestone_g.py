@@ -46,16 +46,16 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    here = Path(__file__).resolve().parent
+    data_dir = Path(__file__).resolve().parents[1] / "data"
     p.add_argument(
         "--imagenette-root",
         type=Path,
-        default=here / "data" / "imagenette2-160",
+        default=data_dir / "imagenette2-160",
     )
     p.add_argument(
         "--curated-dir",
         type=Path,
-        default=here / "data" / "curated_milestone_a",
+        default=data_dir / "curated_milestone_a",
     )
     p.add_argument("--n-per-class", type=int, default=16)
     p.add_argument("--steps", type=int, default=14)
@@ -74,7 +74,7 @@ def main():
     p.add_argument(
         "--out",
         type=Path,
-        default=here / "data" / "milestone_g_results.csv",
+        default=data_dir / "milestone_g_results.csv",
     )
     args = p.parse_args()
 

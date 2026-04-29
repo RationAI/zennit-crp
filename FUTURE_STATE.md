@@ -27,7 +27,7 @@ Done in iter 7:
 3. **Default**: `AttnLRPEpsilonComposite` (3/4 OK on the criterion). Keep
    `AttnLRPGammaComposite(gamma=0.25)` available; γ remains the AttnLRP
    §3.2.1 recommendation for pixel-attribution use cases.
-4. ✅ Faithfulness table at `tutorials/vit_crp/data/milestone_a_table.md`,
+4. ✅ Faithfulness table at `data/milestone_a_table.md`,
    raw CSV + naïve-top-k=8 archive at `data/milestone_a_results*.csv`.
 
 Open follow-ups within A (gated on Milestone D outcome):
@@ -49,7 +49,7 @@ A richer benchmark beyond the current deletion / insertion AUC + random-concept 
 
 ## Milestone C — localisation / pointing-game
 
-10. **ImageNet-S bounding-box dataset** — pick a subset (the full thing is ~3 GB; a 50-image curated subset under `tutorials/vit_crp/data/imagenet_s_subset/` is enough for a sanity table).
+10. **ImageNet-S bounding-box dataset** — pick a subset (the full thing is ~3 GB; a 50-image curated subset under `data/imagenet_s_subset/` is enough for a sanity table).
 11. **Pointing-game implementation** — heatmap argmax inside ground-truth bbox → 1, else 0. Aggregate as accuracy per granularity.
 12. **Optional**: weighted variant (sum of relevance inside bbox / total relevance).
 

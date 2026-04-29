@@ -10,9 +10,9 @@ tensor + with no rule applied.
 
 Usage::
 
-    uv run python tutorials/vit_crp/conservation_check.py \\
+    uv run python experiments/conservation_check.py \\
         --models vit_tiny_patch16_224,vit_small_patch16_224,vit_base_patch16_224 \\
-        --pretrained --target 217 --image-dir tutorials/vit_crp/data/curated_milestone_a/217
+        --pretrained --target 217 --image-dir data/curated_milestone_a/217
 
 Without ``--image-dir``, uses random Gaussian input. With ``--pretrained``
 and a real image, the ratios reflect what the milestone-A sweep actually

@@ -67,13 +67,38 @@ The 6 legacy tests in `tests/test_attribution.py` and `tests/test_integration.py
 
 ### 5. Tutorials — `tutorials/vit_crp/`
 
-* `walkthrough.ipynb` — end-to-end notebook (Imagenette download → composite → FV index per granularity → top-concept identification → reference samples → conditional heatmap). Source kept in `_build_notebook.py` for reviewable diffs.
-* `demo.py` — single-image CLI demo across the four granularities.
-* `metrics.py` — deletion / insertion AUC faithfulness benchmark (Petsiuk et al.) with random-concept baseline.
+User-facing capabilities only — minimal, focused, committed-as-they-are:
 
-### 6. Tooling — `pyproject.toml`, `uv.lock`
+* `walkthrough.ipynb` — end-to-end notebook (Imagenette download → composite → FV index per granularity → top-concept identification → reference samples → conditional heatmap). Tracked directly in the repo; edit in Jupyter.
+* `demo.py` — single-image CLI comparing the four granularities side-by-side.
 
-Dependency management is `uv add` / `uv sync`. Optional extras: `vit` (timm + transformers), `dev` (pytest, ruff), `notebook` (jupyter, ipykernel, ipywidgets, torchvision), `fast_img`. Lockfile committed for reproducibility.
+### 6. Experiments — `experiments/`
+
+Sweeps and audits that drove design decisions; **not** prerequisites for using the library. Each script reads/writes under `data/` (gitignored).
+
+* `metrics.py` — Petsiuk deletion/insertion AUC machinery (per-granularity top-k, random-concept baseline, ε / γ composite factory). Imported by all milestone drivers; also runnable as a single-config CLI.
+* `run_milestone_a.py` — γ-LRP sweep on `vit_base_patch16_224` (Milestone A).
+* `run_milestone_d.py` — multi-model PA-LRP sweep on vit_small/base/large (Milestone D).
+* `run_milestone_g.py` — multi-model residual-LRP (symmetric / ratio) sweep (Milestone G).
+* `aggregate_milestone_a.py` — turn the milestone-A CSV into a markdown table for the PR description.
+* `conservation_check.py` — diagnostic CLI that complements `tests/test_vit_integration.py::TestConservation`.
+
+See [`experiments/README.md`](experiments/README.md) for run-time details.
+
+### 7. Generated data — `data/` (gitignored)
+
+Single top-level dir for everything that gets generated:
+
+* `data/imagenette2-160/` — downloaded by the walkthrough notebook (~98 MB).
+* `data/curated_milestone_a/<class_idx>/*.JPEG` — symlink farm built by `experiments/run_milestone_a.py`.
+* `data/feature_visualization/<concept>/` — per-granularity FV indices.
+* `data/milestone_*_results.csv`, `data/milestone_a_table.md` — sweep outputs.
+
+Both scripts and the notebook compute paths under `<repo>/data/`; running from the repo root just works.
+
+### 8. Tooling — `pyproject.toml`, `uv.lock`
+
+Dependency management is `uv add` / `uv sync`. `timm` and `Pillow` are pinned in main `dependencies`. Optional extras: `vit` (HF `transformers`, reserved for the future HF-ViT canonizer), `dev` (pytest, ruff), `notebook` (jupyter, ipykernel, ipywidgets, torchvision), `fast_img`. Lockfile committed for reproducibility.
 
 ## What was removed
 
@@ -97,7 +122,8 @@ Dependency management is `uv add` / `uv sync`. Optional extras: `vit` (timm + tr
 | 7  | `c7cd0d7` | Milestone A faithfulness sweep on `vit_base_patch16_224` (64 imgs × 4 classes × {ε, γ ∈ 0.0/0.1/0.25/0.5} × 4 granularities × {true, random}, per-granularity top-k). Methodology fix (`resolve_top_k`), per-granularity top-k defaults, `run_milestone_a.py` driver, `aggregate_milestone_a.py` table emitter. Drop stale `IMPLEMENTATION_PLAN.md`. |
 | 8  | `4835c3c` | Milestone D — conservation test + PA-LRP. `PALRPCanonizer` (uniform rule at `x + pos_embed`, factor 2). `TimmViTCanonizer(palrp=…)`, both composites take `palrp` kwarg. Conservation diagnostic in `tests/test_vit_integration.py` and `tutorials/vit_crp/conservation_check.py`. Multi-model sweep `run_milestone_d.py` on `vit_small/base/large` × ± PA-LRP. Findings: PA-LRP halves heatmap uniformly → AUC unchanged (Pearson=1.0, argsort identical empirically). kqv_head failure persists at every model scale (vit_large worst, vit_small mildest — opposite of saturation hypothesis). |
 | 9  | `c38923e` | Milestone G — residual-LRP. `_ResidualRatioFn` (Otsuki ratio split, ∝ `|x|` vs `|branch|`) + `vit_block_forward_{symmetric,ratio}` swaps + `TimmViTCanonizer(residual_lrp=…)` toggle. `run_milestone_g.py` sweep. Symmetric is AUC-inert (Pearson=1.0, like PA-LRP). **Ratio fixes the kqv_head AUC anomaly at all three model sizes and gets vit_small to 4/4 OK** (was 2/4). Trade-off: breaks `head` on vit_base (del_gap −0.0075) and degrades vit_large further. Default kept off; opt-in via `residual_lrp='ratio'`. |
-| 10 | (this commit) | Concept refactor per design review. **Removed `KQVConcept`** (per-block coarse Q/K/V wasn't a meaningful concept detector). **Renamed old `HeadDimConcept` → `KQVHeadDimConcept`** and introduced **new `HeadConcept` and `HeadDimConcept` reading at the per-head output tokens**: a new `attn_out_tap` (`nn.Identity` between `attn @ v` and `self.proj`) is now the default tap for output-side concepts. Single `_AttentionConcept` base class with two boolean flags `KQV_SPLIT` and `DIM_SPLIT`; the four concrete classes are flag-only. `AttentionTapsCanonizer` (rename of `QKVTapCanonizer`) installs both taps; back-compat alias kept. Concepts auto-register attention dims when constructed with the model: `HeadConcept(model)`. Tests fully rewritten; tutorials, demo CLI, milestone drivers, walkthrough notebook, README updated. |
+| 10 | `c608a8e` | Concept refactor per design review. **Removed `KQVConcept`** (per-block coarse Q/K/V wasn't a meaningful concept detector). **Renamed old `HeadDimConcept` → `KQVHeadDimConcept`** and introduced **new `HeadConcept` and `HeadDimConcept` reading at the per-head output tokens**: a new `attn_out_tap` (`nn.Identity` between `attn @ v` and `self.proj`) is now the default tap for output-side concepts. Single `_AttentionConcept` base class with two boolean flags `KQV_SPLIT` and `DIM_SPLIT`; the four concrete classes are flag-only. `AttentionTapsCanonizer` (rename of `QKVTapCanonizer`) installs both taps; back-compat alias kept. Concepts auto-register attention dims when constructed with the model: `HeadConcept(model)`. Tests fully rewritten; tutorials, demo CLI, milestone drivers, walkthrough notebook, README updated. |
+| 11 | (this commit) | Repo layout cleanup. **Top-level `data/`** (single `.gitignore` entry) replaces nested `tutorials/vit_crp/data/` + `tutorials/vit_crp/FeatureVisualization/`. **`experiments/`** dir holds milestone drivers + metrics + conservation_check + aggregator (moved from `tutorials/vit_crp/`); `tutorials/vit_crp/` keeps only `walkthrough.ipynb` + `demo.py`. `_build_notebook.py` deleted — the notebook is tracked directly going forward. New `experiments/README.md`; `tutorials/vit_crp/README.md` rewritten to focus on the notebook + demo. Path defaults in scripts derive `<repo>/data/` from `__file__`; the notebook walks up to `pyproject.toml` to find the repo root. |
 
 ## Public API (post-iter-10)
 
@@ -149,8 +175,8 @@ result = attribution(
 
 Driver: `tutorials/vit_crp/run_milestone_a.py`.
 Aggregator: `tutorials/vit_crp/aggregate_milestone_a.py` →
-`tutorials/vit_crp/data/milestone_a_table.md`.
-Raw CSV: `tutorials/vit_crp/data/milestone_a_results.csv` (2560 rows).
+`data/milestone_a_table.md`.
+Raw CSV: `data/milestone_a_results.csv` (2560 rows).
 
 Acceptance criterion (FUTURE_STATE.md A2): `del_AUC(true) < del_AUC(random)`
 **and** `ins_AUC(true) > ins_AUC(random)` for **all four** granularities
@@ -232,7 +258,7 @@ are catastrophic and unfixable by PA-LRP. Documented in test docstrings.
 Run `tutorials/vit_crp/run_milestone_d.py` (multi-model: vit_small / base /
 large × ε-LRP × {palrp off, on}, same 64-image curated subset and 14-step
 deletion/insertion as milestone A). 3072 rows in
-`tutorials/vit_crp/data/milestone_d_results.csv`.
+`data/milestone_d_results.csv`.
 
 **PA-LRP changes nothing about AUC** — every (model, granularity) row in
 the summary table reproduces bit-identically across `palrp=False` and
@@ -318,7 +344,7 @@ Per-(model, granularity) verdict, comparing `residual_lrp=None` to
 | | head_dim (3072/8) | ❌ del_FAIL | ❌ ins_FAIL |
 | | **summary** | **2/4** | **0/4** |
 
-Raw CSV: `tutorials/vit_crp/data/milestone_g_results.csv` (3072 rows).
+Raw CSV: `data/milestone_g_results.csv` (3072 rows).
 
 ### Reading
 

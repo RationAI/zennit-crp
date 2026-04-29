@@ -193,10 +193,14 @@ The recommended entry point is the
 [**walkthrough notebook**](tutorials/vit_crp/walkthrough.ipynb), which
 covers setup, Imagenette download, FeatureVisualization indexing, and a
 side-by-side comparison of the four granularities on a target image.
-Setup, CLI demo, and the quantitative deletion/insertion-AUC benchmark are
-documented in [`tutorials/vit_crp/README.md`](tutorials/vit_crp/README.md).
-Audit findings about the legacy POC and the roadmap for follow-up work are
-in [`CURRENT_STATE.md`](CURRENT_STATE.md) and
+Setup and the single-image CLI demo are documented in
+[`tutorials/vit_crp/README.md`](tutorials/vit_crp/README.md). Sweeps,
+audits, and milestone drivers (faithfulness AUC, conservation
+diagnostic, multi-model PA-LRP / residual-LRP comparisons) are separated
+into [`experiments/`](experiments/) — see
+[`experiments/README.md`](experiments/README.md). All generated artefacts
+live under [`data/`](data) (gitignored). Audit findings and the roadmap
+for follow-up work are in [`CURRENT_STATE.md`](CURRENT_STATE.md) and
 [`FUTURE_STATE.md`](FUTURE_STATE.md).
 
 Dependencies are managed with [`uv`](https://docs.astral.sh/uv/) — see
