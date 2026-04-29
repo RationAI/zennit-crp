@@ -177,14 +177,16 @@ We are open to any improvements (:
 ## Vision-Transformer Extensions (RationAI fork)
 
 This fork extends CRP to vision transformers (ViT) with four concept-detector
-granularities, all hooking the same named tap (`attn.qkv_tap`):
+granularities, crossing two orthogonal axes — *split by K/Q/V?* (which tap
+to read) and *split by head_dim?* (whether the per-head feature axis is
+kept):
 
-| Concept class       | Granularity                                          | `attribute()` shape           |
-|---------------------|------------------------------------------------------|-------------------------------|
-| `HeadConcept`       | one concept per attention head                       | `(B, num_heads)`              |
-| `KQVConcept`        | three concepts per block (whole Q / K / V)           | `(B, 3)`                      |
-| `KQVHeadConcept`    | per `(part, head)` — `3 × num_heads`                 | `(B, 3, num_heads)`           |
-| `HeadDimConcept`    | per `(part, head, dim)` — `3 × num_heads × head_dim` | `(B, 3, num_heads, head_dim)` |
+| Concept class         | Hook tap         | Granularity                                  | `attribute()` shape            |
+|-----------------------|------------------|----------------------------------------------|--------------------------------|
+| `HeadConcept`         | `attn_out_tap`   | output tokens, per head                      | `(B, num_heads)`               |
+| `HeadDimConcept`      | `attn_out_tap`   | output tokens, per `(head, dim)`             | `(B, num_heads, head_dim)`     |
+| `KQVHeadConcept`      | `qkv_tap`        | K/Q/V projections, per `(part, head)`        | `(B, 3, num_heads)`            |
+| `KQVHeadDimConcept`   | `qkv_tap`        | K/Q/V projections, per `(part, head, dim)`   | `(B, 3, num_heads, head_dim)`  |
 
 The four classes live in [`crp/attention_concepts.py`](crp/attention_concepts.py).
 The recommended entry point is the

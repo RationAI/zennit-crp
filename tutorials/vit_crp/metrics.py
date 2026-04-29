@@ -15,6 +15,12 @@ Metrics
   heatmap should achieve materially better deletion / insertion AUC than the
   random one.
 
+The four supported concepts each pick their own hook tap: ``HeadConcept`` /
+``HeadDimConcept`` read at the per-head output tokens (``attn_out_tap``);
+``KQVHeadConcept`` / ``KQVHeadDimConcept`` read at the K/Q/V projections
+(``qkv_tap``). The caller passes a block index and the layer name is
+resolved per-concept as ``blocks.{block}.attn.{concept.tap_name}``.
+
 Usage
 -----
 
@@ -52,9 +58,9 @@ from timm.data import resolve_data_config, create_transform
 from PIL import Image
 from crp.attention_concepts import (
     HeadConcept,
-    KQVConcept,
-    KQVHeadConcept,
     HeadDimConcept,
+    KQVHeadConcept,
+    KQVHeadDimConcept,
     PARTS,
 )
 from crp.attribution import CondAttribution
@@ -65,25 +71,36 @@ from crp.transformer_patches import (
 
 
 CONCEPT_DEFS = {
-    "head": HeadConcept,
-    "kqv": KQVConcept,
-    "kqv_head": KQVHeadConcept,
-    "head_dim": HeadDimConcept,
+    "head":         HeadConcept,
+    "head_dim":     HeadDimConcept,
+    "kqv_head":     KQVHeadConcept,
+    "kqv_head_dim": KQVHeadDimConcept,
 }
 
 
 def _enumerate_ids(name: str, num_heads: int, head_dim: int) -> list:
     if name == "head":
         return list(range(num_heads))
-    if name == "kqv":
-        return list(PARTS)
+    if name == "head_dim":
+        return [(h, d) for h in range(num_heads) for d in range(head_dim)]
     if name == "kqv_head":
         return [(p, h) for p in PARTS for h in range(num_heads)]
-    if name == "head_dim":
+    if name == "kqv_head_dim":
         return [
             (p, h, d) for p in PARTS for h in range(num_heads) for d in range(head_dim)
         ]
     raise ValueError(name)
+
+
+def _layer_name(block_idx: int, concept) -> str:
+    """Resolve the recording layer name for a concept on a given block.
+
+    Each concept knows which tap it reads from (``concept.tap_name`` —
+    either ``qkv_tap`` for K/Q/V-side concepts or ``attn_out_tap`` for the
+    output-side ones), so the caller passes the block index and the layer
+    name follows.
+    """
+    return f"blocks.{block_idx}.attn.{concept.tap_name}"
 
 
 # ── core attribution helpers ──────────────────────────────────────────────────
@@ -335,13 +352,13 @@ def resolve_top_k(
     For Petsiuk-style true-vs-random union heatmaps to discriminate, ``k``
     must be << ``num_concepts`` — otherwise the random union covers most of
     the same concepts as the true union and the gap collapses to noise. The
-    canonical defaults below pick ~⅓ of concepts at the smaller granularities
-    and stay sparse at ``head_dim`` (8 of 2304):
+    canonical defaults below pick ~⅓ of concepts at the coarse granularities
+    and stay sparse at the fine ones:
 
-      ``head`` (12)        → 4
-      ``kqv`` (3)          → 1
-      ``kqv_head`` (36)    → 8
-      ``head_dim`` (2304)  → 8
+      ``head`` (12)              → 4
+      ``head_dim`` (12·64=768)   → 8
+      ``kqv_head`` (3·12=36)     → 8
+      ``kqv_head_dim`` (2304)    → 8
     """
     if isinstance(top_k, dict):
         if name not in top_k:
@@ -355,9 +372,9 @@ def resolve_top_k(
 
 PER_GRANULARITY_TOP_K: dict[str, int] = {
     "head": 4,
-    "kqv": 1,
-    "kqv_head": 8,
     "head_dim": 8,
+    "kqv_head": 8,
+    "kqv_head_dim": 8,
 }
 
 
@@ -368,7 +385,7 @@ def run_one_config(
     composite_label: str,
     gamma_label: float | None,
     image_class_pairs: list[tuple[Path, int]],
-    layer_name: str,
+    block_idx: int,
     num_heads: int,
     head_dim: int,
     top_k: int | dict[str, int],
@@ -381,6 +398,10 @@ def run_one_config(
     Returns a flat list of result rows, one per
     ``(image, granularity, mode)`` triple. ``top_k`` may be a single int
     (applied to every granularity, clamped) or a per-granularity dict.
+
+    Each concept's recording layer is resolved from ``block_idx`` and the
+    concept's own ``tap_name`` (``qkv_tap`` for K/Q/V-side concepts,
+    ``attn_out_tap`` for output-side concepts).
     """
     rows: list[dict] = []
     for img_path, target_class in image_class_pairs:
@@ -388,8 +409,8 @@ def run_one_config(
         data = load_image(img_path, model).to(device)
 
         for name, cls in CONCEPT_DEFS.items():
-            concept = cls()
-            concept.register_from_model(model)
+            concept = cls(model)
+            layer_name = _layer_name(block_idx, concept)
 
             scores = per_concept_scores(
                 attribution, concept, layer_name, data, target_class, composite
@@ -456,8 +477,7 @@ def main():
 
     block = model.blocks[args.block].attn
     num_heads, head_dim = block.num_heads, block.head_dim
-    layer_name = f"blocks.{args.block}.attn.qkv_tap"
-    print(f"layer={layer_name}  num_heads={num_heads}  head_dim={head_dim}")
+    print(f"block={args.block}  num_heads={num_heads}  head_dim={head_dim}")
 
     composite = build_composite(args.composite, args.gamma, args.epsilon)
     composite_label = type(composite).__name__
@@ -476,7 +496,7 @@ def main():
         composite_label=composite_label,
         gamma_label=gamma_label,
         image_class_pairs=image_class_pairs,
-        layer_name=layer_name,
+        block_idx=args.block,
         num_heads=num_heads,
         head_dim=head_dim,
         top_k=args.top_k,

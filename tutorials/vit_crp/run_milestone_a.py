@@ -220,8 +220,7 @@ def main():
     model = timm.create_model(args.model, pretrained=True).eval().to(device)
     attn = model.blocks[args.block].attn
     num_heads, head_dim = attn.num_heads, attn.head_dim
-    layer_name = f"blocks.{args.block}.attn.qkv_tap"
-    print(f"  layer={layer_name}  num_heads={num_heads}  head_dim={head_dim}")
+    print(f"  block={args.block}  num_heads={num_heads}  head_dim={head_dim}")
     attribution = CondAttribution(model, device=torch.device(device))
 
     # 3. Build sweep configs.
@@ -253,7 +252,7 @@ def main():
             composite_label=composite_label,
             gamma_label=gamma,
             image_class_pairs=image_class_pairs,
-            layer_name=layer_name,
+            block_idx=args.block,
             num_heads=num_heads,
             head_dim=head_dim,
             top_k=top_k_arg,

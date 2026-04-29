@@ -3,15 +3,18 @@
 End-to-end demos for the four attention-concept granularities defined in
 [`crp.attention_concepts`](../../crp/attention_concepts.py):
 
-| Concept class       | Granularity                                        | `attribute()` shape           |
-|---------------------|----------------------------------------------------|-------------------------------|
-| `HeadConcept`       | one concept per attention head                     | `(B, num_heads)`              |
-| `KQVConcept`        | three concepts per block (whole Q / K / V)         | `(B, 3)`                      |
-| `KQVHeadConcept`    | per `(part, head)` — `3 × num_heads`               | `(B, 3, num_heads)`           |
-| `HeadDimConcept`    | per `(part, head, dim)` — `3 × num_heads × head_dim` | `(B, 3, num_heads, head_dim)` |
+| Concept class         | Hook tap         | Granularity                                  | `attribute()` shape            |
+|-----------------------|------------------|----------------------------------------------|--------------------------------|
+| `HeadConcept`         | `attn_out_tap`   | output tokens, per head                      | `(B, num_heads)`               |
+| `HeadDimConcept`      | `attn_out_tap`   | output tokens, per `(head, dim)`             | `(B, num_heads, head_dim)`     |
+| `KQVHeadConcept`      | `qkv_tap`        | K/Q/V projections, per `(part, head)`        | `(B, 3, num_heads)`            |
+| `KQVHeadDimConcept`   | `qkv_tap`        | K/Q/V projections, per `(part, head, dim)`   | `(B, 3, num_heads, head_dim)`  |
 
-All four hook the same named tap (`attn.qkv_tap`, an `nn.Identity` injected
-by `inject_qkv_taps`) so they can be compared on equal footing.
+The four classes cross two orthogonal granularity dimensions: **whether
+to split by K/Q/V** (qkv_tap vs the per-head output tokens at attn_out_tap)
+and **whether to split per head_dim** (sum the head_dim axis or keep it).
+Both `qkv_tap` and `attn_out_tap` are `nn.Identity` submodules installed
+by `AttentionTapsCanonizer`.
 
 ## Setup
 
@@ -42,7 +45,9 @@ reproducibility.
 1. Downloads an Imagenette subset (~98 MB) — real ImageNet images, ten
    classes, mapped back to ImageNet-1k indices.
 2. Builds a `FeatureVisualization` index for each of the four concept
-   granularities, all hooking the same `qkv_tap`.
+   granularities. Each granularity reads from its own tap (`attn_out_tap`
+   or `qkv_tap`) — the notebook resolves the layer name from the
+   concept's `tap_name`.
 3. For one target image, ranks each granularity's concepts by relevance
    under the true class, then displays top-k reference samples and
    conditional heatmaps.
@@ -74,9 +79,10 @@ ImageNet target-class indices: 281 is *tabby cat*, 207 is *golden retriever*,
 817 is *sports car*, etc. (full list at
 `https://github.com/anishathalye/imagenet-simple-labels`).
 
-The `--block` flag chooses which ViT attention block's `qkv_tap` is hooked.
-For `vit_base_patch16_224` (12 blocks), mid-network blocks (5–9) tend to
-carry the most class-relevant structure.
+The `--block` flag chooses the ViT attention block to attribute through;
+each concept hooks the right tap on that block automatically. For
+`vit_base_patch16_224` (12 blocks), mid-network blocks (5–9) tend to carry
+the most class-relevant structure.
 
 ## Quantitative comparison
 
@@ -119,10 +125,12 @@ The CSV has one row per `(image, concept_def, mode)` triple, where `mode ∈
 * **Block index**: each attention block is independent; the choice is
   empirical. Mid- to late-network blocks usually carry class-relevant
   structure; very-early blocks carry low-level features.
-* **`top_k`**: for `head_dim` (3 × 12 × 64 = 2304 concepts on ViT-B), `k=8`
-  picks the eight most-relevant feature dimensions across all parts and
-  heads. The right `k` is granularity-dependent: `head` has only 12
-  concepts, so `k=4` gives a third of them.
+* **`top_k`**: granularity-dependent. On ViT-B (12 heads × 64 head_dim):
+  `head` has 12 concepts (`k=4` ≈ ⅓), `head_dim` 768, `kqv_head` 36,
+  `kqv_head_dim` 2 304 (sparse `k=8` ≈ 0.3 %). The
+  `PER_GRANULARITY_TOP_K` map in `metrics.py` ships sensible defaults; the
+  Petsiuk methodology requires `k ≪ num_concepts` for the random baseline
+  to actually differ from the relevance-ranked top-k.
 
 ## What's next (this fork's roadmap)
 

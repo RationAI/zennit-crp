@@ -21,23 +21,21 @@ named tap ``…attn.qkv_tap`` that :class:`QKVTapCanonizer` adds.
 
 Usage::
 
-    from zennit.composites import EpsilonPlusFlat
     from crp.transformer_patches import AttnLRPEpsilonComposite
     from crp.attention_concepts import HeadConcept
     from crp.attribution import CondAttribution
 
     composite = AttnLRPEpsilonComposite()      # canonizer pre-bundled
     attribution = CondAttribution(model)
-    concept = HeadConcept()
-    concept.register_from_model(model)
+    concept = HeadConcept(model)               # auto-registers attention dims
     result = attribution(
-        data, [{"blocks.6.attn.qkv_tap": [0], "y": [281]}],
+        data, [{"blocks.6.attn.attn_out_tap": [0], "y": [281]}],
         composite, mask_map=concept.mask,
     )
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -250,9 +248,19 @@ def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
 
     Differences from upstream timm forward:
 
-    * Routes ``self.qkv(x)`` through ``self.qkv_tap`` (an ``nn.Identity``
-      submodule installed by :class:`QKVTapCanonizer`) — the named hook
-      point used by :mod:`crp.attention_concepts`.
+    * Routes ``self.qkv(x)`` through ``self.qkv_tap`` and the per-head
+      attention output through ``self.attn_out_tap`` — both ``nn.Identity``
+      submodules installed by :class:`AttentionTapsCanonizer`. They are the
+      named hook points used by :mod:`crp.attention_concepts`:
+
+      * ``qkv_tap`` (last dim ``3*D``) is where K/Q/V-side concepts read
+        relevance — :class:`KQVHeadConcept`, :class:`KQVHeadDimConcept`.
+      * ``attn_out_tap`` (last dim ``D``) is where output-side concepts read
+        relevance — :class:`HeadConcept`, :class:`HeadDimConcept`. Placed
+        after ``attn @ v`` and the (optional) post-attention norm but
+        **before** ``self.proj`` so the per-head stripe layout
+        ``[head0[0..d_h-1], head1[...], ...]`` is preserved.
+
     * Q, K, V each pass through :func:`divide_gradient` (factors 4, 4, 2) —
       AttnLRP uniform rule on the ``QKᵀ`` and ``attn·V`` bilinears
       (Eq. 14–15 of arXiv:2402.05602).
@@ -262,7 +270,7 @@ def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
     """
     B, N, _ = x.shape
     qkv_flat = self.qkv(x)              # (B, N, 3*num_heads*head_dim)
-    qkv_flat = self.qkv_tap(qkv_flat)   # ← named hook tap
+    qkv_flat = self.qkv_tap(qkv_flat)   # ← K/Q/V-side hook tap
     qkv = qkv_flat.reshape(B, N, 3, self.num_heads, self.head_dim).permute(
         2, 0, 3, 1, 4
     )
@@ -302,6 +310,7 @@ def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
     x = x.transpose(1, 2).reshape(B, N, out_dim)
     if hasattr(self, "norm"):
         x = self.norm(x)
+    x = self.attn_out_tap(x)            # ← output-side hook tap
     x = self.proj(x)
     x = self.proj_drop(x)
     return x
@@ -310,18 +319,35 @@ def timm_attention_forward(self, x, attn_mask=None, is_causal=False):
 # ─── 3. Canonizers — register on composite.context() enter, revert on exit ──
 
 
-class QKVTapCanonizer(Canonizer):
-    """Inject ``qkv_tap = nn.Identity()`` into every timm-style ``Attention``
-    submodule. Detection: presence of ``qkv`` (a ``nn.Linear``), ``num_heads``,
+_TAPS = ("qkv_tap", "attn_out_tap")
+
+
+class AttentionTapsCanonizer(Canonizer):
+    """Inject ``qkv_tap`` and ``attn_out_tap`` (both ``nn.Identity``) into
+    every timm-style ``Attention`` submodule.
+
+    Detection: presence of ``qkv`` (a ``nn.Linear``), ``num_heads``,
     ``head_dim``.
 
-    The tap is the named hook point used by :mod:`crp.attention_concepts`.
-    Registers on apply, removes on :meth:`remove` (so the model is reverted
-    when ``composite.context()`` exits).
+    Both taps are named hook points consumed by
+    :mod:`crp.attention_concepts`:
+
+    * ``qkv_tap`` lives between ``Linear(D, 3D)`` and the K/Q/V split,
+      shape ``(B, N, 3D)``.
+    * ``attn_out_tap`` lives between the per-head attention output (after
+      ``attn @ v``, optional post-attention norm) and ``proj``, shape
+      ``(B, N, D)``.
+
+    Registers on ``apply``, removes on :meth:`remove` (so the model is
+    reverted when ``composite.context()`` exits). User-pre-injected taps
+    are respected and not auto-removed.
     """
 
     def __init__(self):
         self.module: Optional[nn.Module] = None
+        # Tracks which of the named taps THIS instance added (so remove()
+        # only deletes the ones it created, not any pre-injected by the user).
+        self._added: List[str] = []
 
     def apply(self, root_module):
         instances = []
@@ -338,21 +364,32 @@ class QKVTapCanonizer(Canonizer):
         return instances
 
     def register(self, module):
-        existing = getattr(module, "qkv_tap", None)
-        if isinstance(existing, nn.Identity):
-            # User pre-injected; respect that, do not auto-remove.
-            self.module = None
-            return
         self.module = module
-        module.add_module("qkv_tap", nn.Identity())
+        self._added = []
+        for tap_name in _TAPS:
+            existing = getattr(module, tap_name, None)
+            if isinstance(existing, nn.Identity):
+                # User pre-injected; respect, do not auto-remove.
+                continue
+            module.add_module(tap_name, nn.Identity())
+            self._added.append(tap_name)
 
     def remove(self):
         if self.module is None:
             return
-        del self.module._modules["qkv_tap"]
+        for tap_name in self._added:
+            if tap_name in self.module._modules:
+                del self.module._modules[tap_name]
+        self._added = []
 
     def copy(self):
         return type(self)()
+
+
+# Back-compat alias: pre-iter-10 code referenced ``QKVTapCanonizer`` (which
+# only injected ``qkv_tap``). The new canonizer also installs
+# ``attn_out_tap``; the alias keeps imports green for any callers we missed.
+QKVTapCanonizer = AttentionTapsCanonizer
 
 
 def _attn_attribute_map(_name, module):
@@ -457,7 +494,8 @@ class TimmViTCanonizer(CompositeCanonizer):
     """All graph + forward changes needed for AttnLRP on a timm ViT, in one
     canonizer. Composes:
 
-    * :class:`QKVTapCanonizer` — install ``qkv_tap`` Identity submodule.
+    * :class:`AttentionTapsCanonizer` — install ``qkv_tap`` and
+      ``attn_out_tap`` Identity submodules.
     * ``AttributeCanonizer`` — swap ``forward`` on ``Attention``,
       ``LayerNorm``, ``GELU``, ``Dropout`` instances; optionally swap
       ``_pos_embed`` on ``VisionTransformer`` for the PA-LRP rule
@@ -490,7 +528,7 @@ class TimmViTCanonizer(CompositeCanonizer):
 
     def __init__(self, palrp: bool = False, residual_lrp: str | None = None):
         canonizers = [
-            QKVTapCanonizer(),
+            AttentionTapsCanonizer(),
             AttributeCanonizer(_attn_attribute_map),
             AttributeCanonizer(_layer_norm_attribute_map),
             AttributeCanonizer(_gelu_attribute_map),
@@ -704,7 +742,8 @@ __all__ = [
     "vit_block_forward_ratio",
     "vit_pos_embed_palrp",
     # Canonizers
-    "QKVTapCanonizer",
+    "AttentionTapsCanonizer",
+    "QKVTapCanonizer",  # back-compat alias
     "TimmViTCanonizer",
     # Hooks
     "GradientTimesInputBasicHook",

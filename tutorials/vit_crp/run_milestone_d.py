@@ -114,7 +114,6 @@ def main():
         block_idx = MID_BLOCK.get(model_name, len(model.blocks) // 2)
         attn = model.blocks[block_idx].attn
         num_heads, head_dim = attn.num_heads, attn.head_dim
-        layer_name = f"blocks.{block_idx}.attn.qkv_tap"
         print(
             f"  block={block_idx}/{len(model.blocks)}  num_heads={num_heads}  "
             f"head_dim={head_dim}"
@@ -138,7 +137,7 @@ def main():
                 composite_label=composite_label,
                 gamma_label=None,
                 image_class_pairs=image_class_pairs,
-                layer_name=layer_name,
+                block_idx=block_idx,
                 num_heads=num_heads,
                 head_dim=head_dim,
                 top_k=PER_GRANULARITY_TOP_K,

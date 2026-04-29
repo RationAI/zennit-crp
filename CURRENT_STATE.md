@@ -4,20 +4,24 @@ Branch: `transformer-multi-concept` (off `transformer` by Jiri Hofirek). PR #2 (
 
 ## What this fork adds
 
-A complete, idiomatic-zennit AttnLRP implementation for vision transformers, with four concept-detector granularities, all sharing one named hook tap.
+A complete, idiomatic-zennit AttnLRP implementation for vision transformers, with four concept-detector granularities crossing two orthogonal axes — *split by K/Q/V?* and *split by head_dim?* — and reading from two named hook taps.
 
 ### 1. Concept classes — `crp/attention_concepts.py`
 
-`_BaseAttentionConcept(ChannelConcept)` and four subclasses, all hooking the same named tap (`<…attn>.qkv_tap`):
+`_AttentionConcept(ChannelConcept)` (a single base class with two boolean flags `KQV_SPLIT` and `DIM_SPLIT`) and four subclasses (one per flag combination):
 
-| Class | Granularity | `attribute()` shape |
-|---|---|---|
-| `HeadConcept`     | one concept per attention head                               | `(B, num_heads)` |
-| `KQVConcept`      | three concepts per block (whole Q / K / V)                   | `(B, 3)` |
-| `KQVHeadConcept`  | per `(part, head)` — `3 × num_heads`                          | `(B, 3, num_heads)` |
-| `HeadDimConcept`  | per `(part, head, dim)` — `3 × num_heads × head_dim`         | `(B, 3, num_heads, head_dim)` |
+| Class | Hook tap | Granularity | `attribute()` shape |
+|---|---|---|---|
+| `HeadConcept`        | `attn_out_tap` | output tokens, per head                       | `(B, num_heads)`               |
+| `HeadDimConcept`     | `attn_out_tap` | output tokens, per `(head, dim)`              | `(B, num_heads, head_dim)`     |
+| `KQVHeadConcept`     | `qkv_tap`      | K/Q/V projections, per `(part, head)`         | `(B, 3, num_heads)`            |
+| `KQVHeadDimConcept`  | `qkv_tap`      | K/Q/V projections, per `(part, head, dim)`    | `(B, 3, num_heads, head_dim)`  |
 
-The base class implements `mask`, `attribute`, and `reference_sampling` (the last is required by `crp.maximization.Maximization` / `FeatureVisualization`); subclasses only define `_concept_to_slices` (mask layout) and `_per_token_relevance` (reshape + sum axes). `KQVHeadConcept` and `HeadDimConcept` accept both tuple ids and flat int ids — flat ints decode in row-major order matching the `attribute()` flatten.
+* `KQV_SPLIT` selects the tap (`qkv_tap` if True, `attn_out_tap` if False) — i.e. whether to read relevance at the K/Q/V projections (split-by-Q/K/V) or at the per-head pre-projection output tokens.
+* `DIM_SPLIT` selects whether the per-head `head_dim` axis is kept as separate concepts (one per dim) or summed out per head.
+* Subclasses are flag-only — no per-class slice/aggregation logic. The base class derives the slice layout, expected last-dim, and the per-token relevance reshape from the two flags.
+* All classes accept both tuple ids and flat int ids — flat ints decode in row-major order matching the `attribute()` flatten.
+* The model can be passed to the constructor (`HeadConcept(model)`) which calls `register_from_model` automatically — no manual setup of head_dim / num_heads needed for any common ViT (timm, HuggingFace, torchvision).
 
 ### 2. AttnLRP rules — `crp/transformer_patches.py`
 
@@ -27,7 +31,7 @@ Idiomatic zennit Canonizer + Hook + Composite stack. Three layers:
   * `_IdentityRuleFn` — AttnLRP identity rule for activations (Eq. 9).
   * `_DivideGradientFn` — AttnLRP uniform rule for bilinears (Eq. 7).
 * **Canonizers** (model graph + forward swaps, instance-level, scoped):
-  * `QKVTapCanonizer(Canonizer)` — installs `qkv_tap = nn.Identity()` per Attention on register; `del module._modules["qkv_tap"]` on remove. Honors a user-pre-injected tap (idempotent).
+  * `AttentionTapsCanonizer(Canonizer)` — installs `qkv_tap` and `attn_out_tap` (both `nn.Identity`) per Attention on register; deletes only the taps it created on remove (user-pre-injected taps preserved). `QKVTapCanonizer` is a back-compat alias.
   * `TimmViTCanonizer(CompositeCanonizer)` — bundles `QKVTapCanonizer` with four `AttributeCanonizer` instances that swap `forward` per-instance on `Attention`, `LayerNorm`, `GELU`, `Dropout`. Forward-swap reverts on `composite.context()` exit.
 * **LRP Hooks** (gradient×input formulation):
   * `GradientTimesInputBasicHook(BasicHook)` — pure subclass overriding `forward` (saves output) and `backward` (multiplies grad_output by output, runs zennit's standard backward through ParamMod-modified module, divides relevance by input).
@@ -50,14 +54,14 @@ with composite.context(self.model) as modified:
         # forward + backward
 ```
 
-Without this ordering, `MaskHook` on `qkv_tap` silently no-ops (`NameMapComposite` finds no module).
+Without this ordering, `MaskHook` on the canonizer-installed taps silently no-ops (`NameMapComposite` finds no module).
 
 ### 4. Tests — `tests/`
 
-* `tests/test_attention_concepts.py` — 38 unit tests (pure tensor, no model): mask shape and slice coverage, batch isolation, int/tuple alias, `attribute` shape and aggregation-vs-manual, abs-norm sums to 1, conservation across granularities, `reference_sampling` shape and ordering, flat-id decode.
-* `tests/test_vit_integration.py` — 14 integration tests on `vit_tiny_patch16_224` (random init): canonizer register/remove cycle, idempotent pre-injected tap, forward-swap reversibility, end-to-end attribution per granularity (heatmap shape `(B, H, W)`), per-concept relevance shape, ε vs γ composite end-to-end and numerical-difference sanity.
+* `tests/test_attention_concepts.py` — pure-tensor unit tests (no model): mask shape and slice coverage at both taps, batch isolation, int/tuple alias, `attribute` shape and aggregation-vs-manual, abs-norm sums to 1, conservation between coarser and finer granularities (HeadDim → Head, KQVHeadDim → KQVHead), `reference_sampling` shape and ordering, flat-id decode, tap-name dispatch.
+* `tests/test_vit_integration.py` — integration tests on `vit_tiny_patch16_224` (random init): canonizer register/remove cycle for both taps, idempotent pre-injected tap, forward-swap reversibility, end-to-end attribution per granularity (heatmap shape `(B, H, W)`), per-concept relevance shape, ε vs γ composite end-to-end + numerical-difference sanity, conservation diagnostic on `vit_base_patch16_224`.
 
-All 52 ViT-CRP tests green.
+All 69 ViT-CRP tests green (47 unit + 22 integration).
 
 The 6 legacy tests in `tests/test_attribution.py` and `tests/test_integration.py` predate this work and fail under the current zennit version (positional canonizer arg removed); out of scope here.
 
@@ -73,9 +77,10 @@ Dependency management is `uv add` / `uv sync`. Optional extras: `vit` (timm + tr
 
 ## What was removed
 
-* `crp.concepts.AttentionHeadConcept` (POC) — superseded by `HeadConcept`. The POC hooked the post-`proj` attention output, where `Linear(D, D)` mixes all heads, so a head-stripe mask there did not isolate head `h`. The four classes in `crp.attention_concepts` hook the pre-attention `qkv_tap` instead.
+* `crp.concepts.AttentionHeadConcept` (POC) — superseded by `HeadConcept`. The POC hooked the post-`proj` attention output, where `Linear(D, D)` mixes all heads, so a head-stripe mask there did not isolate head `h`. The four classes in `crp.attention_concepts` hook either `attn_out_tap` (pre-`proj`, per-head stripes preserved) or `qkv_tap` (pre-attention K/Q/V).
 * `crp.attribution.AttentionAttribution` — convenience wrapper that bound `AttentionHeadConcept.mask` as default. Use `CondAttribution` with `mask_map=concept.mask` directly.
 * `crp.transformer_patches.{monkey_patch, monkey_patch_zennit, prepare_timm_vit, inject_qkv_taps, _build_default_map, get_default_map, _check_already_patched, replace_module, wrap_attention_forward, cp_*}` — the entire monkey-patch infrastructure plus its LLaMA / GPT-2 / Qwen2 / Gemma3 patch maps (none of those models were exercised on this branch). Replaced by the Canonizer + Hook + Composite stack.
+* `KQVConcept` (per-block coarse Q/K/V concept, iter-10) — granularity below the attention head was conceptually dubious (Q-across-all-heads isn't a single concept detector). Replaced by the four-class `KQV_SPLIT × DIM_SPLIT` matrix.
 
 ## Iteration history (this branch)
 
@@ -91,37 +96,53 @@ Dependency management is `uv add` / `uv sync`. Optional extras: `vit` (timm + tr
 | 6  | `526c77a` | Generalise `FeatureVisualization._attribution_on_reference` — pull `mask_map` from `self.layer_map[layer_name]` instead of hardcoded `ChannelConcept.{mask,mask_rf}`. Restores per-reference-sample conditional heatmaps for the four attention concepts. |
 | 7  | `c7cd0d7` | Milestone A faithfulness sweep on `vit_base_patch16_224` (64 imgs × 4 classes × {ε, γ ∈ 0.0/0.1/0.25/0.5} × 4 granularities × {true, random}, per-granularity top-k). Methodology fix (`resolve_top_k`), per-granularity top-k defaults, `run_milestone_a.py` driver, `aggregate_milestone_a.py` table emitter. Drop stale `IMPLEMENTATION_PLAN.md`. |
 | 8  | `4835c3c` | Milestone D — conservation test + PA-LRP. `PALRPCanonizer` (uniform rule at `x + pos_embed`, factor 2). `TimmViTCanonizer(palrp=…)`, both composites take `palrp` kwarg. Conservation diagnostic in `tests/test_vit_integration.py` and `tutorials/vit_crp/conservation_check.py`. Multi-model sweep `run_milestone_d.py` on `vit_small/base/large` × ± PA-LRP. Findings: PA-LRP halves heatmap uniformly → AUC unchanged (Pearson=1.0, argsort identical empirically). kqv_head failure persists at every model scale (vit_large worst, vit_small mildest — opposite of saturation hypothesis). |
-| 9  | (this commit) | Milestone G — residual-LRP. `_ResidualRatioFn` (Otsuki ratio split, ∝ `|x|` vs `|branch|`) + `vit_block_forward_{symmetric,ratio}` swaps + `TimmViTCanonizer(residual_lrp=…)` toggle. `run_milestone_g.py` sweep. Symmetric is AUC-inert (Pearson=1.0, like PA-LRP). **Ratio fixes the kqv_head AUC anomaly at all three model sizes and gets vit_small to 4/4 OK** (was 2/4). Trade-off: breaks `head` on vit_base (del_gap −0.0075) and degrades vit_large further. Default kept off; opt-in via `residual_lrp='ratio'`. |
+| 9  | `c38923e` | Milestone G — residual-LRP. `_ResidualRatioFn` (Otsuki ratio split, ∝ `|x|` vs `|branch|`) + `vit_block_forward_{symmetric,ratio}` swaps + `TimmViTCanonizer(residual_lrp=…)` toggle. `run_milestone_g.py` sweep. Symmetric is AUC-inert (Pearson=1.0, like PA-LRP). **Ratio fixes the kqv_head AUC anomaly at all three model sizes and gets vit_small to 4/4 OK** (was 2/4). Trade-off: breaks `head` on vit_base (del_gap −0.0075) and degrades vit_large further. Default kept off; opt-in via `residual_lrp='ratio'`. |
+| 10 | (this commit) | Concept refactor per design review. **Removed `KQVConcept`** (per-block coarse Q/K/V wasn't a meaningful concept detector). **Renamed old `HeadDimConcept` → `KQVHeadDimConcept`** and introduced **new `HeadConcept` and `HeadDimConcept` reading at the per-head output tokens**: a new `attn_out_tap` (`nn.Identity` between `attn @ v` and `self.proj`) is now the default tap for output-side concepts. Single `_AttentionConcept` base class with two boolean flags `KQV_SPLIT` and `DIM_SPLIT`; the four concrete classes are flag-only. `AttentionTapsCanonizer` (rename of `QKVTapCanonizer`) installs both taps; back-compat alias kept. Concepts auto-register attention dims when constructed with the model: `HeadConcept(model)`. Tests fully rewritten; tutorials, demo CLI, milestone drivers, walkthrough notebook, README updated. |
 
-## Public API (post-iter-5)
+## Public API (post-iter-10)
 
 ```python
-from crp.attention_concepts import HeadConcept, KQVConcept, KQVHeadConcept, HeadDimConcept
+from crp.attention_concepts import (
+    HeadConcept,        # output-side, per head
+    HeadDimConcept,     # output-side, per (head, dim)
+    KQVHeadConcept,     # K/Q/V-side, per (part, head)
+    KQVHeadDimConcept,  # K/Q/V-side, per (part, head, dim)
+)
 from crp.attribution import CondAttribution
 from crp.transformer_patches import AttnLRPEpsilonComposite, AttnLRPGammaComposite
 from crp.visualization import FeatureVisualization
 
-# Choose composite. γ for ViT linears (AttnLRP §3.2.1 recommends γ ≈ 0.25):
-composite = AttnLRPGammaComposite()        # canonizer pre-bundled
+composite = AttnLRPEpsilonComposite()      # default; canonizer pre-bundled
 attribution = CondAttribution(model)       # no model-time setup needed
 
-concept = KQVHeadConcept()
-concept.register_from_model(model)
+# Pass the model to auto-register attention dims for every Attention block.
+concept = KQVHeadConcept(model)
+layer_name = f"blocks.6.attn.{concept.tap_name}"  # 'qkv_tap' here
 
-# Conditional heatmap on the top KQV-head concept:
+# Conditional heatmap on the top KQV-head concept (("v", 1) = head 1 of V):
 result = attribution(
     data,
-    [{"blocks.6.attn.qkv_tap": [("v", 1)], "y": [281]}],
+    [{layer_name: [("v", 1)], "y": [281]}],
     composite,
     mask_map=concept.mask,
 )
 
 # Index reference samples across a dataset:
-fv = FeatureVisualization(attribution, dataset, {"blocks.6.attn.qkv_tap": concept},
+fv = FeatureVisualization(attribution, dataset, {layer_name: concept},
                           preprocess_fn=preprocess_fn, path="fv_kqv_head")
 fv.run(composite, 0, len(dataset))
-ref_c = fv.get_max_reference([0, 1, 2], "blocks.6.attn.qkv_tap", "relevance", (0, 4),
+ref_c = fv.get_max_reference([0, 1, 2], layer_name, "relevance", (0, 4),
                               composite=composite)
+
+# Output-side concept (HeadConcept / HeadDimConcept) — same shape, different tap:
+out_concept = HeadConcept(model)
+out_layer = f"blocks.6.attn.{out_concept.tap_name}"  # 'attn_out_tap'
+result = attribution(
+    data,
+    [{out_layer: [3], "y": [281]}],     # head 3 of the output tokens
+    composite,
+    mask_map=out_concept.mask,
+)
 ```
 
 ## Milestone A — faithfulness sweep finding (iter 7)

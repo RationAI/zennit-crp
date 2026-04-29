@@ -74,8 +74,8 @@ CELLS.append(md(
     "5. **Build a `FeatureVisualization` index per concept granularity** — "
     "cached on disk; re-runs are no-ops.",
     "6. **Top-concept identification + reference samples** — for each "
-    "granularity (`HeadConcept`, `KQVConcept`, `KQVHeadConcept`, "
-    "`HeadDimConcept`), rank concepts under the target class, fetch the "
+    "granularity (`HeadConcept`, `HeadDimConcept`, `KQVHeadConcept`, "
+    "`KQVHeadDimConcept`), rank concepts under the target class, fetch the "
     "top-N samples that maximise each concept's relevance.",
     "7. **Conditional heatmaps on the target image** — pixel-space "
     "attribution under the most-important concept of each granularity, "
@@ -86,17 +86,17 @@ CELLS.append(md(
     "(Achtibat et al., Nature MI 2023; "
     "[arXiv 2206.03208](https://arxiv.org/abs/2206.03208)).",
     "",
-    "**Concept-detector cheat sheet**:",
+    "**Concept-detector cheat sheet** (two orthogonal granularity dims):",
     "",
-    "| Class | Granularity | `attribute()` shape |",
-    "|---|---|---|",
-    "| `HeadConcept`     | one concept per attention head                       | `(B, num_heads)` |",
-    "| `KQVConcept`      | three concepts per block (whole Q / K / V)           | `(B, 3)` |",
-    "| `KQVHeadConcept`  | per `(part, head)` — `3 × num_heads`                 | `(B, 3, num_heads)` |",
-    "| `HeadDimConcept`  | per `(part, head, dim)` — `3 × num_heads × head_dim` | `(B, 3, num_heads, head_dim)` |",
+    "| Class | Tap | Granularity | `attribute()` shape |",
+    "|---|---|---|---|",
+    "| `HeadConcept`        | `attn_out_tap` | per head (output tokens)             | `(B, num_heads)`              |",
+    "| `HeadDimConcept`     | `attn_out_tap` | per `(head, dim)` (output tokens)    | `(B, num_heads, head_dim)`    |",
+    "| `KQVHeadConcept`     | `qkv_tap`      | per `(part, head)` (K/Q/V projections) | `(B, 3, num_heads)`         |",
+    "| `KQVHeadDimConcept`  | `qkv_tap`      | per `(part, head, dim)` (K/Q/V projections) | `(B, 3, num_heads, head_dim)` |",
     "",
-    "All four hook the same named tap (`attn.qkv_tap`) installed by "
-    "`QKVTapCanonizer`."
+    "Both taps are `nn.Identity` submodules installed by "
+    "`AttentionTapsCanonizer`."
 ))
 
 
@@ -135,16 +135,16 @@ CELLS.append(code(
     "",
     "from crp.attention_concepts import (",
     "    HeadConcept,",
-    "    KQVConcept,",
-    "    KQVHeadConcept,",
     "    HeadDimConcept,",
+    "    KQVHeadConcept,",
+    "    KQVHeadDimConcept,",
     "    PARTS,",
     ")",
     "from crp.attribution import CondAttribution",
     "from crp.transformer_patches import (",
     "    AttnLRPEpsilonComposite,",
     "    AttnLRPGammaComposite,",
-    "    QKVTapCanonizer,",
+    "    AttentionTapsCanonizer,",
     "    TimmViTCanonizer,",
     ")",
     "from crp.visualization import FeatureVisualization",
@@ -285,10 +285,10 @@ CELLS.append(md(
     "",
     "* **Canonizers** modify the model graph and forward methods so standard "
     "LRP rules can apply. We use `TimmViTCanonizer`, which composes "
-    "`QKVTapCanonizer` (adds a named `qkv_tap = nn.Identity()` to every "
-    "Attention) with `AttributeCanonizer`s that swap `forward` per-instance "
-    "on `Attention`, `LayerNorm`, `GELU`, `Dropout` to embed the AttnLRP "
-    "autograd functions in the forward pass.",
+    "`AttentionTapsCanonizer` (adds named `qkv_tap` and `attn_out_tap` "
+    "`nn.Identity` submodules to every Attention) with `AttributeCanonizer`s "
+    "that swap `forward` per-instance on `Attention`, `LayerNorm`, `GELU`, "
+    "`Dropout` to embed the AttnLRP autograd functions in the forward pass.",
     "* **Composite** maps module classes to LRP **Hooks**. We map `Linear` / "
     "`Conv2d` to a gradient×input ε or γ rule, and activations to `Pass` "
     "(the AttnLRP identity rule is already encoded in their forward via the "
@@ -304,7 +304,9 @@ CELLS.append(code(
     "",
     "block = model.blocks[BLOCK_INDEX].attn",
     "NUM_HEADS, HEAD_DIM = block.num_heads, block.head_dim",
-    "LAYER_NAME = f'blocks.{BLOCK_INDEX}.attn.qkv_tap'",
+    "# Layer name is per-concept (each concept knows its tap):",
+    "QKV_LAYER = f'blocks.{BLOCK_INDEX}.attn.qkv_tap'",
+    "OUT_LAYER = f'blocks.{BLOCK_INDEX}.attn.attn_out_tap'",
     "",
     "if USE_GAMMA:",
     "    composite = AttnLRPGammaComposite(gamma=GAMMA, epsilon=EPSILON)",
@@ -312,22 +314,23 @@ CELLS.append(code(
     "    composite = AttnLRPEpsilonComposite(epsilon=EPSILON)",
     "",
     "print(f'composite: {type(composite).__name__}')",
-    "print(f'layer    : {LAYER_NAME}')",
+    "print(f'qkv tap  : {QKV_LAYER}')",
+    "print(f'out tap  : {OUT_LAYER}')",
     "print(f'num_heads: {NUM_HEADS}')",
     "print(f'head_dim : {HEAD_DIM}')",
     "print()",
     "print('concept counts:')",
-    "print(f'  HeadConcept    -> {NUM_HEADS}')",
-    "print(f'  KQVConcept     -> 3')",
-    "print(f'  KQVHeadConcept -> {3 * NUM_HEADS}')",
-    "print(f'  HeadDimConcept -> {3 * NUM_HEADS * HEAD_DIM}')"
+    "print(f'  HeadConcept       -> {NUM_HEADS}')",
+    "print(f'  HeadDimConcept    -> {NUM_HEADS * HEAD_DIM}')",
+    "print(f'  KQVHeadConcept    -> {3 * NUM_HEADS}')",
+    "print(f'  KQVHeadDimConcept -> {3 * NUM_HEADS * HEAD_DIM}')"
 ))
 
 
 CELLS.append(md(
     "### 3.1 What the canonizer does (inspection cell)",
     "",
-    "Sanity-check that `qkv_tap` only exists *inside* `composite.context()`. "
+    "Sanity-check that both taps only exist *inside* `composite.context()`. "
     "Before/after the `with` block, the model is exactly as `timm` constructed it."
 ))
 
@@ -336,19 +339,19 @@ CELLS.append(code(
     "attn = model.blocks[BLOCK_INDEX].attn",
     "",
     "print('before composite.context():')",
-    "print(f'  hasattr(attn, \"qkv_tap\")           = {hasattr(attn, \"qkv_tap\")}')",
-    "print(f'  attn.forward is type(attn).forward = {attn.forward.__func__ is type(attn).forward}')",
+    "print(f'  hasattr(attn, \"qkv_tap\")      = {hasattr(attn, \"qkv_tap\")}')",
+    "print(f'  hasattr(attn, \"attn_out_tap\") = {hasattr(attn, \"attn_out_tap\")}')",
     "",
     "with composite.context(model) as modified:",
     "    print()",
     "    print('inside composite.context() (canonizer applied):')",
-    "    print(f'  hasattr(attn, \"qkv_tap\")           = {hasattr(attn, \"qkv_tap\")}')",
-    "    print(f'  attn.forward is timm_attention_forward = '",
-    "          f'{attn.forward.__func__.__name__ == \"timm_attention_forward\"}')",
+    "    print(f'  hasattr(attn, \"qkv_tap\")      = {hasattr(attn, \"qkv_tap\")}')",
+    "    print(f'  hasattr(attn, \"attn_out_tap\") = {hasattr(attn, \"attn_out_tap\")}')",
     "",
     "print()",
     "print('after composite.context() exits (canonizer reverted):')",
-    "print(f'  hasattr(attn, \"qkv_tap\")           = {hasattr(attn, \"qkv_tap\")}')"
+    "print(f'  hasattr(attn, \"qkv_tap\")      = {hasattr(attn, \"qkv_tap\")}')",
+    "print(f'  hasattr(attn, \"attn_out_tap\") = {hasattr(attn, \"attn_out_tap\")}')"
 ))
 
 
@@ -454,11 +457,10 @@ CELLS.append(code(
 CELLS.append(code(
     "attribution = CondAttribution(model, device=torch.device(DEVICE))",
     "",
-    "head_concept = HeadConcept()",
-    "head_concept.register_from_model(model)",
+    "head_concept = HeadConcept(model)",
     "",
     "# Conditional attribution: HeadConcept head=0 under the target class.",
-    "conditions = [{LAYER_NAME: [0], 'y': [target_class]}]",
+    "conditions = [{OUT_LAYER: [0], 'y': [target_class]}]",
     "result = attribution(",
     "    target_pre, conditions, composite, mask_map=head_concept.mask,",
     ")",
@@ -496,28 +498,31 @@ CELLS.append(md(
 
 CELLS.append(code(
     "CONCEPT_DEFS = {",
-    "    'head':     HeadConcept,",
-    "    'kqv':      KQVConcept,",
-    "    'kqv_head': KQVHeadConcept,",
-    "    'head_dim': HeadDimConcept,",
+    "    'head':         HeadConcept,",
+    "    'head_dim':     HeadDimConcept,",
+    "    'kqv_head':     KQVHeadConcept,",
+    "    'kqv_head_dim': KQVHeadDimConcept,",
     "}",
     "",
     "concepts: dict = {}",
     "fvs: dict = {}",
+    "layers: dict = {}",
     "for name, cls in CONCEPT_DEFS.items():",
-    "    concept = cls()",
-    "    concept.register_from_model(model)",
+    "    concept = cls(model)",
     "    concepts[name] = concept",
+    "    layer_name = f'blocks.{BLOCK_INDEX}.attn.{concept.tap_name}'",
+    "    layers[name] = layer_name",
     "    fvs[name] = FeatureVisualization(",
     "        attribution,",
     "        dataset,",
-    "        layer_map={LAYER_NAME: concept},",
+    "        layer_map={layer_name: concept},",
     "        preprocess_fn=preprocess_fn,",
     "        path=str(FV_ROOT / name),",
     "        device=torch.device(DEVICE),",
     "    )",
     "",
-    "print('concepts registered for layer', LAYER_NAME)"
+    "for name, layer in layers.items():",
+    "    print(f'  {name:13} -> {layer}')"
 ))
 
 
@@ -543,8 +548,9 @@ CELLS.append(md(
     "",
     "For the chosen target image:",
     "",
-    "1. Run a backward pass per granularity, recording relevance at "
-    "`qkv_tap`, masked by `concept.mask` under the target class.",
+    "1. Run a backward pass per granularity, recording relevance at the "
+    "concept's tap (`attn_out_tap` for output-side concepts, `qkv_tap` for "
+    "K/Q/V-side concepts), masked by `concept.mask` under the target class.",
     "2. Aggregate via `concept.attribute()` to get one scalar per concept "
     "id.",
     "3. Take the top-K concepts by absolute relevance.",
@@ -574,12 +580,13 @@ CELLS.append(code(
     "def label_for(name, flat_id):",
     "    if name == 'head':",
     "        return f'h{flat_id}'",
-    "    if name == 'kqv':",
-    "        return PARTS[flat_id]",
+    "    if name == 'head_dim':",
+    "        h, d = divmod(flat_id, HEAD_DIM)",
+    "        return f'h{h}/d{d}'",
     "    if name == 'kqv_head':",
     "        p, h = divmod(flat_id, NUM_HEADS)",
     "        return f'{PARTS[p]}/h{h}'",
-    "    if name == 'head_dim':",
+    "    if name == 'kqv_head_dim':",
     "        p, rem = divmod(flat_id, NUM_HEADS * HEAD_DIM)",
     "        h, d = divmod(rem, HEAD_DIM)",
     "        return f'{PARTS[p]}/h{h}/d{d}'",
@@ -589,7 +596,7 @@ CELLS.append(code(
     "top_ids: dict = {}",
     "for name, concept in concepts.items():",
     "    target_pre.grad = None",
-    "    scores = per_concept_scores(concept, LAYER_NAME, target_pre, target_class)",
+    "    scores = per_concept_scores(concept, layers[name], target_pre, target_class)",
     "    ids = top_k_flat(scores, TOP_K)",
     "    top_ids[name] = ids",
     "    pretty = ', '.join(label_for(name, i) for i in ids)",
@@ -620,7 +627,7 @@ CELLS.append(code(
     "    print(f'\\n── {name} ──')",
     "    fv = fvs[name]",
     "    ref_c = fv.get_max_reference(",
-    "        ids, LAYER_NAME, mode='relevance', r_range=REF_RANGE,",
+    "        ids, layers[name], mode='relevance', r_range=REF_RANGE,",
     "        composite=composite, plot_fn=vis_opaque_img,",
     "    )",
     "    pretty = {label_for(name, k): v for k, v in ref_c.items()}",
@@ -668,7 +675,7 @@ CELLS.append(code(
     "    ax = axes[i + 1]",
     "    cid = ids[0]  # most important",
     "    target_pre.grad = None",
-    "    hm = conditional_heatmap(concepts[name], LAYER_NAME, cid, target_pre, target_class)",
+    "    hm = conditional_heatmap(concepts[name], layers[name], cid, target_pre, target_class)",
     "    vmax = np.abs(hm).max()",
     "    ax.imshow(img_np, alpha=0.4)",
     "    ax.imshow(hm, cmap='bwr', alpha=0.7, vmin=-vmax, vmax=vmax)",
@@ -676,7 +683,7 @@ CELLS.append(code(
     "    ax.axis('off')",
     "",
     "fig.suptitle(",
-    "    f'conditional heatmaps  •  layer={LAYER_NAME}  •  '",
+    "    f'conditional heatmaps  •  block={BLOCK_INDEX}  •  '",
     "    f'composite={type(composite).__name__}',",
     "    fontsize=11,",
     ")",

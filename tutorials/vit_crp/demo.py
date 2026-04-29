@@ -2,15 +2,17 @@
 
 Compares the four attention-concept granularities on a single image:
 
-* ``HeadConcept``    — one concept per head
-* ``KQVConcept``     — three concepts per block (whole Q / K / V)
-* ``KQVHeadConcept`` — 3 × num_heads concepts (per (part, head))
-* ``HeadDimConcept`` — 3 × num_heads × head_dim concepts
+* ``HeadConcept``        — output-side, one concept per head
+* ``HeadDimConcept``     — output-side, per (head, dim)
+* ``KQVHeadConcept``     — K/Q/V-side, per (part, head)
+* ``KQVHeadDimConcept``  — K/Q/V-side, per (part, head, dim)
 
 For each granularity, the script computes per-concept relevance scores at a
 chosen attention block under the target class, picks the top-k concepts,
 runs a conditional attribution per concept to obtain a pixel-space heatmap,
-and renders a comparison grid.
+and renders a comparison grid. The recording layer is resolved per-concept
+from ``concept.tap_name`` (``attn_out_tap`` for output-side concepts,
+``qkv_tap`` for K/Q/V-side concepts).
 
 Usage::
 
@@ -38,9 +40,9 @@ from timm.data import resolve_data_config, create_transform
 
 from crp.attention_concepts import (
     HeadConcept,
-    KQVConcept,
-    KQVHeadConcept,
     HeadDimConcept,
+    KQVHeadConcept,
+    KQVHeadDimConcept,
     PARTS,
 )
 from crp.attribution import CondAttribution
@@ -51,10 +53,10 @@ from crp.transformer_patches import AttnLRPEpsilonComposite
 
 
 CONCEPT_DEFS = {
-    "head": HeadConcept,
-    "kqv": KQVConcept,
-    "kqv_head": KQVHeadConcept,
-    "head_dim": HeadDimConcept,
+    "head":         HeadConcept,
+    "head_dim":     HeadDimConcept,
+    "kqv_head":     KQVHeadConcept,
+    "kqv_head_dim": KQVHeadDimConcept,
 }
 
 
@@ -62,12 +64,13 @@ def _id_label(name: str, cid) -> str:
     """Pretty-print a concept id for figure labels."""
     if name == "head":
         return f"head={int(cid)}"
-    if name == "kqv":
-        return f"part={cid}"
+    if name == "head_dim":
+        h, d = cid
+        return f"h{int(h)}/d{int(d)}"
     if name == "kqv_head":
         part, h = cid
         return f"{part}/h{int(h)}"
-    if name == "head_dim":
+    if name == "kqv_head_dim":
         part, h, d = cid
         return f"{part}/h{int(h)}/d{int(d)}"
     raise ValueError(name)
@@ -77,11 +80,11 @@ def _enumerate_ids(name: str, num_heads: int, head_dim: int) -> list:
     """All concept ids for this granularity and ViT geometry."""
     if name == "head":
         return list(range(num_heads))
-    if name == "kqv":
-        return list(PARTS)
+    if name == "head_dim":
+        return [(h, d) for h in range(num_heads) for d in range(head_dim)]
     if name == "kqv_head":
         return [(p, h) for p in PARTS for h in range(num_heads)]
-    if name == "head_dim":
+    if name == "kqv_head_dim":
         return [
             (p, h, d)
             for p in PARTS
@@ -112,7 +115,7 @@ def per_concept_scores(
     composite,
 ) -> torch.Tensor:
     """Run a single backward pass under the target class with NO mask, record
-    relevance at the qkv_tap layer, aggregate via the concept's ``attribute``.
+    relevance at the concept's tap layer, aggregate via ``concept.attribute``.
     Returns scores of shape ``concept.attribute(...)``-shape (batch dim 1).
     """
     conditions = [{"y": [target_class]}]
@@ -169,7 +172,7 @@ def make_figure(
     image: torch.Tensor,
     rows: dict,
     out_path: Path,
-    layer_name: str,
+    title: str,
     target_class: int,
     model: torch.nn.Module,
 ):
@@ -194,7 +197,7 @@ def make_figure(
         for c in range(len(items) + 1, n_cols):
             axes[r, c].axis("off")
 
-    fig.suptitle(f"layer={layer_name}  target_class={target_class}", fontsize=11)
+    fig.suptitle(f"{title}  target_class={target_class}", fontsize=11)
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
@@ -242,11 +245,10 @@ def main():
         marker = " ← target" if idx == args.target_class else ""
         print(f"  cls={idx:4d} p={prob:.3f}{marker}")
 
-    # Resolve geometry from a representative attention block
+    # Resolve geometry from a representative attention block.
     block = model.blocks[args.block].attn
     num_heads, head_dim = block.num_heads, block.head_dim
-    layer_name = f"blocks.{args.block}.attn.qkv_tap"
-    print(f"layer={layer_name}  num_heads={num_heads}  head_dim={head_dim}")
+    print(f"block={args.block}  num_heads={num_heads}  head_dim={head_dim}")
 
     composite = AttnLRPEpsilonComposite()
     attribution = CondAttribution(model, device=torch.device(device))
@@ -254,15 +256,15 @@ def main():
     rows = {}
     for name in args.concepts:
         concept_cls = CONCEPT_DEFS[name]
-        concept = concept_cls()
-        concept.register_from_model(model)
+        concept = concept_cls(model)
+        layer_name = f"blocks.{args.block}.attn.{concept.tap_name}"
 
         scores = per_concept_scores(
             attribution, concept, layer_name, data, args.target_class, composite
         )
         all_ids = _enumerate_ids(name, num_heads, head_dim)
         top_ids = top_k_ids(scores, all_ids, args.top_k)
-        print(f"[{name}] top-{args.top_k} ids: {top_ids}")
+        print(f"[{name}] tap={concept.tap_name}  top-{args.top_k} ids: {top_ids}")
 
         items = []
         for cid in top_ids:
@@ -273,7 +275,10 @@ def main():
         rows[name] = items
 
     out_path = Path(args.out)
-    make_figure(data, rows, out_path, layer_name, args.target_class, model)
+    make_figure(
+        data, rows, out_path,
+        f"block={args.block}", args.target_class, model,
+    )
 
 
 if __name__ == "__main__":
