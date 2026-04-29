@@ -1,16 +1,29 @@
 ### zennit-crp
 tests/results/
 
-### vit_crp tutorial artifacts (downloaded data + computed indices)
+### vit_crp tutorial artifacts
+# Downloaded datasets (Imagenette etc.), curated subsets, sweep CSVs:
 tutorials/vit_crp/data/
-tutorials/vit_crp/FeatureVisualization/
-tutorials/vit_crp/FeatureVisualization_smoke/
+# FeatureVisualization indices — large per-layer .npy/.json caches that
+# the walkthrough notebook builds on first run. Match anywhere under
+# tutorials/ in case a user customises the path.
+tutorials/**/FeatureVisualization/
+tutorials/**/FeatureVisualization_*/
+# demo.py figure outputs (default --out is figures/comparison.png).
+figures/
 
 ### uv (uv.lock is committed for reproducibility)
 .python-version
 
-### VSCODE
-.vscode
+### IDE
+.vscode/
+.idea/
+
+### OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
 
 ### Python ###
 # Byte-compiled / optimized / DLL files

@@ -24,9 +24,10 @@ Dependencies are managed with `uv`. From the repo root:
 uv sync --extra vit --extra dev --extra notebook
 ```
 
-The optional extras: `vit` pulls in `timm` and `transformers`; `dev` adds
-`pytest`/`ruff`; `notebook` adds Jupyter and `torchvision` (used by the
-walkthrough notebook for its dataset wrapper).
+`timm` and `Pillow` are pinned in main `dependencies`. The optional extras:
+`vit` pulls in HuggingFace `transformers` (reserved for the upcoming HF-ViT
+canonizer); `dev` adds `pytest`/`ruff`; `notebook` adds Jupyter and
+`torchvision` (used by the walkthrough notebook for its dataset wrapper).
 
 To add a new dependency, prefer `uv add`:
 
@@ -37,6 +38,25 @@ uv add --optional dev some-package # dev-only
 
 `uv sync` then re-resolves and rewrites `uv.lock`, which is committed for
 reproducibility.
+
+### HuggingFace token (optional but recommended)
+
+`timm.create_model(..., pretrained=True)` downloads weights via the
+HuggingFace Hub. Without an authenticated request you'll see a *"sending
+unauthenticated requests to the HF Hub"* warning and may hit rate limits
+on a shared host. The `huggingface_hub` library auto-reads a token from
+`~/.cache/huggingface/token` (its default `HF_HOME/token`), so the simplest
+setup is:
+
+```bash
+mkdir -p ~/.cache/huggingface
+echo "hf_xxx_your_token" > ~/.cache/huggingface/token
+chmod 600 ~/.cache/huggingface/token
+```
+
+No env var or code change needed; `timm` will pick it up automatically.
+Alternatively `uv run huggingface-cli login` writes the same file
+interactively.
 
 ## Walkthrough notebook (start here)
 

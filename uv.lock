@@ -3546,6 +3546,8 @@ dependencies = [
     { name = "matplotlib" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "pillow" },
+    { name = "timm" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "zennit", version = "0.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11.11'" },
@@ -3569,8 +3571,6 @@ notebook = [
     { name = "torchvision" },
 ]
 vit = [
-    { name = "pillow" },
-    { name = "timm" },
     { name = "transformers" },
 ]
 
@@ -3582,12 +3582,12 @@ requires-dist = [
     { name = "matplotlib" },
     { name = "nbclient", marker = "extra == 'notebook'", specifier = ">=0.10.4" },
     { name = "numpy", specifier = ">=1.24" },
-    { name = "pillow", marker = "extra == 'vit'" },
+    { name = "pillow", specifier = ">=12.2.0" },
     { name = "pillow-simd", marker = "extra == 'fast-img'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "timm", marker = "extra == 'vit'", specifier = ">=1.0" },
+    { name = "timm", specifier = ">=1.0.26" },
     { name = "torch", specifier = ">=2.1" },
     { name = "torchvision", marker = "extra == 'notebook'", specifier = ">=0.26.0" },
     { name = "tqdm" },

@@ -25,14 +25,18 @@ dependencies = [
   "numpy>=1.24",
   "tqdm",
   "matplotlib",
+  "timm>=1.0.26",
+  "pillow>=12.2.0",
 ]
 
 [project.optional-dependencies]
 fast_img = ["Pillow-SIMD"]
+# `timm` and `Pillow` are now in main `dependencies` (timm is the only
+# supported ViT backend; Pillow is imported by crp.cache + crp.image).
+# The `vit` extra now only pulls the HuggingFace `transformers` library —
+# left optional pending a multi-architecture canonizer milestone.
 vit = [
-  "timm>=1.0",
   "transformers>=4.40",
-  "Pillow",
 ]
 dev = [
   "pytest>=8",
