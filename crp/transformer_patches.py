@@ -92,6 +92,30 @@ class _DivideGradientFn(Function):
         return out_relevance[0] / ctx.factor, None
 
 
+class _ResidualRatioFn(Function):
+    """Ratio rule for residual addition ``y = x + branch``.
+
+    Distributes the upstream relevance ``R_y`` proportionally to ``|x|`` and
+    ``|branch|`` — Otsuki et al.'s ratio split, used in our ResNet pipeline
+    and reported there as superior to the symmetric (uniform) split.
+    Conservation: ``R_x + R_branch = R_y · (|x| + |branch|) / (|x| + |branch| + ε) ≈ R_y``.
+    """
+
+    @staticmethod
+    def forward(ctx, x, branch, epsilon=1e-6):
+        ctx.save_for_backward(x, branch)
+        ctx.epsilon = epsilon
+        return x + branch
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, branch = ctx.saved_tensors
+        abs_x = x.abs()
+        abs_b = branch.abs()
+        denom = abs_x + abs_b + ctx.epsilon
+        return grad_output * (abs_x / denom), grad_output * (abs_b / denom), None
+
+
 def identity_rule_implicit(fn, input):
     """Apply ``fn(input)`` with the AttnLRP identity rule inlined into backward."""
     return _IdentityRuleFn.apply(fn, input)
@@ -105,6 +129,13 @@ def divide_gradient(input, factor=2):
 def stop_gradient(input):
     """Detach ``input`` from the autograd graph (CP-LRP variant on normalisations)."""
     return input.detach()
+
+
+def residual_ratio(x, branch, epsilon=1e-6):
+    """Apply ratio-split residual rule. Forward: ``x + branch``. Backward
+    distributes upstream relevance ∝ ``|x|`` vs ``|branch|`` (Otsuki).
+    """
+    return _ResidualRatioFn.apply(x, branch, epsilon)
 
 
 # ─── 2. Replacement forward methods (installed per-instance by Canonizer) ────
@@ -126,6 +157,36 @@ def layer_norm_forward(self, x):
 
 def dropout_passthrough_forward(self, x):
     """Disable dropout during attribution (model may be in train mode)."""
+    return x
+
+
+def vit_block_forward_symmetric(self, x, attn_mask=None, is_causal=False):
+    """timm ``Block.forward`` replacement applying the symmetric (uniform)
+    residual-LRP rule: each ``x = x + branch(x)`` becomes
+    ``divide_gradient(x + branch(x), 2)`` — halves the gradient at each
+    additive node so that the identity branch and the attn/mlp branch
+    receive equal halves of the upstream relevance. Conservative.
+    """
+    branch1 = self.drop_path1(
+        self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal))
+    )
+    x = divide_gradient(x + branch1, 2)
+    branch2 = self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+    x = divide_gradient(x + branch2, 2)
+    return x
+
+
+def vit_block_forward_ratio(self, x, attn_mask=None, is_causal=False):
+    """timm ``Block.forward`` replacement applying the ratio-split residual
+    rule (Otsuki): distributes upstream relevance to ``x`` vs the
+    attn/mlp branch in proportion to ``|x|`` vs ``|branch|``. Conservative.
+    """
+    branch1 = self.drop_path1(
+        self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal))
+    )
+    x = residual_ratio(x, branch1)
+    branch2 = self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+    x = residual_ratio(x, branch2)
     return x
 
 
@@ -348,6 +409,50 @@ def _vit_pos_embed_attribute_map(_name, module):
     return None
 
 
+def _make_block_residual_attribute_map(rule: str):
+    """Build an AttributeCanonizer ``attribute_map`` for residual-LRP that
+    swaps timm ``Block.forward`` for one of the residual rules.
+
+    Parameters
+    ----------
+    rule : {'symmetric', 'ratio'}
+        ``'symmetric'`` — factor-2 uniform allocation (each branch gets
+        half of the upstream relevance).
+        ``'ratio'`` — Otsuki proportional allocation by ``|x|`` vs
+        ``|branch|``; matches the LRP-ε rule for sums in spirit but uses
+        absolute values to avoid sign cancellation.
+    """
+    forwards = {
+        "symmetric": vit_block_forward_symmetric,
+        "ratio": vit_block_forward_ratio,
+    }
+    if rule not in forwards:
+        raise ValueError(
+            f"residual_lrp must be one of {list(forwards)}; got {rule!r}"
+        )
+    fn = forwards[rule]
+
+    def _block_residual_attribute_map(_name, module):
+        try:
+            from timm.models.vision_transformer import Block as TimmBlock
+        except ImportError:
+            return None
+        if isinstance(module, TimmBlock):
+            # Sanity: only handle the standard two-residual layout (no
+            # 'parallel' / 'init_values'-without-ls variant). The standard
+            # Block has both .ls1/.ls2 and .drop_path1/.drop_path2 attrs;
+            # bail otherwise so the unswapped forward is used.
+            needed = ("ls1", "ls2", "drop_path1", "drop_path2", "norm1",
+                      "norm2", "attn", "mlp")
+            if not all(hasattr(module, a) for a in needed):
+                return None
+            bound = fn.__get__(module, type(module))
+            return {"forward": bound}
+        return None
+
+    return _block_residual_attribute_map
+
+
 class TimmViTCanonizer(CompositeCanonizer):
     """All graph + forward changes needed for AttnLRP on a timm ViT, in one
     canonizer. Composes:
@@ -372,9 +477,18 @@ class TimmViTCanonizer(CompositeCanonizer):
         ``vit_pos_embed_palrp`` reimplements timm's ``_pos_embed`` and is
         sensitive to upstream timm changes. Enable per AttnLRP-paper-Eq.-1
         conservation if needed (see ``FUTURE_STATE.md`` Milestone D).
+    residual_lrp : {None, 'symmetric', 'ratio'}
+        If non-None, also swap timm ``Block.forward`` to apply a conservative
+        LRP rule at each residual addition. ``'symmetric'`` halves the
+        gradient at every additive node (uniform allocation, matches the
+        ResNet symmetric rule). ``'ratio'`` distributes upstream relevance
+        proportionally to ``|x|`` and ``|branch|`` (Otsuki-style ratio split,
+        the closer LRP-ε analogue and reported as superior for ResNets).
+        Defaults to None (residuals untouched, ~2× per-block leak — see
+        ``CURRENT_STATE.md`` "Milestone D").
     """
 
-    def __init__(self, palrp: bool = False):
+    def __init__(self, palrp: bool = False, residual_lrp: str | None = None):
         canonizers = [
             QKVTapCanonizer(),
             AttributeCanonizer(_attn_attribute_map),
@@ -384,6 +498,10 @@ class TimmViTCanonizer(CompositeCanonizer):
         ]
         if palrp:
             canonizers.append(AttributeCanonizer(_vit_pos_embed_attribute_map))
+        if residual_lrp is not None:
+            canonizers.append(
+                AttributeCanonizer(_make_block_residual_attribute_map(residual_lrp))
+            )
         super().__init__(canonizers)
 
 
@@ -519,8 +637,11 @@ class AttnLRPEpsilonComposite(LayerMapComposite):
     ``SequentialMergeBatchNorm`` for a hybrid model.
     """
 
-    def __init__(self, epsilon=1e-6, canonizers=None, palrp: bool = False):
-        canonizers = list(canonizers or []) + [TimmViTCanonizer(palrp=palrp)]
+    def __init__(self, epsilon=1e-6, canonizers=None, palrp: bool = False,
+                 residual_lrp: str | None = None):
+        canonizers = list(canonizers or []) + [
+            TimmViTCanonizer(palrp=palrp, residual_lrp=residual_lrp)
+        ]
         layer_map = [
             (nn.Linear, GTIEpsilon(epsilon)),
             (nn.Conv2d, GTIEpsilon(epsilon)),
@@ -553,8 +674,11 @@ class AttnLRPGammaComposite(LayerMapComposite):
         Extra canonizers to apply alongside :class:`TimmViTCanonizer`.
     """
 
-    def __init__(self, gamma=0.25, epsilon=1e-6, canonizers=None, palrp: bool = False):
-        canonizers = list(canonizers or []) + [TimmViTCanonizer(palrp=palrp)]
+    def __init__(self, gamma=0.25, epsilon=1e-6, canonizers=None,
+                 palrp: bool = False, residual_lrp: str | None = None):
+        canonizers = list(canonizers or []) + [
+            TimmViTCanonizer(palrp=palrp, residual_lrp=residual_lrp)
+        ]
         layer_map = [
             (nn.Linear, GTIGamma(gamma=gamma, epsilon=epsilon)),
             (nn.Conv2d, GTIGamma(gamma=gamma, epsilon=epsilon)),
@@ -570,11 +694,14 @@ __all__ = [
     # autograd Functions (AttnLRP rule kernels)
     "identity_rule_implicit",
     "divide_gradient",
+    "residual_ratio",
     "stop_gradient",
     # forward replacements (advanced use; Canonizer installs them automatically)
     "layer_norm_forward",
     "dropout_passthrough_forward",
     "timm_attention_forward",
+    "vit_block_forward_symmetric",
+    "vit_block_forward_ratio",
     "vit_pos_embed_palrp",
     # Canonizers
     "QKVTapCanonizer",

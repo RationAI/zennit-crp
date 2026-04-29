@@ -81,39 +81,36 @@ sweep also rules out the saturation hypothesis: vit_large (top-k coverage
 inversion rather than diluting it, pointing at accumulated rule error
 along the per-block backward chain.
 
-## Milestone G — residual-LRP (highest-likelihood fix for the AUC anomaly)
+## Milestone G — residual-LRP (closed; ratio shipped opt-in, partial AUC fix)
 
-Each transformer block does `x = x + attn(x)` and `x = x + mlp(x)` as
-plain tensor `+`. zennit attaches no hook to a tensor op, so relevance
-flowing back receives the full upstream relevance on **both** branches
-(double-allocation; not conservative; ~2× per block). Conservation
-ratio on a 12-block ViT drifts ~10²× and on a 24-block ViT ~10⁴×, which
-matches the 24-block model's amplified AUC inversion.
+Done in iter 9 (`run_milestone_g.py`, see `CURRENT_STATE.md` "Milestone G
+— residual-LRP" for the full per-cell verdict matrix):
 
-PA-LRP at `pos_embed` doesn't address this — the residual additions are
-inside each block, repeated 24 times for vit_large.
+23. ✅ `_ResidualRatioFn(Function)` (Otsuki ratio split, ∝ |x| vs |branch|)
+    + `divide_gradient(_, 2)` re-used for the symmetric rule.
+24. ✅ `vit_block_forward_symmetric` and `vit_block_forward_ratio` —
+    replicate timm's standard `Block.forward` (`norm1 → attn → ls1 →
+    drop_path1 → +`, `norm2 → mlp → ls2 → drop_path2 → +`) with the
+    additive nodes rewritten. Layout sanity-check in the
+    `AttributeCanonizer`'s attribute_map (bails on non-standard variants
+    with `init_values`-without-ls or parallel-attention).
+25. ✅ `_make_block_residual_attribute_map(rule)` factory + plumbed
+    through `TimmViTCanonizer(residual_lrp=…)`.
+26. ✅ `residual_lrp` kwarg on both composites, defaults to None.
+27. Multi-model sweep:
+    * `'symmetric'` is AUC-inert at every cell (Pearson 1.0 vs baseline
+      empirically — uniform halving across the chain).
+    * `'ratio'` **fixes vit_small fully** (2/4 → 4/4 OK, kqv_head
+      del_gap +0.028) and **fixes the milestone-A kqv_head anomaly on
+      vit_base** (del_gap +0.005). Trade-off: marginal `head` regression
+      on vit_base (−0.008, near noise floor); broader regression on
+      vit_large (24-block backward chain over-attenuates the branch
+      contribution).
 
-Sketch:
-
-23. Add `_BlockResidualFn(Function)` — identity in forward, `divide_gradient`
-    by **2** on the additive output (uniform rule allocates relevance
-    equally between the identity branch `x` and the residual branch
-    `f(x)`). One per `Block.forward`'s two adds.
-24. `vit_block_forward(self, x)` — replicates timm `Block.forward` with
-    each `x = x + branch(x)` rewritten as
-    `x = divide_gradient(x + branch(x), 2)`. Versioned per timm-`Block`
-    layout (`init_values`, `parallel`, `Mlp`/`SwiGLU` variants).
-25. `BlockResidualCanonizer(AttributeCanonizer)` — swaps `forward` per
-    `Block` instance.
-26. Compose into `TimmViTCanonizer` behind a `residual_lrp: bool` kwarg
-    (or default-on if conservation tests confirm it's the right fix).
-27. Re-run `run_milestone_d.py` with the new canonizer enabled. Acceptance:
-    kqv_head and head_dim del/ins gaps positive across all three model
-    sizes.
-
-Risk: residual-LRP can over-correct and flatten the heatmap. If it
-collapses the discriminative signal, fall back to single-branch (only the
-attn residual, not the mlp) and re-measure.
+Decision: ship `'ratio'` as opt-in; default off. Recommended for
+vit_small. Open follow-ups in `CURRENT_STATE.md` "Open questions raised
+by the result" — scale-aware ratio (clip), per-layer relevance dump on
+vit_large, larger-n re-test of the vit_base `head` flip.
 
 ## Milestone H — methodology check (independent investigation)
 

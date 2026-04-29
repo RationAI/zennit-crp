@@ -90,7 +90,8 @@ Dependency management is `uv add` / `uv sync`. Optional extras: `vit` (timm + tr
 | 5  | `8019975` / `3c80950` | γ-LRP variant (`GTIGamma` / `AttnLRPGammaComposite`) + drop legacy classes + state docs refresh |
 | 6  | `526c77a` | Generalise `FeatureVisualization._attribution_on_reference` — pull `mask_map` from `self.layer_map[layer_name]` instead of hardcoded `ChannelConcept.{mask,mask_rf}`. Restores per-reference-sample conditional heatmaps for the four attention concepts. |
 | 7  | `c7cd0d7` | Milestone A faithfulness sweep on `vit_base_patch16_224` (64 imgs × 4 classes × {ε, γ ∈ 0.0/0.1/0.25/0.5} × 4 granularities × {true, random}, per-granularity top-k). Methodology fix (`resolve_top_k`), per-granularity top-k defaults, `run_milestone_a.py` driver, `aggregate_milestone_a.py` table emitter. Drop stale `IMPLEMENTATION_PLAN.md`. |
-| 8  | (this commit) | Milestone D — conservation test + PA-LRP. `PALRPCanonizer` (uniform rule at `x + pos_embed`, factor 2). `TimmViTCanonizer(palrp=…)`, both composites take `palrp` kwarg. Conservation diagnostic in `tests/test_vit_integration.py` and `tutorials/vit_crp/conservation_check.py`. Multi-model sweep `run_milestone_d.py` on `vit_small/base/large` × ± PA-LRP. Findings: PA-LRP halves heatmap uniformly → AUC unchanged (Pearson=1.0, argsort identical empirically). kqv_head failure persists at every model scale (vit_large worst, vit_small mildest — opposite of saturation hypothesis). |
+| 8  | `4835c3c` | Milestone D — conservation test + PA-LRP. `PALRPCanonizer` (uniform rule at `x + pos_embed`, factor 2). `TimmViTCanonizer(palrp=…)`, both composites take `palrp` kwarg. Conservation diagnostic in `tests/test_vit_integration.py` and `tutorials/vit_crp/conservation_check.py`. Multi-model sweep `run_milestone_d.py` on `vit_small/base/large` × ± PA-LRP. Findings: PA-LRP halves heatmap uniformly → AUC unchanged (Pearson=1.0, argsort identical empirically). kqv_head failure persists at every model scale (vit_large worst, vit_small mildest — opposite of saturation hypothesis). |
+| 9  | (this commit) | Milestone G — residual-LRP. `_ResidualRatioFn` (Otsuki ratio split, ∝ `|x|` vs `|branch|`) + `vit_block_forward_{symmetric,ratio}` swaps + `TimmViTCanonizer(residual_lrp=…)` toggle. `run_milestone_g.py` sweep. Symmetric is AUC-inert (Pearson=1.0, like PA-LRP). **Ratio fixes the kqv_head AUC anomaly at all three model sizes and gets vit_small to 4/4 OK** (was 2/4). Trade-off: breaks `head` on vit_base (del_gap −0.0075) and degrades vit_large further. Default kept off; opt-in via `residual_lrp='ratio'`. |
 
 ## Public API (post-iter-5)
 
@@ -255,9 +256,90 @@ enough rule error that the ranking on the 3072 head_dim concepts inverts.
   `x = x + branch(x)` step in `divide_gradient(2)`). Tracked in
   FUTURE_STATE.md as the next milestone.
 
+## Milestone G — residual-LRP (iter 9)
+
+Adapted from a ResNet residual-LRP scheme used in our adjacent project:
+two rules, `'symmetric'` (uniform halving — equivalent to
+`divide_gradient(_, 2)` per residual) and `'ratio'` (Otsuki proportional
+split, ``R_x ∝ |x|`` and ``R_branch ∝ |branch|``). Both implemented as
+autograd Functions in the forward pass, swapped in via an
+`AttributeCanonizer` on timm `Block.forward`. Composite kwarg
+`residual_lrp ∈ {None, 'symmetric', 'ratio'}` (None default).
+
+### `'symmetric'` is AUC-inert
+
+`divide_gradient(_, 2)` at every residual is a uniform multiplicative
+factor on the entire backward chain. Pearson 1.0000 / Spearman 1.0000 vs
+the baseline heatmap on a single image — same identical-AUC pathology as
+PA-LRP. **Implemented but not run through the multi-model sweep**;
+a no-op for ranking.
+
+### `'ratio'` AUC findings (multi-model sweep, 64 imgs, ε-LRP)
+
+Per-(model, granularity) verdict, comparing `residual_lrp=None` to
+`residual_lrp='ratio'`. ✅ = OK, ❌ = FAIL.
+
+| model | granularity (concepts/k) | baseline | ratio |
+|---|---|---|---|
+| vit_small (12L, 6H) | head (6/4) | ❌ ins_FAIL | ✅ OK |
+| | kqv (3/1) | ✅ OK | ✅ OK |
+| | kqv_head (18/8) | ❌ del_FAIL | ✅ OK (del_gap +0.028) |
+| | head_dim (1152/8) | ✅ OK | ✅ OK |
+| | **summary** | **2/4** | **4/4** |
+| vit_base (12L, 12H) | head (12/4) | ✅ OK | ❌ del_FAIL (−0.008) |
+| | kqv (3/1) | ✅ OK | ✅ OK |
+| | kqv_head (36/8) | ❌ del_FAIL (−0.009) | ✅ OK (del_gap +0.005) |
+| | head_dim (2304/8) | ✅ OK | ✅ OK |
+| | **summary** | **3/4** | **3/4** (different cell) |
+| vit_large (24L, 16H) | head (16/4) | ✅ OK | ❌ del_FAIL |
+| | kqv (3/1) | ✅ OK | ❌ del_FAIL |
+| | kqv_head (48/8) | ❌ del_FAIL | ❌ ins_FAIL |
+| | head_dim (3072/8) | ❌ del_FAIL | ❌ ins_FAIL |
+| | **summary** | **2/4** | **0/4** |
+
+Raw CSV: `tutorials/vit_crp/data/milestone_g_results.csv` (3072 rows).
+
+### Reading
+
+* **vit_small fully fixed.** The Otsuki ratio split is a strict
+  improvement (2/4 → 4/4) at this scale. The original Milestone A `head`
+  ins_FAIL and the deeper kqv_head del_FAIL both close.
+* **vit_base trade-off.** Ratio splits the kqv_head failure (closes it
+  cleanly, +0.013 swing on del_gap). Cost: `head` granularity
+  marginally fails (del_gap −0.008, within noise of the +0.005 ratio
+  result on kqv_head). Net 3/4 ↔ 3/4 — different cell fails.
+* **vit_large breaks more cells.** With 24 blocks, the ratio rule
+  attenuates relevance more aggressively; small absolute discrimination
+  signal at this depth flips on multiple granularities. The
+  cumulative-attenuation hypothesis (deeper backward chain → more
+  relevance compressed near zero by the proportional split) fits.
+
+### Decision
+
+`residual_lrp='ratio'` is shipped as **opt-in** (`residual_lrp=None`
+default on both composites). It is a real fix at the smaller scales but a
+regression at vit_large; I won't override the user's heatmap by default.
+
+For vit_small users facing the kqv_head/head failures, the recommendation
+is `AttnLRPEpsilonComposite(residual_lrp='ratio')` — strict improvement.
+
+### Open questions raised by the result
+
+* Why does vit_large degrade? Likely cumulative attenuation: with 24
+  block-pair residuals (48 ratio splits) and `|x| ≫ |branch|` after
+  LayerNorm-ed inputs, the branch-relevance gets repeatedly down-weighted.
+  Worth a per-layer relevance dump to confirm.
+* Could a **scale-aware** ratio (clip the `|x|`/`|branch|` ratio to a
+  bounded range) keep the small-scale gains without the large-scale
+  collapse? Worth a single image probe before another full sweep.
+* The `head`-on-vit_base regression sits at the boundary of statistical
+  noise (sample n=64, gap −0.008). One more sweep with a different
+  random seed and 128 imgs would settle whether it's a real flip.
+
 ## Outstanding work
 
 See `FUTURE_STATE.md`. Milestone A is **investigated, not closed**;
-Milestone D is **closed** but the underlying AUC anomaly it was meant to
-fix turned out to be unrelated to PA-LRP. The next high-likelihood fix is
-residual-LRP (un-hooked `x = x + f(x)` in each transformer block).
+Milestone D is **closed** (PA-LRP shipped, AUC-inert). Milestone G is
+**closed** (ratio rule shipped opt-in; partial AUC fix; open questions
+above). Next: methodology check (Milestone H — pixel-rank Petsiuk and
+signed-vs-abs ranking) and Milestone B (richer baselines).
