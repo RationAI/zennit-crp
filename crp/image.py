@@ -286,3 +286,5 @@ def plot_grid(ref_c: Dict[int, Any], cmap_dim=1, cmap="bwr", vmin=None, vmax=Non
                 
     outer.tight_layout(fig)  
     fig.show()
+
+    return fig

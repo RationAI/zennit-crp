@@ -1,6 +1,5 @@
 import weakref
 import functools
-import torch
 
 from zennit.core import RemovableHandle, RemovableHandleList
 
@@ -72,18 +71,36 @@ class FeatVisHook:
     def post_forward(self, module, input, output):
         '''Register a backward-hook to the resulting tensor right after the forward.'''
 
-        s_indices, targets = self.dict_inputs["sample_indices"], self.dict_inputs["targets"]
-        activation = output.detach().to(self.on_device) if self.on_device else output.detach()
-        self.FV.analyze_activation(activation, self.layer_name, self.concept, s_indices, targets)
+        s_indices = self.dict_inputs["sample_indices"]
+        targets = self.dict_inputs["targets"]
+
+        if not isinstance(output, tuple):
+            output = (output,)
+
+        # Only output[0] is analyzed: it is the primary activation tensor.
+        # Secondary outputs (e.g. attention weights, key/value caches) are intentionally skipped
+        # because calling analyze_activation multiple times with the same layer_name would corrupt stats.
+        activation = (
+            output[0].detach().to(self.on_device)
+            if self.on_device
+            else output[0].detach()
+        )
+        self.FV.analyze_activation(
+            activation, self.layer_name, self.concept, s_indices, targets
+        )
 
         hook_ref = weakref.ref(self)
 
         @functools.wraps(self.backward)
         def wrapper(grad):
-            return hook_ref().backward(module, grad)
-
-        if not isinstance(output, tuple):
-            output = (output,)
+            # Handle tuple grads (multi-output gradient functions) same as MaskHook.
+            if isinstance(grad, tuple):
+                for g in grad:
+                    if g is not None:
+                        hook_ref().backward(module, g)
+            else:
+                hook_ref().backward(module, grad)
+            return grad
 
         if output[0].grad_fn is not None:
             # only if gradient required
