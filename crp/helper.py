@@ -79,19 +79,58 @@ def get_output_shapes(model, single_sample: torch.tensor, record_layers: List[st
     return output_shapes
 
 
+_VARIANT_PREFIXES = ("RelMax_", "ActMax_", "RelStats_", "ActStats_")
+_CONCEPT_MODES = ("head_", "token_")
+
+
+def _legacy_path(path_folder):
+    """
+    Map a new-style variant folder (e.g. RelMax_head_sum_normed/) back to the
+    legacy single-variant folder (RelMax_sum_normed/) for backward-compatible loads.
+    Returns None if the folder name does not match the new layout.
+    """
+    p = Path(path_folder)
+    parent = p.parent
+    name = p.name
+    for prefix in _VARIANT_PREFIXES:
+        if name.startswith(prefix):
+            tail = name[len(prefix):]
+            for cm in _CONCEPT_MODES:
+                if tail.startswith(cm):
+                    return parent / Path(prefix + tail[len(cm):])
+    return None
+
+
+def _resolve_variant_folder(path_folder, *probe_files):
+    """
+    If `path_folder` lacks any of the probe files, fall back to the legacy folder
+    (without the head_/token_ prefix). Returns the resolved Path.
+    """
+    p = Path(path_folder)
+    if all((p / f).exists() for f in probe_files):
+        return p
+    legacy = _legacy_path(p)
+    if legacy is not None and all((legacy / f).exists() for f in probe_files):
+        return legacy
+    return p
+
+
 def load_maximization(path_folder, layer_name):
 
     filename = f"{layer_name}_"
+    folder = _resolve_variant_folder(
+        path_folder, filename + "data.npy", filename + "rel.npy", filename + "rf.npy")
 
-    d_c_sorted = np.load(Path(path_folder) / Path(filename + "data.npy"), mmap_mode="r")
-    rel_c_sorted = np.load(Path(path_folder) / Path(filename + "rel.npy"), mmap_mode="r")
-    rf_c_sorted = np.load(Path(path_folder) / Path(filename + "rf.npy"), mmap_mode="r")
+    d_c_sorted = np.load(folder / Path(filename + "data.npy"), mmap_mode="r")
+    rel_c_sorted = np.load(folder / Path(filename + "rel.npy"), mmap_mode="r")
+    rf_c_sorted = np.load(folder / Path(filename + "rf.npy"), mmap_mode="r")
 
     return d_c_sorted, rel_c_sorted, rf_c_sorted
 
 def load_stat_targets(path_folder):
 
-    targets = np.load(Path(path_folder) / Path("targets.npy")).astype(np.int)
+    folder = _resolve_variant_folder(path_folder, "targets.npy")
+    targets = np.load(folder / Path("targets.npy")).astype(np.int_)
 
     return targets
 
@@ -99,10 +138,16 @@ def load_stat_targets(path_folder):
 def load_statistics(path_folder, layer_name, target):
 
     filename = f"{target}_"
+    folder = _resolve_variant_folder(
+        path_folder,
+        Path(layer_name) / Path(filename + "data.npy"),
+        Path(layer_name) / Path(filename + "rel.npy"),
+        Path(layer_name) / Path(filename + "rf.npy"),
+    )
 
-    d_c_sorted = np.load(Path(path_folder) / Path(layer_name) / Path(filename + "data.npy"), mmap_mode="r")
-    rel_c_sorted = np.load(Path(path_folder) / Path(layer_name) / Path(filename + "rel.npy"), mmap_mode="r")
-    rf_c_sorted = np.load(Path(path_folder) / Path(layer_name) / Path(filename + "rf.npy"), mmap_mode="r")
+    d_c_sorted = np.load(folder / Path(layer_name) / Path(filename + "data.npy"), mmap_mode="r")
+    rel_c_sorted = np.load(folder / Path(layer_name) / Path(filename + "rel.npy"), mmap_mode="r")
+    rf_c_sorted = np.load(folder / Path(layer_name) / Path(filename + "rf.npy"), mmap_mode="r")
 
     return d_c_sorted, rel_c_sorted, rf_c_sorted
 

@@ -8,10 +8,12 @@ from tqdm import tqdm
 
 class Statistics:
 
-    def __init__(self, mode="relevance", max_target="sum", abs_norm=False, path=None):
+    def __init__(self, mode="relevance", max_target="sum", abs_norm=False, path=None, concept_mode=None):
 
         self.d_c_sorted, self.rel_c_sorted, self.rf_c_sorted = {}, {}, {}
         self.SAMPLE_SIZE = 40
+
+        self.concept_mode = concept_mode
 
         # generate path string for filenames
         if abs_norm:
@@ -19,10 +21,12 @@ class Statistics:
         else:
             norm_str = "unnormed"
 
+        cm_part = f"{concept_mode}_" if concept_mode else ""
+
         if mode == "relevance":
-            self.sub_folder = Path(f"RelStats_{max_target}_{norm_str}/")
+            self.sub_folder = Path(f"RelStats_{cm_part}{max_target}_{norm_str}/")
         elif mode == "activation":
-            self.sub_folder = Path(f"ActStats_{max_target}_{norm_str}/")
+            self.sub_folder = Path(f"ActStats_{cm_part}{max_target}_{norm_str}/")
         else:
             raise ValueError("<mode> must be 'relevance' or 'activation'.")
 
