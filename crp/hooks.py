@@ -1,6 +1,5 @@
 import weakref
 import functools
-import torch
 
 from zennit.core import RemovableHandle, RemovableHandleList
 
@@ -18,20 +17,7 @@ class MaskHook:
 
         @functools.wraps(self.backward)
         def wrapper(grad):
-            # Handle both single gradients and tuples (for multi-output layers)
-            if isinstance(grad, tuple):
-                result = []
-                for g in grad:
-                    if g is None or not isinstance(g, torch.Tensor) or g.ndim < 2:
-                        # Pass through: not a valid [..., hidden_dim] tensor; masking
-                        # would silently corrupt shape-dependent concepts like
-                        # AttentionHeadConcept which requires at least [batch, hidden_dim].
-                        result.append(g)
-                    else:
-                        result.append(hook_ref().backward(module, g))
-                return tuple(result)
-            else:
-                return hook_ref().backward(module, grad)
+            return hook_ref().backward(module, grad)
 
         if not isinstance(output, tuple):
             output = (output,)
