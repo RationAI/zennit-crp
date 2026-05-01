@@ -160,18 +160,26 @@ def _attribute_concept(
     concept_id,
     target_class: int,
     extra_conditions: Optional[dict] = None,
+    exclude_parallel: bool = True,
 ) -> np.ndarray:
     """One conditional attribution → 2D heatmap.
 
     ``extra_conditions`` is folded into the condition dict alongside
     ``{layer_name: [concept_id], "y": [target_class]}`` — used by the
-    conditional-cascade helper to pass deeper-layer masks.
+    conditional-cascade helper to pass deeper-layer masks. The cascade
+    sets ``exclude_parallel=False`` to avoid zennit-crp's
+    ``partial_backward`` path, which can't chain multi-layer conditions
+    through our custom autograd Functions; one unified backward fires
+    every ``MaskHook`` in topological order.
     """
     image.grad = None
     cond = {layer_name: [concept_id], "y": [target_class]}
     if extra_conditions:
         cond.update(extra_conditions)
-    res = attribution(image, [cond], composite, mask_map=concept.mask)
+    res = attribution(
+        image, [cond], composite, mask_map=concept.mask,
+        exclude_parallel=exclude_parallel,
+    )
     return _heatmap_2d(res.heatmap[0])
 
 
@@ -183,11 +191,16 @@ def _per_concept_scores(
     concept,
     target_class: int,
     extra_conditions: Optional[dict] = None,
+    exclude_parallel: bool = True,
 ) -> torch.Tensor:
     """Per-concept relevance under target class — no concept mask in
     the recording condition; record at the concept's tap and let
     ``concept.attribute`` reduce to scores. ``extra_conditions`` allows
-    masking at deeper layers (cascade)."""
+    masking at deeper layers (cascade); cascade callers pass
+    ``exclude_parallel=False`` so a single unified backward fires every
+    ``MaskHook`` in topological order (avoids the
+    ``partial_backward`` "tensor not in graph" failure when the chain
+    crosses our custom autograd Functions)."""
     image.grad = None
     cond = {"y": [target_class]}
     if extra_conditions:
@@ -195,6 +208,7 @@ def _per_concept_scores(
     res = attribution(
         image, [cond], composite,
         mask_map=concept.mask, record_layer=[layer_name],
+        exclude_parallel=exclude_parallel,
     )
     rel = res.relevances[layer_name]
     return concept.attribute(rel, layer_name=layer_name, abs_norm=False)[0]
@@ -541,9 +555,14 @@ def plot_conditional_cascade(
 
     for layer_idx in layers:
         layer_name = _layer_name_for(layer_idx, head_concept)
+        # exclude_parallel=False once any extra condition is present —
+        # see the docstrings on _per_concept_scores / _attribute_concept.
+        # The first cascade step (no extras) keeps the cheaper default.
+        exclude_parallel = not bool(accumulated)
         scores = _per_concept_scores(
             attribution, composite, image, layer_name, head_concept,
             target_class, extra_conditions=(accumulated or None),
+            exclude_parallel=exclude_parallel,
         )
         k = min(top_k_per_layer, scores.numel())
         top_heads = sorted(
@@ -586,16 +605,19 @@ def plot_conditional_cascade(
                     axes[row_i, base_col + col_offset].axis("off")
                 continue
             h, score, samples, ref_heatmaps = head_blocks[h_i]
-            # Target image with this head's conditional heatmap.
+            # Target image with this head's conditional heatmap, masked
+            # also at every deeper cascade layer (full-history option).
+            deeper_extras = {
+                _layer_name_for(deeper, head_concept): selected[deeper]
+                for deeper in layers if deeper != layer_idx
+                and layers.index(deeper) < layers.index(layer_idx)
+            }
             target_hm = _attribute_concept(
                 attribution, composite, image,
                 _layer_name_for(layer_idx, head_concept),
                 head_concept, h, target_class,
-                extra_conditions={
-                    _layer_name_for(deeper, head_concept): selected[deeper]
-                    for deeper in layers if deeper != layer_idx
-                    and layers.index(deeper) < layers.index(layer_idx)
-                } or None,
+                extra_conditions=(deeper_extras or None),
+                exclude_parallel=not bool(deeper_extras),
             )
             panel(axes[row_i, base_col], target_np, target_hm)
             axes[row_i, base_col].set_title(
