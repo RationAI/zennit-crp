@@ -9,8 +9,8 @@ Concepts under test:
 * :class:`HeadConcept` (per-head, optional dim_split) on `attn.context`
 * :class:`QConcept`, :class:`KConcept`, :class:`VConcept`
   (Q/K/V per-head, optional dim_split) on `attn.rope_q`/`attn.rope_k`/`attn.v_id`
-* :class:`AttnWeightConcept` on `attn.softmax`
-* :class:`AttnOutputConcept` on `attn.proj_drop`
+* :class:`AttnOutputDimConcept` on `attn.proj_drop` (per-channel,
+  spatial aggregation)
 """
 from __future__ import annotations
 
@@ -22,8 +22,7 @@ from crp.attention_concepts import (
     QConcept,
     KConcept,
     VConcept,
-    AttnWeightConcept,
-    AttnOutputConcept,
+    AttnOutputDimConcept,
 )
 
 
@@ -38,13 +37,6 @@ def per_head_relevance():
     """(B, num_heads, N, head_dim) — the shape used by HeadConcept and Q/K/V."""
     torch.manual_seed(0)
     return torch.randn(B, NUM_HEADS, N, HEAD_DIM)
-
-
-@pytest.fixture
-def attn_weight_relevance():
-    """(B, num_heads, N, N) — the shape after softmax."""
-    torch.manual_seed(1)
-    return torch.randn(B, NUM_HEADS, N, N)
 
 
 @pytest.fixture
@@ -176,58 +168,18 @@ class TestQKVConcepts:
 # ── AttnWeightConcept ───────────────────────────────────────────────────────
 
 
-class TestAttnWeightConcept:
-    LAYER = "blocks.0.attn.softmax"
-
-    def _make(self, granularity="head"):
-        c = AttnWeightConcept(granularity=granularity)
-        c.register_layer(self.LAYER, NUM_HEADS)
-        return c
-
-    def test_head_granularity_mask_zeros_other_heads(self, attn_weight_relevance):
-        c = self._make("head")
-        m = c.mask(batch_id=0, concept_ids=[2], layer_name=self.LAYER)
-        masked = m(attn_weight_relevance.clone())
-        assert torch.equal(masked[0, 2], attn_weight_relevance[0, 2])
-        for h in (0, 1, 3):
-            assert torch.all(masked[0, h] == 0)
-
-    def test_head_granularity_attribute_shape(self, attn_weight_relevance):
-        c = self._make("head")
-        rel = c.attribute(attn_weight_relevance, layer_name=self.LAYER, abs_norm=False)
-        assert rel.shape == (B, NUM_HEADS)
-
-    def test_head_query_granularity(self, attn_weight_relevance):
-        c = self._make("head_query")
-        m = c.mask(batch_id=0, concept_ids=[(1, 3)], layer_name=self.LAYER)
-        masked = m(attn_weight_relevance.clone())
-        # head=1, query=3 row preserved; rest zero.
-        assert torch.equal(masked[0, 1, 3], attn_weight_relevance[0, 1, 3])
-        for q in (0, 2, 4):
-            assert torch.all(masked[0, 1, q] == 0)
-
-    def test_head_query_key_granularity(self, attn_weight_relevance):
-        c = self._make("head_query_key")
-        m = c.mask(batch_id=0, concept_ids=[(1, 3, 5)], layer_name=self.LAYER)
-        masked = m(attn_weight_relevance.clone())
-        assert masked[0, 1, 3, 5].item() == attn_weight_relevance[0, 1, 3, 5].item()
-        # One cell preserved out of (NUM_HEADS * N * N).
-        nonzero = (masked[0] != 0).sum().item()
-        assert nonzero == 1
-
-    def test_invalid_granularity(self):
-        with pytest.raises(ValueError):
-            AttnWeightConcept(granularity="nope")
+# ── AttnOutputDimConcept ─────────────────────────────────────────────────────
 
 
-# ── AttnOutputConcept ───────────────────────────────────────────────────────
+class TestAttnOutputDimConcept:
+    """Per-channel conditioning at the post-projection residual stream.
+    Spatial token axis aggregated in attribute (no per-token conditioning).
+    """
 
-
-class TestAttnOutputConcept:
     LAYER = "blocks.0.attn.proj_drop"
 
     def _make(self):
-        c = AttnOutputConcept()
+        c = AttnOutputDimConcept()
         c.register_layer(self.LAYER, EMBED_DIM)
         return c
 
@@ -237,15 +189,16 @@ class TestAttnOutputConcept:
         masked = m(proj_output_relevance.clone())
         for ch in range(EMBED_DIM):
             if ch in (5, 7):
+                # All tokens of selected channels preserved (channel-only mask).
                 assert torch.equal(masked[0, :, ch], proj_output_relevance[0, :, ch])
             else:
                 assert torch.all(masked[0, :, ch] == 0)
 
-    def test_attribute_shape(self, proj_output_relevance):
+    def test_attribute_shape_sums_tokens(self, proj_output_relevance):
         c = self._make()
         rel = c.attribute(proj_output_relevance, layer_name=self.LAYER, abs_norm=False)
         assert rel.shape == (B, EMBED_DIM)
-        # Equals sum over tokens.
+        # Spatial aggregation: equals sum over the token (N) axis.
         expected = proj_output_relevance.sum(dim=1)
         assert torch.allclose(rel, expected)
 
@@ -255,4 +208,4 @@ class TestAttnOutputConcept:
             c.mask(batch_id=0, concept_ids=[EMBED_DIM], layer_name=self.LAYER)
 
     def test_layer_suffix(self):
-        assert AttnOutputConcept.LAYER_SUFFIX == "proj_drop"
+        assert AttnOutputDimConcept.LAYER_SUFFIX == "proj_drop"

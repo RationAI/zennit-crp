@@ -10,7 +10,7 @@ attention refactor. Each concept class is a thin wrapper around a CRP
 * implements ``mask`` (zero-out non-selected concepts during attribution
   backward) and ``attribute`` (per-concept relevance reduction).
 
-There are **four conditioning points** inside one attention block, each
+There are **three conditioning points** inside one attention block, each
 with its own concept class:
 
 1. **Q / K / V inputs to the bilinears** — :class:`QConcept`,
@@ -19,21 +19,41 @@ with its own concept class:
    tensors of shape ``(B, num_heads, N, head_dim)``. Per-head
    conditioning by default; per-(head, dim) via ``dim_split=True``.
 
-2. **Post-softmax attention weights** — :class:`AttnWeightConcept`.
-   Hooks the ``softmax`` output of shape ``(B, num_heads, N, N)``.
-   Per (head, query_pos, key_pos) conditioning, or coarser variants.
-
-3. **Per-head context output** — :class:`HeadConcept`. Hooks the
+2. **Per-head context output** — :class:`HeadConcept`. Hooks the
    ``context`` output (= ``attn @ V``, before the reshape that merges
    heads back) of shape ``(B, num_heads, N, head_dim)``. This is the
    "per-head contribution to the attention output" view — the natural
    CRP analogue to a CNN filter.
 
-4. **Post-projection residual contribution** — :class:`AttnOutputConcept`.
+3. **Post-projection residual contribution** — :class:`AttnOutputDimConcept`.
    Hooks the ``proj_drop`` output (= the attention block's contribution
-   to the residual stream, shape ``(B, N, embed_dim)``). Per-channel
-   conditioning. The "OV-circuit-output" view used by the Anthropic
+   to the residual stream, shape ``(B, N, embed_dim)``). **Per-channel
+   conditioning only**, with relevance aggregated over the spatial
+   token axis. The "OV-circuit-output" view used by the Anthropic
    mathematical-framework / induction-heads line of work.
+
+   *Why not per-(token, channel)?* For ViTs, spatial token positions
+   carry no fixed semantic — the same channel responds similarly to
+   the same feature regardless of where it appears in the image
+   (translation-equivariant feature space). Per-token conditioning
+   would treat the same concept differently based on accidental
+   spatial location and would not generalise across reference samples.
+   Channel conditioning + spatial aggregation is the meaningful axis.
+
+   *Register / cls tokens.* Currently lumped with patch tokens in the
+   spatial sum. They DO carry global non-spatial meaning (Darcet et al.
+   ICLR 2024, arXiv:2309.16588) and could be conditioned on by
+   token-id, but the right framing for that is open research; for now
+   the channel-only baseline applies uniformly to all tokens.
+
+**Removed concept classes** (per design review):
+
+* ``AttnWeightConcept`` (would have hooked ``attn.softmax``) — softmax
+  weights have no fixed semantic per neuron: the same (head, query, key)
+  cell combines different concepts for different inputs. Useful for
+  inspecting K/Q relations directly (via tensor recording) but not for
+  identifying concepts via reference-sample retrieval. Not exposed as a
+  concept; the named submodule remains hookable for inspection.
 
 All concepts auto-discover their target submodules from the model on
 construction (``concept = HeadConcept(model)``), or layers can be
@@ -44,7 +64,7 @@ Naming convention for layer paths: a model with attention modules at
 ``blocks.0.attn``, …, ``blocks.23.attn`` (substituted by
 :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`) will
 expose hookable submodules like ``blocks.6.attn.context``,
-``blocks.6.attn.softmax``, ``blocks.6.attn.rope_q``, etc. The concept
+``blocks.6.attn.rope_q``, ``blocks.6.attn.proj_drop``, etc. The concept
 classes below build the full path as ``f"{attn_name}.{LAYER_SUFFIX}"``.
 """
 from __future__ import annotations
@@ -320,129 +340,21 @@ class VConcept(_PerHeadAttentionConcept):
     LAYER_SUFFIX = "v_id"
 
 
-# ─── 2. Attention-weight concept (post-softmax) ──────────────────────────────
+# NOTE: ``AttnWeightConcept`` (would target ``attn.softmax``) was
+# removed by design. Softmax weights have no fixed semantic per neuron:
+# the same (head, query, key) cell combines different concepts for
+# different inputs. Useful for inspecting K/Q relations directly via
+# tensor recording (``record_layer=['blocks.6.attn.softmax']``) but not
+# for identifying concepts via reference-sample retrieval.
 
 
-class AttnWeightConcept(ChannelConcept):
-    """One concept per attention weight position (head × query × key).
-
-    Targets ``EvaAttentionUnfolded.softmax``. Tensor shape:
-    ``(B, num_heads, N, N)`` — the row-stochastic attention map per
-    head. Concept id forms:
-
-    * ``int head_id`` — sum across all (query, key) for that head.
-    * ``(head, query_pos)`` — sum across all keys.
-    * ``(head, query_pos, key_pos)`` — single weight cell.
-
-    Construction-time ``granularity`` controls which axis the concept
-    lives on: ``'head'`` (default), ``'head_query'``, or
-    ``'head_query_key'``.
-
-    **Status: experimental.** Class is exposed for future use but no
-    notebook in the current set demonstrates it. Open question: what
-    interpretive use cases benefit from per-weight conditioning beyond
-    direct attention-map visualisation?
-    """
-
-    LAYER_SUFFIX = "softmax"
-    _GRANULARITIES = ("head", "head_query", "head_query_key")
-
-    def __init__(
-        self,
-        model: Optional[nn.Module] = None,
-        *,
-        granularity: str = "head",
-    ):
-        if granularity not in self._GRANULARITIES:
-            raise ValueError(
-                f"granularity must be one of {self._GRANULARITIES}; got {granularity!r}"
-            )
-        self.granularity = granularity
-        self._dims: Dict[str, Tuple[int, int]] = {}
-        if model is not None:
-            for attn_name, attn in _find_unfolded_attentions(model):
-                # AttnWeightConcept needs num_heads and N (sequence length).
-                # N varies per forward (token count after patch_embed +
-                # prefix); the concept resolves it from the actual tensor
-                # shape at mask-time. We still store num_heads here for
-                # decoding and validation.
-                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
-                    int(attn.num_heads), 0,  # N filled in at mask-time
-                )
-
-    def register_layer(self, layer_name: str, num_heads: int) -> None:
-        self._dims[layer_name] = (int(num_heads), 0)
-
-    def _decode(self, cid, num_heads: int, N: int):
-        """Return ``(head, query_or_None, key_or_None)``."""
-        if self.granularity == "head":
-            head = int(cid[0]) if isinstance(cid, (tuple, list)) else int(cid)
-            return head, None, None
-        if self.granularity == "head_query":
-            if not isinstance(cid, (tuple, list)) or len(cid) != 2:
-                raise ValueError("head_query granularity expects (head, query)")
-            return int(cid[0]), int(cid[1]), None
-        # head_query_key
-        if not isinstance(cid, (tuple, list)) or len(cid) != 3:
-            raise ValueError("head_query_key granularity expects (head, query, key)")
-        return int(cid[0]), int(cid[1]), int(cid[2])
-
-    def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        num_heads, _ = _resolve_dims(layer_name, self._dims)
-
-        def mask_fct(grad: torch.Tensor) -> torch.Tensor:
-            # grad shape: (B, num_heads, N, N).
-            t = grad[batch_id]
-            if t.dim() != 3 or t.shape[0] != num_heads or t.shape[1] != t.shape[2]:
-                raise ValueError(
-                    f"AttnWeightConcept expects (B, {num_heads}, N, N) on layer "
-                    f"{layer_name!r}; got per-batch shape {tuple(t.shape)}"
-                )
-            N = t.shape[1]
-            mask = torch.zeros_like(t)
-            for cid in concept_ids:
-                head, q, k = self._decode(cid, num_heads, N)
-                if q is None:
-                    mask[head, :, :] = 1
-                elif k is None:
-                    mask[head, q, :] = 1
-                else:
-                    mask[head, q, k] = 1
-            grad[batch_id] = t * mask
-            return grad
-
-        return mask_fct
-
-    def attribute(
-        self,
-        relevance: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        layer_name: Optional[str] = None,
-        abs_norm: bool = True,
-    ) -> torch.Tensor:
-        if isinstance(mask, torch.Tensor):
-            relevance = relevance * mask
-        # (B, num_heads, N, N) → reduce based on granularity.
-        if self.granularity == "head":
-            rel = relevance.sum(dim=(2, 3))             # (B, num_heads)
-        elif self.granularity == "head_query":
-            rel = relevance.sum(dim=3)                  # (B, num_heads, N)
-        else:                                            # head_query_key
-            rel = relevance                              # (B, num_heads, N, N)
-        if abs_norm:
-            shape = rel.shape
-            flat = rel.reshape(shape[0], -1)
-            denom = flat.abs().sum(dim=-1, keepdim=True) + 1e-10
-            rel = (flat / denom).reshape(shape)
-        return rel
+# ─── 2. Post-projection concept (residual-stream contribution) ──────────────
 
 
-# ─── 3. Post-projection concept (residual-stream contribution) ──────────────
-
-
-class AttnOutputConcept(ChannelConcept):
-    """One concept per output channel of the post-projection attention output
-    (= attention block's contribution to the residual stream).
+class AttnOutputDimConcept(ChannelConcept):
+    """One concept per output channel (embed-dim feature) of the post-
+    projection attention output (= attention block's contribution to the
+    residual stream).
 
     Targets ``EvaAttentionUnfolded.proj_drop``. Tensor shape:
     ``(B, N, embed_dim)``. Concept id forms:
@@ -455,13 +367,28 @@ class AttnOutputConcept(ChannelConcept):
     (Elhage et al., Olsson et al.). Conditioning on a single channel
     asks: "which feature in the attention block's residual contribution
     is most relevant to the prediction?". Different from
-    :class:`HeadConcept` (pre-proj per-head) because ``proj`` mixes
-    head outputs into the residual-stream basis — channels here are
-    in the *embed_dim* coordinates, not per-head coordinates.
+    :class:`HeadConcept` (pre-proj per-head) because ``proj`` mixes head
+    outputs into the residual-stream basis — channels here are in the
+    *embed_dim* coordinates, not per-head coordinates.
 
-    To condition per-token instead of per-channel, sum over the channel
-    axis upstream and pass per-token concept ids instead — not currently
-    exposed; would be straightforward to add as a sibling class.
+    **Token aggregation (not per-token conditioning).** The mask zeros
+    all NON-selected channels but keeps every (token, channel) entry of
+    the selected channels. ``attribute()`` then sums over the token
+    axis. This is intentional: ViT spatial token positions carry no
+    fixed semantic — the same channel responds similarly to the same
+    feature regardless of where it appears in the image. Per-token
+    conditioning would treat the same concept differently based on
+    accidental spatial location and would not generalise across
+    reference samples; channel-only conditioning + spatial aggregation
+    is the meaningful axis.
+
+    *Register / cls tokens (DINOv3's first 5 prefix tokens).* Currently
+    lumped with patch tokens in the spatial sum. They DO carry global
+    non-spatial meaning per Darcet et al. ICLR 2024 (arXiv:2309.16588)
+    and could in principle be conditioned on by token-id, but the right
+    interpretive framing is open research. The channel-only baseline
+    here applies uniformly to all tokens; refining the register-token
+    treatment is tracked as future work.
     """
 
     LAYER_SUFFIX = "proj_drop"
@@ -485,7 +412,9 @@ class AttnOutputConcept(ChannelConcept):
                     embed_dim = self._dims[k]
                     break
             else:
-                raise ValueError(f"AttnOutputConcept: layer {layer_name!r} not registered")
+                raise ValueError(
+                    f"AttnOutputDimConcept: layer {layer_name!r} not registered"
+                )
         else:
             embed_dim = self._dims[layer_name]
 
@@ -496,18 +425,22 @@ class AttnOutputConcept(ChannelConcept):
             elif isinstance(cid, (tuple, list)) and len(cid) == 1:
                 ch = int(cid[0])
             else:
-                raise ValueError(f"AttnOutputConcept expects int or 1-tuple; got {cid!r}")
+                raise ValueError(
+                    f"AttnOutputDimConcept expects int or 1-tuple; got {cid!r}"
+                )
             if not 0 <= ch < embed_dim:
                 raise IndexError(f"channel {ch} out of [0, {embed_dim})")
             channels.append(ch)
 
         def mask_fct(grad: torch.Tensor) -> torch.Tensor:
-            # grad shape: (B, N, embed_dim).
+            # grad shape: (B, N, embed_dim). The mask preserves all tokens
+            # of the selected channels (channel-only conditioning); spatial
+            # aggregation happens in attribute().
             t = grad[batch_id]
             if t.dim() != 2 or t.shape[1] != embed_dim:
                 raise ValueError(
-                    f"AttnOutputConcept expects (B, N, {embed_dim}) on layer "
-                    f"{layer_name!r}; got per-batch shape {tuple(t.shape)}"
+                    f"AttnOutputDimConcept expects (B, N, {embed_dim}) on "
+                    f"layer {layer_name!r}; got per-batch shape {tuple(t.shape)}"
                 )
             mask = torch.zeros_like(t)
             mask[:, channels] = 1
@@ -526,6 +459,7 @@ class AttnOutputConcept(ChannelConcept):
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
         # (B, N, embed_dim) → sum over tokens → (B, embed_dim).
+        # Spatial aggregation is the design — see class docstring.
         rel = relevance.sum(dim=1)
         if abs_norm:
             denom = rel.abs().sum(dim=-1, keepdim=True) + 1e-10
@@ -538,6 +472,5 @@ __all__ = [
     "QConcept",
     "KConcept",
     "VConcept",
-    "AttnWeightConcept",
-    "AttnOutputConcept",
+    "AttnOutputDimConcept",
 ]

@@ -10,7 +10,7 @@ Covers:
   :class:`AttnLRPCombinedComposite(use_unfolded_attention=True)` —
   substitutes EvaAttention with EvaAttentionUnfolded and runs concept-
   conditioned attribution via :class:`HeadConcept`,
-  :class:`QConcept`, :class:`AttnOutputConcept`.
+  :class:`QConcept`, :class:`AttnOutputDimConcept`.
 
 Run::
 
@@ -27,7 +27,7 @@ zennit = pytest.importorskip("zennit")
 from crp.attention_concepts import (
     HeadConcept,
     QConcept,
-    AttnOutputConcept,
+    AttnOutputDimConcept,
 )
 from crp.attention_unfolded import (
     EvaAttentionUnfolded,
@@ -281,7 +281,7 @@ class TestEvaUnfoldedIntegration:
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
         with composite.context(eva_tiny) as modified:
-            concept = AttnOutputConcept(modified)
+            concept = AttnOutputDimConcept(modified)
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
         layer = f"blocks.{target_block}.attn.proj_drop"
