@@ -1,0 +1,210 @@
+{
+  "baseline_2y_eps": [
+    {
+      "sample": 0,
+      "class": 0,
+      "elapsed_s": 0.59,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 9.273145041714459e+25,
+      "heatmap_focus_top10pct": 0.9428234020392964,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 1,
+      "class": 217,
+      "elapsed_s": 0.46,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 9.37898477404182e+20,
+      "heatmap_focus_top10pct": 0.870921010103345,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 2,
+      "class": 482,
+      "elapsed_s": 0.48,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 2.1249661983875084e+23,
+      "heatmap_focus_top10pct": 0.796496190283458,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 3,
+      "class": 491,
+      "elapsed_s": 0.47,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 1.0645871088820677e+24,
+      "heatmap_focus_top10pct": 0.9180605061665134,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 4,
+      "class": 497,
+      "elapsed_s": 0.55,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 3.8692738123048493e+21,
+      "heatmap_focus_top10pct": 0.9290248656419772,
+      "register_leak_share": NaN,
+      "per_layer": []
+    }
+  ],
+  "alphabeta_1_0": [
+    {
+      "sample": 0,
+      "class": 0,
+      "elapsed_s": 0.59,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 895.0597534179688,
+      "heatmap_focus_top10pct": 0.9186691319992563,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 1,
+      "class": 217,
+      "elapsed_s": 0.57,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 84.36019897460938,
+      "heatmap_focus_top10pct": 0.7805285081128652,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 2,
+      "class": 482,
+      "elapsed_s": 0.57,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 1114.23779296875,
+      "heatmap_focus_top10pct": 0.7904036761941587,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 3,
+      "class": 491,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 21886.134765625,
+      "heatmap_focus_top10pct": 0.9611364110895869,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 4,
+      "class": 497,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 106.40290832519531,
+      "heatmap_focus_top10pct": 0.8854352272307225,
+      "register_leak_share": NaN,
+      "per_layer": []
+    }
+  ],
+  "alphabeta_2_-1": [
+    {
+      "sample": 0,
+      "class": 0,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 308740736.0,
+      "heatmap_focus_top10pct": 0.8134138297881609,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 1,
+      "class": 217,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 142942144.0,
+      "heatmap_focus_top10pct": 0.8527597858819591,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 2,
+      "class": 482,
+      "elapsed_s": 0.57,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 8388391936.0,
+      "heatmap_focus_top10pct": 0.8350602643721982,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 3,
+      "class": 491,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 39083196416.0,
+      "heatmap_focus_top10pct": 0.9356406360802375,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 4,
+      "class": 497,
+      "elapsed_s": 0.59,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 256314368.0,
+      "heatmap_focus_top10pct": 0.9249108905423055,
+      "register_leak_share": NaN,
+      "per_layer": []
+    }
+  ],
+  "alphabeta_05_05": [
+    {
+      "sample": 0,
+      "class": 0,
+      "elapsed_s": 0.65,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 147.97613525390625,
+      "heatmap_focus_top10pct": 0.7376396044967717,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 1,
+      "class": 217,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 1.113595724105835,
+      "heatmap_focus_top10pct": 0.6787094790458068,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 2,
+      "class": 482,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 40.330989837646484,
+      "heatmap_focus_top10pct": 0.6631196240180469,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 3,
+      "class": 491,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 547.4430541992188,
+      "heatmap_focus_top10pct": 0.9112146700540198,
+      "register_leak_share": NaN,
+      "per_layer": []
+    },
+    {
+      "sample": 4,
+      "class": 497,
+      "elapsed_s": 0.58,
+      "finite_heatmap": true,
+      "heatmap_max_abs": 43.159088134765625,
+      "heatmap_focus_top10pct": 0.8065718371905486,
+      "register_leak_share": NaN,
+      "per_layer": []
+    }
+  ]
+}

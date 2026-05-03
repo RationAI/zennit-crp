@@ -143,6 +143,97 @@ class _ScaleIdentityRuleFn(Function):
         return grad_out, None
 
 
+class _AlphaBetaMatmulFn(Function):
+    """AlphaBeta-on-bilinear LRP rule (Bach 2015 generalised to bilinear).
+
+    See ``RESEARCH_NOTES.md`` Entry 6 for the full derivation,
+    conservation proof, and motivation. Short version: replaces the
+    standard AttnLRP Prop. 3.3 ``2y+ε`` denominator with separate
+    ``Y^+`` and ``|Y^-|`` denominators built from sign-decomposed
+    operand contributions, structurally avoiding the LRP-0 Case-B
+    cancellation amplification of the standard bilinear rule on
+    near-orthogonal Q/K pairs and similar attention regimes.
+
+    Forward: standard ``Y = A @ B``.
+
+    Backward (per element of A):
+
+    .. math::
+
+        R_A = \\tfrac{1}{2} \\big\\{ A^+ \\odot [\\alpha (F B^{+T})
+              + \\beta (G B^{-T})] + A^- \\odot [\\alpha (F B^{-T})
+              + \\beta (G B^{+T})] \\big\\}
+
+    where ``A^± = max/min(A, 0)``, ``B^± = max/min(B, 0)``,
+    ``Y^+ = A^+ B^+ + A^- B^-`` (positive contributions sum,
+    always ≥ 0), ``Y^- = A^+ B^- + A^- B^+`` (negative contributions
+    sum, always ≤ 0), ``F = R_Y / (Y^+ + ε)``,
+    ``G = R_Y / (Y^- − ε)``. Symmetric formula for ``R_B``.
+
+    Conservation: ``Σ R_A + Σ R_B = (α+β)·Σ R_Y``; with the standard
+    constraint ``α + β = 1``, we get exact conservation modulo ε.
+
+    Hyperparameters
+    ---------------
+    alpha, beta : float
+        Bach 2015 mixture coefficients. Typical: ``α=1, β=0`` (z+,
+        positive only), ``α=2, β=-1`` ("alpha2beta1" — amplify
+        positive, suppress negative), ``α=0.5, β=0.5`` (balanced).
+        Constraint ``α + β = 1`` for exact conservation.
+    epsilon : float
+        Stabilizer. Default ``1e-6``.
+
+    Compute cost: ~4 sign-decomposed forward matmuls + 4 backward
+    matmuls; ~8× the standard ``_MatmulFactor2Fn`` cost. Negligible
+    for typical attention shapes.
+    """
+
+    @staticmethod
+    def forward(ctx, a, b, alpha=1.0, beta=0.0, epsilon=1e-6):
+        out = a @ b
+        # Sign-decomposed operands; saved for backward.
+        a_pos = a.clamp(min=0)
+        a_neg = a.clamp(max=0)
+        b_pos = b.clamp(min=0)
+        b_neg = b.clamp(max=0)
+        # Y^+ (≥ 0): same-sign products. Y^- (≤ 0): opposite-sign products.
+        # Computed under no_grad — the Function's backward handles all
+        # gradient routing; autograd shouldn't trace these intermediates.
+        with torch.no_grad():
+            y_pos = a_pos @ b_pos + a_neg @ b_neg
+            y_neg = a_pos @ b_neg + a_neg @ b_pos
+        ctx.save_for_backward(a_pos, a_neg, b_pos, b_neg, y_pos, y_neg)
+        ctx.alpha = alpha
+        ctx.beta = beta
+        ctx.epsilon = epsilon
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        a_pos, a_neg, b_pos, b_neg, y_pos, y_neg = ctx.saved_tensors
+        eps = ctx.epsilon
+        alpha = ctx.alpha
+        beta = ctx.beta
+        # Stabilized denominators. Y^+ ≥ 0 → +ε keeps positive sign and
+        # bounds 1/(Y^+ + ε) at 1/ε. Y^- ≤ 0 → -ε pushes more negative,
+        # keeps negative sign, bounds |1/(Y^- − ε)| at 1/ε.
+        f = grad_out / (y_pos + eps)
+        g = grad_out / (y_neg - eps)
+        bpT = b_pos.transpose(-1, -2)
+        bnT = b_neg.transpose(-1, -2)
+        grad_a = 0.5 * (
+            a_pos * (alpha * (f @ bpT) + beta * (g @ bnT))
+            + a_neg * (alpha * (f @ bnT) + beta * (g @ bpT))
+        )
+        apT = a_pos.transpose(-1, -2)
+        anT = a_neg.transpose(-1, -2)
+        grad_b = 0.5 * (
+            b_pos * (alpha * (apT @ f) + beta * (anT @ g))
+            + b_neg * (alpha * (anT @ f) + beta * (apT @ g))
+        )
+        return grad_a, grad_b, None, None, None
+
+
 # ─── 2. Bilinear / 2-input nn.Modules ────────────────────────────────────────
 
 
@@ -188,22 +279,32 @@ class BilinearMatmul(nn.Module):
         rule: str = "matmul_factor_2",
         epsilon: float = 1e-6,
         signed: bool = False,
+        alpha: float = 1.0,
+        beta: float = 0.0,
     ):
         super().__init__()
-        if rule not in ("matmul_factor_2", "passthrough"):
+        if rule not in ("matmul_factor_2", "passthrough", "alpha_beta"):
             raise ValueError(
-                f"rule must be 'matmul_factor_2' or 'passthrough'; got {rule!r}"
+                f"rule must be 'matmul_factor_2', 'alpha_beta', or 'passthrough'; "
+                f"got {rule!r}"
             )
         self.rule = rule
         self.epsilon = epsilon
         self.signed = signed
+        self.alpha = alpha
+        self.beta = beta
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         if self.rule == "matmul_factor_2":
             return _MatmulFactor2Fn.apply(a, b, self.epsilon, self.signed)
+        if self.rule == "alpha_beta":
+            return _AlphaBetaMatmulFn.apply(a, b, self.alpha, self.beta, self.epsilon)
         return a @ b
 
     def extra_repr(self) -> str:
+        if self.rule == "alpha_beta":
+            return (f"rule={self.rule!r}, alpha={self.alpha}, beta={self.beta}, "
+                    f"epsilon={self.epsilon}")
         return f"rule={self.rule!r}, epsilon={self.epsilon}, signed={self.signed}"
 
 
@@ -522,6 +623,8 @@ class EvaAttentionUnfolded(nn.Module):
         epsilon: float = 1e-6,
         signed_epsilon: bool = False,
         rope_detach: bool = False,
+        alpha: float = 1.0,
+        beta: float = 0.0,
     ):
         super().__init__()
         if not (
@@ -579,11 +682,13 @@ class EvaAttentionUnfolded(nn.Module):
         self.scale_q = ScaleByConstant(self.scale, rule=scalar_rule)
         self.qk_scores = BilinearMatmul(
             rule=matmul_rule, epsilon=epsilon, signed=signed_epsilon,
+            alpha=alpha, beta=beta,
         )
         self.add_mask = AddBias()
         self.softmax = SoftmaxAlongLastDim(rule=softmax_rule)
         self.context = BilinearMatmul(
             rule=matmul_rule, epsilon=epsilon, signed=signed_epsilon,
+            alpha=alpha, beta=beta,
         )
         self.reshape = ReshapeMergeHeads()
         # NB: we deliberately do NOT keep ``orig`` as an attribute here —
@@ -741,6 +846,8 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         epsilon: float = 1e-6,
         signed_epsilon: bool = False,
         rope_detach: bool = False,
+        alpha: float = 1.0,
+        beta: float = 0.0,
     ):
         self.block_indices = (
             None if block_indices is None else tuple(int(i) for i in block_indices)
@@ -749,6 +856,8 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         self.epsilon = epsilon
         self.signed_epsilon = signed_epsilon
         self.rope_detach = rope_detach
+        self.alpha = alpha
+        self.beta = beta
 
         # State filled by ``register``.
         self.parent: Optional[nn.Module] = None
@@ -794,6 +903,8 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
             epsilon=self.epsilon,
             signed_epsilon=self.signed_epsilon,
             rope_detach=self.rope_detach,
+            alpha=self.alpha,
+            beta=self.beta,
         )
         # Re-bind via setattr so the parent's module dict is updated AND
         # nn.Module's __setattr__ moves the params/buffers to the right
@@ -818,6 +929,8 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
             epsilon=self.epsilon,
             signed_epsilon=self.signed_epsilon,
             rope_detach=self.rope_detach,
+            alpha=self.alpha,
+            beta=self.beta,
         )
 
 
