@@ -10,41 +10,46 @@ attention refactor. Each concept class is a thin wrapper around a CRP
 * implements ``mask`` (zero-out non-selected concepts during attribution
   backward) and ``attribute`` (per-concept relevance reduction).
 
-There are **three conditioning points** inside one attention block, each
-with its own concept class:
+**Strict separation between spatial and prefix (cls + register) tokens.**
+Spatial patch tokens are translation-equivariant: the same channel
+responds similarly to the same feature regardless of position, so
+per-token conditioning of spatial tokens would not generalise across
+reference samples. Register / cls tokens (the first ``num_prefix_tokens``
+positions of the token axis) carry global non-spatial meaning per
+Darcet et al. ICLR 2024 (arXiv:2309.16588) and ARE meaningfully
+addressable by token id. The two are exposed via separate concept
+classes; **no concept class mixes them**.
 
-1. **Q / K / V inputs to the bilinears** — :class:`QConcept`,
-   :class:`KConcept`, :class:`VConcept`. Hook the per-head Q (post
-   q_norm + RoPE), K (post k_norm + RoPE), or V (post per-head reshape)
-   tensors of shape ``(B, num_heads, N, head_dim)``. Per-head
-   conditioning by default; per-(head, dim) via ``dim_split=True``.
+Conditioning points inside one attention block:
 
-2. **Per-head context output** — :class:`HeadConcept`. Hooks the
-   ``context`` output (= ``attn @ V``, before the reshape that merges
-   heads back) of shape ``(B, num_heads, N, head_dim)``. This is the
-   "per-head contribution to the attention output" view — the natural
-   CRP analogue to a CNN filter.
+1. **Q / K / V inputs to the bilinears (spatial-only)** —
+   :class:`QConcept`, :class:`KConcept`, :class:`VConcept`. Hook the
+   per-head Q (post q_norm + RoPE), K (post k_norm + RoPE), or V (post
+   per-head reshape) tensors of shape ``(B, num_heads, N, head_dim)``.
+   Per-head conditioning by default; per-(head, dim) via
+   ``dim_split=True``. Excludes the first ``num_prefix_tokens`` of the
+   token axis.
 
-3. **Post-projection residual contribution** — :class:`AttnOutputDimConcept`.
-   Hooks the ``proj_drop`` output (= the attention block's contribution
-   to the residual stream, shape ``(B, N, embed_dim)``). **Per-channel
-   conditioning only**, with relevance aggregated over the spatial
-   token axis. The "OV-circuit-output" view used by the Anthropic
-   mathematical-framework / induction-heads line of work.
+2. **Per-head context output (spatial-only)** — :class:`HeadConcept`.
+   Hooks the ``context`` output (= ``attn @ V``, before the reshape
+   that merges heads back) of shape ``(B, num_heads, N, head_dim)``.
+   "Per-head contribution to the attention output" — natural CRP
+   analogue to a CNN filter. Spatial tokens only.
 
-   *Why not per-(token, channel)?* For ViTs, spatial token positions
-   carry no fixed semantic — the same channel responds similarly to
-   the same feature regardless of where it appears in the image
-   (translation-equivariant feature space). Per-token conditioning
-   would treat the same concept differently based on accidental
-   spatial location and would not generalise across reference samples.
-   Channel conditioning + spatial aggregation is the meaningful axis.
+3. **Post-projection residual contribution, spatial channels** —
+   :class:`AttnOutputDimConcept`. Hooks the ``proj_drop`` output of
+   shape ``(B, N, embed_dim)``. **Per-channel conditioning only** with
+   relevance aggregated over spatial tokens. The
+   "OV-circuit-output" view used by the Anthropic mathematical-framework
+   / induction-heads line of work. Excludes prefix tokens.
 
-   *Register / cls tokens.* Currently lumped with patch tokens in the
-   spatial sum. They DO carry global non-spatial meaning (Darcet et al.
-   ICLR 2024, arXiv:2309.16588) and could be conditioned on by
-   token-id, but the right framing for that is open research; for now
-   the channel-only baseline applies uniformly to all tokens.
+4. **Register / cls token contribution** — :class:`RegisterTokenConcept`.
+   Same hook point (``proj_drop``) but addresses **only the first
+   ``num_prefix_tokens``** of the token axis. Per-token conditioning by
+   default; per-(token, channel) via ``dim_split=True``. Each prefix
+   token carries a distinct global signal (cls = classification
+   aggregator; register tokens absorb high-norm artifacts) and is
+   meaningfully retrievable via reference-sample search.
 
 **Removed concept classes** (per design review):
 
@@ -118,6 +123,12 @@ class _PerHeadAttentionConcept(ChannelConcept):
     """Shared base for concepts on per-head tensors of shape
     ``(B, num_heads, N, head_dim)``.
 
+    **Spatial-only conditioning.** All operations exclude the first
+    ``num_prefix_tokens`` of the token axis (cls + register tokens in
+    DINOv3 etc.) — those carry global non-spatial meaning that must
+    not be mixed with patch-token conditioning. Register / cls tokens
+    are addressable separately via :class:`RegisterTokenConcept`.
+
     Subclasses set:
 
     * ``LAYER_SUFFIX`` — the named submodule of
@@ -141,16 +152,23 @@ class _PerHeadAttentionConcept(ChannelConcept):
 
     def __init__(self, model: Optional[nn.Module] = None, *, dim_split: bool = False):
         self.dim_split = bool(dim_split)
-        # layer_name -> (num_heads, head_dim)
-        self._dims: Dict[str, Tuple[int, int]] = {}
+        # layer_name -> (num_heads, head_dim, num_prefix_tokens)
+        self._dims: Dict[str, Tuple[int, int, int]] = {}
         if model is not None:
             for attn_name, attn in _find_unfolded_attentions(model):
                 self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
-                    int(attn.num_heads), int(attn.head_dim),
+                    int(attn.num_heads),
+                    int(attn.head_dim),
+                    int(getattr(attn, "num_prefix_tokens", 0)),
                 )
 
-    def register_layer(self, layer_name: str, num_heads: int, head_dim: int) -> None:
-        self._dims[layer_name] = (int(num_heads), int(head_dim))
+    def register_layer(
+        self, layer_name: str, num_heads: int, head_dim: int,
+        num_prefix_tokens: int = 0,
+    ) -> None:
+        self._dims[layer_name] = (
+            int(num_heads), int(head_dim), int(num_prefix_tokens),
+        )
 
     # ── concept id decode ───────────────────────────────────────────────────
 
@@ -200,10 +218,10 @@ class _PerHeadAttentionConcept(ChannelConcept):
             f"concept id must be int or tuple; got {type(concept_id).__name__}"
         )
 
-    # ── mask (zero out non-selected concepts during backward) ───────────────
+    # ── mask (zero out non-selected concepts AND prefix tokens) ─────────────
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        num_heads, head_dim = _resolve_dims(layer_name, self._dims)
+        num_heads, head_dim, npt = _resolve_dims(layer_name, self._dims)
         decoded = [self._decode(cid, num_heads, head_dim) for cid in concept_ids]
 
         def mask_fct(grad: torch.Tensor) -> torch.Tensor:
@@ -215,18 +233,24 @@ class _PerHeadAttentionConcept(ChannelConcept):
                     f"(B, {num_heads}, N, {head_dim}) on layer {layer_name!r}; "
                     f"got {tuple(grad.shape)} (per-batch slice {tuple(t.shape)})"
                 )
+            if t.shape[1] <= npt:
+                raise ValueError(
+                    f"{type(self).__name__}: token axis has {t.shape[1]} positions "
+                    f"but num_prefix_tokens = {npt}; no spatial tokens left"
+                )
             mask = torch.zeros_like(t)
             for head, dim in decoded:
+                # Spatial tokens only — slice [npt:] on the N axis.
                 if dim is None:
-                    mask[head, :, :] = 1
+                    mask[head, npt:, :] = 1
                 else:
-                    mask[head, :, dim] = 1
+                    mask[head, npt:, dim] = 1
             grad[batch_id] = t * mask
             return grad
 
         return mask_fct
 
-    # ── attribute (per-concept relevance reduction) ─────────────────────────
+    # ── attribute (sum spatial tokens, per-concept reduction) ───────────────
 
     def attribute(
         self,
@@ -235,15 +259,17 @@ class _PerHeadAttentionConcept(ChannelConcept):
         layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
+        _, _, npt = _resolve_dims(layer_name, self._dims)
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
-        # (B, num_heads, N, head_dim)
+        # (B, num_heads, N, head_dim) → keep only spatial tokens [npt:].
+        rel_spatial = relevance[:, :, npt:, :]
         if self.dim_split:
-            # Sum out the token (N) axis only → (B, num_heads, head_dim).
-            rel = relevance.sum(dim=2)
+            # Sum over the spatial token axis → (B, num_heads, head_dim).
+            rel = rel_spatial.sum(dim=2)
         else:
-            # Sum out tokens AND head_dim → (B, num_heads).
-            rel = relevance.sum(dim=(2, 3))
+            # Sum over spatial tokens AND head_dim → (B, num_heads).
+            rel = rel_spatial.sum(dim=(2, 3))
         if abs_norm:
             shape = rel.shape
             flat = rel.reshape(shape[0], -1)
@@ -260,22 +286,29 @@ class _PerHeadAttentionConcept(ChannelConcept):
         max_target: str = "sum",
         abs_norm: bool = True,
     ):
-        # (B, num_heads, N, head_dim) → (B, num_concepts, N) for argmax-over-N.
+        # Argmax over the spatial token axis only — receptive-field token id
+        # is reported relative to the absolute (B, num_heads, N, head_dim)
+        # token axis (so the caller can map it back to the original token
+        # coordinates), but the argmax search excludes the prefix tokens.
+        _, _, npt = _resolve_dims(layer_name, self._dims)
         B = relevance.shape[0]
+        rel_spatial = relevance[:, :, npt:, :]
         if self.dim_split:
-            # (B, num_heads, N, head_dim) → permute to (B, num_heads, head_dim, N)
-            rel = relevance.permute(0, 1, 3, 2).reshape(B, -1, relevance.shape[2])
+            # (B, num_heads, N_spatial, head_dim) → (B, num_heads*head_dim, N_spatial)
+            rel = rel_spatial.permute(0, 1, 3, 2).reshape(B, -1, rel_spatial.shape[2])
         else:
-            # Sum head_dim out: (B, num_heads, N, head_dim) → (B, num_heads, N)
-            rel = relevance.sum(dim=-1)
-        N = rel.shape[-1]
-        # rel shape: (B, num_concepts, N). Find the receptive-field token
-        # (= argmax-N) per concept.
-        rf_neuron = torch.argmax(rel, dim=-1)  # (B, num_concepts)
+            # Sum head_dim → (B, num_heads, N_spatial)
+            rel = rel_spatial.sum(dim=-1)
+        # rel shape: (B, num_concepts, N_spatial). Argmax on the spatial axis.
+        rf_neuron_spatial = torch.argmax(rel, dim=-1)  # (B, num_concepts)
+        # Map back to absolute token id (offset by the prefix count).
+        rf_neuron = rf_neuron_spatial + npt
         if max_target == "sum":
             rel_c = rel.sum(dim=-1)
         elif max_target == "max":
-            rel_c = torch.gather(rel, -1, rf_neuron.unsqueeze(-1)).squeeze(-1)
+            rel_c = torch.gather(
+                rel, -1, rf_neuron_spatial.unsqueeze(-1),
+            ).squeeze(-1)
         else:
             raise ValueError("'max_target' supports only 'max' or 'sum'.")
         if abs_norm:
@@ -394,29 +427,22 @@ class AttnOutputDimConcept(ChannelConcept):
     LAYER_SUFFIX = "proj_drop"
 
     def __init__(self, model: Optional[nn.Module] = None):
-        # layer_name -> embed_dim
-        self._dims: Dict[str, int] = {}
+        # layer_name -> (embed_dim, num_prefix_tokens)
+        self._dims: Dict[str, Tuple[int, int]] = {}
         if model is not None:
             for attn_name, attn in _find_unfolded_attentions(model):
                 embed_dim = int(attn.num_heads) * int(attn.head_dim)
-                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = embed_dim
+                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
+                    embed_dim, int(getattr(attn, "num_prefix_tokens", 0)),
+                )
 
-    def register_layer(self, layer_name: str, embed_dim: int) -> None:
-        self._dims[layer_name] = int(embed_dim)
+    def register_layer(
+        self, layer_name: str, embed_dim: int, num_prefix_tokens: int = 0,
+    ) -> None:
+        self._dims[layer_name] = (int(embed_dim), int(num_prefix_tokens))
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        if layer_name not in self._dims:
-            # Try parent prefix.
-            for k in self._dims:
-                if layer_name.startswith(k.rsplit(".", 1)[0]):
-                    embed_dim = self._dims[k]
-                    break
-            else:
-                raise ValueError(
-                    f"AttnOutputDimConcept: layer {layer_name!r} not registered"
-                )
-        else:
-            embed_dim = self._dims[layer_name]
+        embed_dim, npt = _resolve_dims(layer_name, self._dims)
 
         channels = []
         for cid in concept_ids:
@@ -433,17 +459,24 @@ class AttnOutputDimConcept(ChannelConcept):
             channels.append(ch)
 
         def mask_fct(grad: torch.Tensor) -> torch.Tensor:
-            # grad shape: (B, N, embed_dim). The mask preserves all tokens
-            # of the selected channels (channel-only conditioning); spatial
-            # aggregation happens in attribute().
+            # grad shape: (B, N, embed_dim). Channel-only conditioning AND
+            # spatial-only token slice — register / cls tokens (the first
+            # ``npt``) are zeroed out; they're addressable separately via
+            # :class:`RegisterTokenConcept`.
             t = grad[batch_id]
             if t.dim() != 2 or t.shape[1] != embed_dim:
                 raise ValueError(
                     f"AttnOutputDimConcept expects (B, N, {embed_dim}) on "
                     f"layer {layer_name!r}; got per-batch shape {tuple(t.shape)}"
                 )
+            if t.shape[0] <= npt:
+                raise ValueError(
+                    f"AttnOutputDimConcept: token axis has {t.shape[0]} "
+                    f"positions but num_prefix_tokens = {npt}; no spatial "
+                    f"tokens left"
+                )
             mask = torch.zeros_like(t)
-            mask[:, channels] = 1
+            mask[npt:, channels] = 1
             grad[batch_id] = t * mask
             return grad
 
@@ -456,14 +489,175 @@ class AttnOutputDimConcept(ChannelConcept):
         layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
+        _, npt = _resolve_dims(layer_name, self._dims)
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
-        # (B, N, embed_dim) → sum over tokens → (B, embed_dim).
-        # Spatial aggregation is the design — see class docstring.
-        rel = relevance.sum(dim=1)
+        # (B, N, embed_dim) → keep spatial tokens only → sum over tokens → (B, embed_dim).
+        rel = relevance[:, npt:, :].sum(dim=1)
         if abs_norm:
             denom = rel.abs().sum(dim=-1, keepdim=True) + 1e-10
             rel = rel / denom
+        return rel
+
+
+# ─── 3. Register / cls token concept (prefix-token residual contribution) ───
+
+
+class RegisterTokenConcept(ChannelConcept):
+    """One concept per prefix (cls + register) token of the post-projection
+    attention output.
+
+    Targets ``EvaAttentionUnfolded.proj_drop``. Tensor shape:
+    ``(B, N, embed_dim)``. Concepts live on the first ``num_prefix_tokens``
+    of the token axis.
+
+    DINOv3 ViT-L has ``num_prefix_tokens = 5`` (1 cls + 4 register).
+    Each token carries a global, non-spatial signal — register tokens
+    absorb high-norm artifacts per Darcet et al. ICLR 2024
+    (arXiv:2309.16588), and the cls token is the model's classification
+    aggregator. Per-token addressing makes sense at this granularity:
+    each prefix token can encode different global features and is
+    meaningfully retrievable via reference-sample search (a different
+    contract from spatial patch tokens, which are translation-equivariant).
+
+    Construction-time flag:
+
+    * ``dim_split`` — if ``False`` (default), one concept per prefix
+      token (5 concepts on DINOv3); if ``True``, one concept per
+      ``(prefix_token_id, channel_id)`` pair.
+
+    Concept id encoding:
+    * ``dim_split=False``: ``int token_id`` or ``(token_id,)``;
+      ``attribute()`` returns shape ``(B, num_prefix_tokens)``.
+    * ``dim_split=True``: ``(token_id, channel_id)`` tuple or flat
+      row-major ``int`` over ``(num_prefix_tokens, embed_dim)``;
+      ``attribute()`` returns shape ``(B, num_prefix_tokens, embed_dim)``.
+
+    Use cases:
+
+    * Find images where the cls token (``token_id=0``) carries the most
+      relevance — the natural classification-aggregator-attention view.
+    * Find images that activate a specific register token most — useful
+      for the artifact-storage hypothesis of Darcet et al.
+    """
+
+    LAYER_SUFFIX = "proj_drop"
+
+    def __init__(self, model: Optional[nn.Module] = None, *, dim_split: bool = False):
+        self.dim_split = bool(dim_split)
+        # layer_name -> (embed_dim, num_prefix_tokens)
+        self._dims: Dict[str, Tuple[int, int]] = {}
+        if model is not None:
+            for attn_name, attn in _find_unfolded_attentions(model):
+                embed_dim = int(attn.num_heads) * int(attn.head_dim)
+                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
+                    embed_dim, int(getattr(attn, "num_prefix_tokens", 0)),
+                )
+
+    def register_layer(
+        self, layer_name: str, embed_dim: int, num_prefix_tokens: int,
+    ) -> None:
+        if num_prefix_tokens <= 0:
+            raise ValueError(
+                f"RegisterTokenConcept needs num_prefix_tokens > 0; got "
+                f"{num_prefix_tokens}"
+            )
+        self._dims[layer_name] = (int(embed_dim), int(num_prefix_tokens))
+
+    def _decode(
+        self, concept_id, num_prefix_tokens: int, embed_dim: int,
+    ) -> Tuple[int, Optional[int]]:
+        """Decode a concept id into ``(token_id, channel_or_None)``."""
+        if isinstance(concept_id, (int, np.integer)):
+            flat = int(concept_id)
+            if self.dim_split:
+                total = num_prefix_tokens * embed_dim
+                if not 0 <= flat < total:
+                    raise IndexError(
+                        f"flat concept {flat} out of [0, {total}) for "
+                        f"RegisterTokenConcept(dim_split=True)"
+                    )
+                tok, ch = divmod(flat, embed_dim)
+                return tok, ch
+            if not 0 <= flat < num_prefix_tokens:
+                raise IndexError(
+                    f"prefix token {flat} out of [0, {num_prefix_tokens})"
+                )
+            return flat, None
+        if isinstance(concept_id, (tuple, list)):
+            if self.dim_split:
+                if len(concept_id) != 2:
+                    raise ValueError(
+                        "RegisterTokenConcept(dim_split=True) expects (token, channel)"
+                    )
+                tok, ch = int(concept_id[0]), int(concept_id[1])
+                if not 0 <= tok < num_prefix_tokens:
+                    raise IndexError(f"token {tok} out of [0, {num_prefix_tokens})")
+                if not 0 <= ch < embed_dim:
+                    raise IndexError(f"channel {ch} out of [0, {embed_dim})")
+                return tok, ch
+            if len(concept_id) != 1:
+                raise ValueError("RegisterTokenConcept expects (token,) or int")
+            tok = int(concept_id[0])
+            if not 0 <= tok < num_prefix_tokens:
+                raise IndexError(f"token {tok} out of [0, {num_prefix_tokens})")
+            return tok, None
+        raise TypeError(
+            f"concept id must be int or tuple; got {type(concept_id).__name__}"
+        )
+
+    def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
+        embed_dim, npt = _resolve_dims(layer_name, self._dims)
+        decoded = [self._decode(cid, npt, embed_dim) for cid in concept_ids]
+
+        def mask_fct(grad: torch.Tensor) -> torch.Tensor:
+            # grad shape: (B, N, embed_dim). Keep selected prefix tokens;
+            # zero everything else (other prefix tokens AND all spatial
+            # tokens — those are addressable via AttnOutputDimConcept).
+            t = grad[batch_id]
+            if t.dim() != 2 or t.shape[1] != embed_dim:
+                raise ValueError(
+                    f"RegisterTokenConcept expects (B, N, {embed_dim}) on "
+                    f"layer {layer_name!r}; got per-batch shape {tuple(t.shape)}"
+                )
+            if t.shape[0] < npt:
+                raise ValueError(
+                    f"RegisterTokenConcept: token axis has {t.shape[0]} positions "
+                    f"but num_prefix_tokens = {npt}"
+                )
+            mask = torch.zeros_like(t)
+            for tok, ch in decoded:
+                if ch is None:
+                    mask[tok, :] = 1
+                else:
+                    mask[tok, ch] = 1
+            grad[batch_id] = t * mask
+            return grad
+
+        return mask_fct
+
+    def attribute(
+        self,
+        relevance: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        layer_name: Optional[str] = None,
+        abs_norm: bool = True,
+    ) -> torch.Tensor:
+        _, npt = _resolve_dims(layer_name, self._dims)
+        if isinstance(mask, torch.Tensor):
+            relevance = relevance * mask
+        # (B, N, embed_dim) → keep prefix tokens only → (B, num_prefix_tokens, embed_dim).
+        rel_prefix = relevance[:, :npt, :]
+        if not self.dim_split:
+            # Sum over channels → (B, num_prefix_tokens).
+            rel = rel_prefix.sum(dim=-1)
+        else:
+            rel = rel_prefix  # (B, num_prefix_tokens, embed_dim)
+        if abs_norm:
+            shape = rel.shape
+            flat = rel.reshape(shape[0], -1)
+            denom = flat.abs().sum(dim=-1, keepdim=True) + 1e-10
+            rel = (flat / denom).reshape(shape)
         return rel
 
 
@@ -473,4 +667,5 @@ __all__ = [
     "KConcept",
     "VConcept",
     "AttnOutputDimConcept",
+    "RegisterTokenConcept",
 ]

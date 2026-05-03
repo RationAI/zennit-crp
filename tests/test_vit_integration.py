@@ -28,6 +28,7 @@ from crp.attention_concepts import (
     HeadConcept,
     QConcept,
     AttnOutputDimConcept,
+    RegisterTokenConcept,
 )
 from crp.attention_unfolded import (
     EvaAttentionUnfolded,
@@ -292,6 +293,40 @@ class TestEvaUnfoldedIntegration:
         attribution = CondAttribution(eva_tiny)
         res = attribution(
             img224, [{layer: [0, 5, 10], "y": [42]}], composite,
+            mask_map=concept.mask,
+        )
+        assert res.heatmap.shape[-1] == H
+
+    def test_register_token_concept_attribution_on_eva(self, eva_tiny, img224):
+        """RegisterTokenConcept addresses the prefix (cls + register)
+        tokens at the attention block's residual contribution. Auto-
+        registration must pick up num_prefix_tokens from the unfolded
+        attention. Some Eva variants have num_prefix_tokens=0 (no register
+        tokens); skip those — RegisterTokenConcept is meaningful only when
+        prefix tokens exist."""
+        composite = AttnLRPCombinedComposite(
+            matmul_factor_2=True, use_unfolded_attention=True,
+            alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
+        )
+        with composite.context(eva_tiny) as modified:
+            concept = RegisterTokenConcept(modified)
+        n_blocks = len(eva_tiny.blocks)
+        target_block = n_blocks // 2
+        layer = f"blocks.{target_block}.attn.proj_drop"
+        assert layer in concept._dims
+        embed_dim, npt = concept._dims[layer]
+        if npt == 0:
+            pytest.skip(
+                f"Eva variant has num_prefix_tokens=0; RegisterTokenConcept "
+                f"requires npt > 0"
+            )
+        H = eva_tiny.default_cfg.get("input_size", (3, 224, 224))[-1]
+        if img224.shape[-1] != H:
+            img224 = torch.randn(1, 3, H, H, requires_grad=True)
+        attribution = CondAttribution(eva_tiny)
+        # Condition on the cls token (always token_id=0 by convention).
+        res = attribution(
+            img224, [{layer: [0], "y": [42]}], composite,
             mask_map=concept.mask,
         )
         assert res.heatmap.shape[-1] == H
