@@ -12,11 +12,27 @@ Runs one attribution and records, at every chosen module:
   (the bias contribution ``b · R_y / stab(y)`` is "discharged" to the
   bias node — Bach et al. 2015; Montavon et al. 2019).
 
-The point: if the ``max|R| ≈ 200`` we observed at the input is a real
-positive blob (not a positive blob cancelled by a comparable negative
-blob) AND the per-layer trajectory shows monotonic deflation consistent
-with bias absorption, we have evidence the working composite is
-behaving like proper LRP (not a numerical accident).
+**Important caveat for Pass-ruled modules** (``nn.LayerNorm``, ``nn.GELU``
+etc., mapped to :class:`zennit.rules.Pass` in the working composite).
+:class:`Pass` overrides ``grad_input`` by returning ``grad_output``
+unchanged. But: when multiple ``full_backward_hook``s are attached to
+the same module (Pass is one, this probe is another), each hook
+receives the **natural autograd** ``grad_input`` — Pass's override
+only takes effect for *downstream* operations (i.e. the next module's
+``grad_output``). So for a Pass-ruled module:
+
+* ``rec[name]['R_in_total']`` is **misleading** — shows the natural
+  autograd gradient (e.g. zero for LayerNorm's per-token sum-zero
+  property), not the post-Pass-override propagated value.
+* The actual relevance flowing downstream is captured by the *next
+  module's* ``R_out_total``.
+
+The probe is therefore most reliable on modules WITHOUT Pass (Linear,
+Conv2d, EvaBlock as a whole). For chain-consistent reading restrict
+the print to those module types.
+
+See ``experiments/debug_probe_anomaly.py`` for the empirical evidence
+that established this caveat (H1-H5 hypothesis tests).
 
 Usage::
 
@@ -231,10 +247,19 @@ def main():
     print("  R_in_total  = sum of relevance LEAVING the module to below (input side)")
     print("  absorbed    = R_out_total − R_in_total")
     print("                positive value = bias absorption (proper LRP behaviour)")
-    print("                negative value = leakage (residual addition or other rule gap)")
+    print("                negative value = leakage (matmul rule magnitude inflation,")
+    print("                                  residual rule conservation gap, or rule bug)")
     print("                near zero      = perfect per-module conservation")
     print("  R_pos / R_neg = positive vs negative relevance entering R_in")
-    print("                 large opposite-sign values = sign-cancellation (max|R| is misleading)")
+    print("                  large opposite-sign values = sign-cancellation")
+    print("                  (max|R| is misleading — the heatmap pattern is dominated by")
+    print("                   pixels where pos and neg DON'T cancel)")
+    print()
+    print("CAVEAT: For Pass-ruled modules (LayerNorm, GELU), R_in shown is the natural")
+    print("autograd value, NOT the post-Pass-override value that actually propagates")
+    print("downstream. The propagated value = next module's R_out (chain-consistent).")
+    print("Restrict per-module conservation reading to non-Pass modules (Linear, EvaBlock).")
+    print("See experiments/debug_probe_anomaly.py for the test that established this.")
 
 
 if __name__ == "__main__":
