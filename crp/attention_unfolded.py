@@ -691,6 +691,14 @@ class EvaAttentionUnfolded(nn.Module):
             alpha=alpha, beta=beta,
         )
         self.reshape = ReshapeMergeHeads()
+        # Identity hook points so concept-conditioning can target Q, K, V
+        # individually (post per-head reshape, before they enter the
+        # bilinear). q_norm / k_norm already exist as nn.Modules (LayerNorm
+        # or Identity) so they're hookable directly; V has no analog
+        # transformation, so we add an explicit Identity for symmetry.
+        # (rope_q / rope_k are also fine hook targets for "Q post-RoPE"
+        # / "K post-RoPE"; pick whichever is most informative.)
+        self.v_id = nn.Identity()
         # NB: we deliberately do NOT keep ``orig`` as an attribute here —
         # PyTorch's ``__setattr__`` would re-register it as a submodule
         # (even with a leading underscore, because it's an ``nn.Module``),
@@ -728,6 +736,7 @@ class EvaAttentionUnfolded(nn.Module):
         q = _to_heads(q_flat)
         k = _to_heads(k_flat)
         v = _to_heads(v_flat)
+        v = self.v_id(v)  # hookable identity for VConcept
 
         q = self.q_norm(q)
         k = self.k_norm(k)

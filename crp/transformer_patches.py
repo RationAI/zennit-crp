@@ -229,9 +229,9 @@ class _MatmulFactor2Fn(Function):
 # Convenience callables (used inside the forward replacements below).
 
 
-def identity_rule_implicit(fn, input, *, epsilon: float = 1e-6, signed: bool = False):
+def identity_rule_implicit(fn, input, *, epsilon: float = 1e-6):
     """Apply ``fn(input)`` with the AttnLRP identity rule inlined into backward."""
-    return _IdentityRuleFn.apply(fn, input, epsilon, signed)
+    return _IdentityRuleFn.apply(fn, input, epsilon)
 
 
 def divide_gradient(input, factor: int = 2):
@@ -278,146 +278,45 @@ def dropout_passthrough_forward(self, x):
     return x
 
 
-def _eva_attention_forward(
-    self, x, rope=None, attn_mask=None, is_causal=False,
-    *, matmul_factor_2_rule: bool = False, rope_detach: bool = False,
-    signed_epsilon: bool = False, epsilon: float = 1e-6,
-):
-    """timm ``EvaAttention.forward`` replacement for AttnLRP + concept hooking.
-
-    Mirrors :func:`_timm_attention_forward` but for the ``Eva``-stack
-    Attention used by DINOv3 ViTs (and EVA*, BEiT-style models). Differences
-    vs. the standard timm Attention path:
-
-    * Forward signature takes ``rope`` (rotary positional embedding tensor)
-      passed in by the parent ``EvaBlock.forward``.
-    * RoPE is applied to ``q`` and ``k`` after q_norm/k_norm and before the
-      attention bilinear. We **insert** :func:`divide_gradient` factors on
-      q/k/v *before* RoPE so the AttnLRP uniform rule still applies to the
-      pre-rotation operands (RoPE is a per-token rotation: a unitary
-      transform that doesn't change ``|q|``/``|k|`` magnitudes).
-    * Bypasses the fused ``F.scaled_dot_product_attention`` path so the
-      autograd graph contains the explicit softmax + matmul ops.
-    * Routes through the named taps installed by
-      :class:`AttentionTapsCanonizer`.
-
-    Strategy parameters (bound by the canonizer at canonize time):
-
-    * ``matmul_factor_2_rule`` — when True, replace ``q @ kᵀ`` and
-      ``attn @ v`` with :func:`matmul_factor_2` (AttnLRP Prop. 3.3,
-      ``2y+ε`` stabiliser) and drop the redundant
-      ``divide_gradient(q,4)/(k,4)/(v,2)`` calls.
-    * ``rope_detach`` — when True, ``rope.detach()`` before the rotary
-      embedding op. RoPE has no learnable parameters (Su et al. 2021,
-      arXiv:2104.09864) so cos/sin can be treated as graph constants;
-      relevance routes purely through q/k.
-    * ``signed_epsilon`` — when True with ``matmul_factor_2_rule``, use
-      sign-aware ε in the bilinear stabiliser (AttnLRP Eq. 16).
-
-    The DINOv3 ViT-L variant has ``q_bias=k_bias=v_bias=None`` and
-    ``qkv.bias=False``; we only support that simple path here. Variants
-    with separate Q/K/V biases (``vit_*_dinov3_qkvb``) would need an
-    additional branch (lift verbatim from the upstream forward).
-    """
-    from timm.layers import apply_rot_embed_cat
-
-    B, N, C = x.shape
-    qkv_flat = self.qkv(x)              # (B, N, 3*num_heads*head_dim)
-    qkv_flat = self.qkv_tap(qkv_flat)   # ← K/Q/V-side hook tap
-    qkv = qkv_flat.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-    q, k, v = qkv.unbind(0)
-    q, k = self.q_norm(q), self.k_norm(k)
-
-    # When matmul_factor_2_rule is on, the ``2·Y + ε`` denominator inside
-    # :class:`_MatmulFactor2Fn` already gives the bilinear conservation —
-    # the operand-side divide_gradient calls are redundant and would
-    # over-shrink relevance. When off, fall back to the operand-side
-    # uniform-rule allocation (4×4×2 over the two bilinears).
-    if not matmul_factor_2_rule:
-        q = divide_gradient(q, 4)
-        k = divide_gradient(k, 4)
-        v = divide_gradient(v, 2)
-
-    # RoPE — first ``num_prefix_tokens`` (cls + reg) are NOT rotated.
-    if rope is not None:
-        npt = self.num_prefix_tokens
-        half = getattr(self, "rotate_half", False)
-        rope_used = rope.detach() if rope_detach else rope
-        q = torch.cat(
-            [q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope_used, half=half)],
-            dim=2,
-        ).type_as(v)
-        k = torch.cat(
-            [k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope_used, half=half)],
-            dim=2,
-        ).type_as(v)
-
-    # Manual softmax + matmul (bypass fused_attn so the autograd graph
-    # exposes the bilinear ops to the LRP rules).
-    q = q * self.scale
-    if matmul_factor_2_rule:
-        attn = matmul_factor_2(q, k.transpose(-2, -1), epsilon=epsilon, signed=signed_epsilon)
-    else:
-        attn = q @ k.transpose(-2, -1)
-
-    try:
-        from timm.models.eva import resolve_self_attn_mask, maybe_add_mask
-        attn_bias = resolve_self_attn_mask(N, attn, attn_mask, is_causal)
-        attn = maybe_add_mask(attn, attn_bias)
-    except (ImportError, AttributeError):
-        if attn_mask is not None:
-            attn = attn + attn_mask
-        if is_causal:
-            mask = torch.triu(
-                torch.full(
-                    (N, N), float("-inf"), device=attn.device, dtype=attn.dtype
-                ),
-                diagonal=1,
-            )
-            attn = attn + mask
-
-    attn = attn.softmax(dim=-1)
-    attn = self.attn_drop(attn)
-    if matmul_factor_2_rule:
-        x = matmul_factor_2(attn, v, epsilon=epsilon, signed=signed_epsilon)
-    else:
-        x = attn @ v
-
-    x = x.transpose(1, 2).reshape(B, N, C)
-    if hasattr(self, "norm"):
-        x = self.norm(x)
-    x = self.attn_out_tap(x)            # ← output-side hook tap
-    x = self.proj(x)
-    x = self.proj_drop(x)
-    return x
+# NOTE: ``_eva_attention_forward`` was removed in the unfolding refactor.
+# Eva attention is now handled by :class:`crp.attention_unfolded.EvaAttentionUnfolded`
+# + :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`. The
+# substitution path replaces the entire ``EvaAttention`` module with a
+# subgraph of named ``nn.Module`` kernels (``BilinearMatmul``,
+# ``SoftmaxAlongLastDim``, ``RotaryEmbedding``, etc.), each owning one
+# LRP rule. See ``UNFOLDING_ATTENTION_REFACTOR.md`` and
+# ``RESEARCH_NOTES.md`` Entries 4-6.
 
 
 def _timm_attention_forward(
     self, x, attn_mask=None, is_causal=False,
-    *, matmul_factor_2_rule: bool = False, signed_epsilon: bool = False,
-    epsilon: float = 1e-6,
+    *, matmul_factor_2_rule: bool = False, epsilon: float = 1e-6,
 ):
-    """timm ``Attention.forward`` replacement for AttnLRP + concept hooking.
+    """timm ``Attention.forward`` replacement for AttnLRP on standard timm
+    ViTs (vit_base, vit_small, etc.).
 
     Tracks the upstream timm signature ``(self, x, attn_mask=None,
     is_causal=False)`` so it remains a drop-in across timm ≥ 1.0.
 
-    Differences from upstream timm forward:
+    Differences from the upstream forward:
 
-    * Routes ``self.qkv(x)`` through ``self.qkv_tap`` and the per-head
-      attention output through ``self.attn_out_tap`` — both ``nn.Identity``
-      submodules installed by :class:`AttentionTapsCanonizer`.
     * Q, K, V each pass through :func:`divide_gradient` (factors 4, 4, 2) —
       AttnLRP uniform rule on the ``QKᵀ`` and ``attn·V`` bilinears
       (Eq. 14–15 of arXiv:2402.05602). Skipped when
-      ``matmul_factor_2_rule`` is enabled — see :func:`_eva_attention_forward`.
+      ``matmul_factor_2_rule`` is enabled (the rule's ``2y+ε`` denominator
+      handles the bilinear conservation directly).
     * Bypasses the fused ``F.scaled_dot_product_attention`` path so the
       autograd graph contains the explicit softmax + matmul ops where the
       rules apply.
+
+    Concept-conditioning on standard timm ViTs is not supported by this
+    forward — the unfolded path (``EvaAttentionUnfolded`` +
+    substitution canonizer) is the supported route for concept work.
+    Use this forward when running plain attribution on a standard timm
+    ViT without per-head conditioning.
     """
     B, N, _ = x.shape
     qkv_flat = self.qkv(x)
-    qkv_flat = self.qkv_tap(qkv_flat)
     qkv = qkv_flat.reshape(B, N, 3, self.num_heads, self.head_dim).permute(
         2, 0, 3, 1, 4
     )
@@ -431,7 +330,7 @@ def _timm_attention_forward(
 
     q = q * self.scale
     if matmul_factor_2_rule:
-        attn = matmul_factor_2(q, k.transpose(-2, -1), epsilon=epsilon, signed=signed_epsilon)
+        attn = matmul_factor_2(q, k.transpose(-2, -1), epsilon=epsilon)
     else:
         attn = q @ k.transpose(-2, -1)
 
@@ -456,7 +355,7 @@ def _timm_attention_forward(
     attn = attn.softmax(dim=-1)
     attn = self.attn_drop(attn)
     if matmul_factor_2_rule:
-        x = matmul_factor_2(attn, v, epsilon=epsilon, signed=signed_epsilon)
+        x = matmul_factor_2(attn, v, epsilon=epsilon)
     else:
         x = attn @ v
 
@@ -464,7 +363,6 @@ def _timm_attention_forward(
     x = x.transpose(1, 2).reshape(B, N, out_dim)
     if hasattr(self, "norm"):
         x = self.norm(x)
-    x = self.attn_out_tap(x)
     x = self.proj(x)
     x = self.proj_drop(x)
     return x
@@ -606,74 +504,12 @@ def vit_pos_embed_palrp(self, x):
 # ─── 4. Canonizers — one class per kind of model graph mutation ─────────────
 
 
-_TAPS = ("qkv_tap", "attn_out_tap")
-
-
-class AttentionTapsCanonizer(Canonizer):
-    """Inject ``qkv_tap`` and ``attn_out_tap`` (both ``nn.Identity``) into
-    every timm-style ``Attention`` submodule.
-
-    Detection: presence of ``qkv`` (a ``nn.Linear``), ``num_heads``,
-    ``head_dim``.
-
-    Both taps are named hook points consumed by
-    :mod:`crp.attention_concepts`:
-
-    * ``qkv_tap`` lives between ``Linear(D, 3D)`` and the K/Q/V split,
-      shape ``(B, N, 3D)``.
-    * ``attn_out_tap`` lives between the per-head attention output (after
-      ``attn @ v``, optional post-attention norm) and ``proj``, shape
-      ``(B, N, D)``.
-
-    Registers on ``apply``, removes on :meth:`remove` (so the model is
-    reverted when ``composite.context()`` exits). User-pre-injected taps
-    are respected and not auto-removed.
-    """
-
-    def __init__(self):
-        self.module: Optional[nn.Module] = None
-        # Tracks which of the named taps THIS instance added (so remove()
-        # only deletes the ones it created, not any pre-injected by the user).
-        self._added: List[str] = []
-
-    def apply(self, root_module):
-        instances = []
-        for _name, module in root_module.named_modules():
-            if (
-                hasattr(module, "qkv")
-                and isinstance(getattr(module, "qkv"), nn.Linear)
-                and hasattr(module, "num_heads")
-                and hasattr(module, "head_dim")
-            ):
-                inst = self.copy()
-                inst.register(module)
-                instances.append(inst)
-        return instances
-
-    def register(self, module):
-        self.module = module
-        self._added = []
-        for tap_name in _TAPS:
-            existing = getattr(module, tap_name, None)
-            if isinstance(existing, nn.Identity):
-                continue
-            module.add_module(tap_name, nn.Identity())
-            self._added.append(tap_name)
-
-    def remove(self):
-        if self.module is None:
-            return
-        for tap_name in self._added:
-            if tap_name in self.module._modules:
-                del self.module._modules[tap_name]
-        self._added = []
-
-    def copy(self):
-        return type(self)()
-
-
-# Back-compat alias: pre-iter-10 code referenced ``QKVTapCanonizer``.
-QKVTapCanonizer = AttentionTapsCanonizer
+# NOTE: ``AttentionTapsCanonizer`` was removed in the unfolding refactor.
+# The qkv_tap / attn_out_tap Identity submodules it injected are no
+# longer needed — concepts target the named submodules of
+# :class:`crp.attention_unfolded.EvaAttentionUnfolded` directly. Concept
+# work on standard timm ViTs (without unfolding) is unsupported; only
+# attribution still works there.
 
 
 def _bind_forward(module: nn.Module, fn: Callable, attr: str = "forward") -> dict:
@@ -706,21 +542,16 @@ class GELUIdentityRuleCanonizer(AttributeCanonizer):
     """Canonizer that routes ``nn.GELU`` through :class:`_IdentityRuleFn`.
 
     AttnLRP §3.2.2 — element-wise non-linearities use the identity rule
-    (relevance flows back through the input/output ratio).
+    (relevance flows through ``output / stab(output)``, ≈ ``R_y`` for
+    active activations and ≈ 0 for inactive).
 
     Parameters
     ----------
-    signed_epsilon : bool
-        When True, use sign-aware ε (``input + ε·sign(input)``) in the
-        identity rule's stabiliser instead of plain ``input + ε``.
-        AttnLRP Eq. 16. Default False (back-compat with the existing
-        baseline composite).
     epsilon : float
         Stabiliser magnitude. Default ``1e-6``.
     """
 
-    def __init__(self, *, signed_epsilon: bool = False, epsilon: float = 1e-6):
-        self.signed_epsilon = signed_epsilon
+    def __init__(self, *, epsilon: float = 1e-6):
         self.epsilon = epsilon
         super().__init__(self._attribute_map)
 
@@ -728,19 +559,17 @@ class GELUIdentityRuleCanonizer(AttributeCanonizer):
         if not isinstance(module, nn.GELU):
             return None
         original_forward = type(module).forward
-        signed = self.signed_epsilon
         eps = self.epsilon
 
         def patched(self, x):
             return identity_rule_implicit(
-                lambda inp: original_forward(self, inp), x,
-                epsilon=eps, signed=signed,
+                lambda inp: original_forward(self, inp), x, epsilon=eps,
             )
 
         return _bind_forward(module, patched)
 
     def copy(self):
-        return type(self)(signed_epsilon=self.signed_epsilon, epsilon=self.epsilon)
+        return type(self)(epsilon=self.epsilon)
 
 
 class DropoutPassthroughCanonizer(AttributeCanonizer):
@@ -769,19 +598,14 @@ class TimmAttentionForwardCanonizer(AttributeCanonizer):
         When True, use :class:`_MatmulFactor2Fn` on the ``QKᵀ`` and
         ``attn·V`` bilinears (AttnLRP Prop. 3.3) and skip the
         operand-side ``divide_gradient(q,4)/(k,4)/(v,2)`` calls.
-    signed_epsilon : bool
-        When True with ``matmul_factor_2_rule``, use sign-aware ε in the
-        bilinear stabiliser (AttnLRP Eq. 16).
     epsilon : float
         ε magnitude when ``matmul_factor_2_rule`` is enabled.
     """
 
     def __init__(
-        self, *, matmul_factor_2_rule: bool = False,
-        signed_epsilon: bool = False, epsilon: float = 1e-6,
+        self, *, matmul_factor_2_rule: bool = False, epsilon: float = 1e-6,
     ):
         self.matmul_factor_2_rule = matmul_factor_2_rule
-        self.signed_epsilon = signed_epsilon
         self.epsilon = epsilon
         super().__init__(self._attribute_map)
 
@@ -793,13 +617,12 @@ class TimmAttentionForwardCanonizer(AttributeCanonizer):
         if not isinstance(module, TimmAttention):
             return None
         m2 = self.matmul_factor_2_rule
-        sgn = self.signed_epsilon
         eps = self.epsilon
 
         def fwd(self, x, attn_mask=None, is_causal=False):
             return _timm_attention_forward(
                 self, x, attn_mask=attn_mask, is_causal=is_causal,
-                matmul_factor_2_rule=m2, signed_epsilon=sgn, epsilon=eps,
+                matmul_factor_2_rule=m2, epsilon=eps,
             )
 
         return _bind_forward(module, fwd)
@@ -807,67 +630,13 @@ class TimmAttentionForwardCanonizer(AttributeCanonizer):
     def copy(self):
         return type(self)(
             matmul_factor_2_rule=self.matmul_factor_2_rule,
-            signed_epsilon=self.signed_epsilon,
             epsilon=self.epsilon,
         )
 
 
-class EvaAttentionForwardCanonizer(AttributeCanonizer):
-    """Canonizer that swaps ``forward`` on timm ``eva.EvaAttention`` (used by
-    DINOv3 / EVA / BEiT-style models) for :func:`_eva_attention_forward`.
-
-    Parameters
-    ----------
-    matmul_factor_2_rule : bool
-        See :class:`TimmAttentionForwardCanonizer`.
-    rope_detach : bool
-        When True, ``rope.detach()`` before applying the rotary
-        embedding. RoPE has no learnable parameters (Su et al. 2021,
-        arXiv:2104.09864) so cos/sin can be treated as graph constants.
-    signed_epsilon : bool
-        See :class:`TimmAttentionForwardCanonizer`.
-    epsilon : float
-        ε magnitude when ``matmul_factor_2_rule`` is enabled.
-    """
-
-    def __init__(
-        self, *, matmul_factor_2_rule: bool = False, rope_detach: bool = False,
-        signed_epsilon: bool = False, epsilon: float = 1e-6,
-    ):
-        self.matmul_factor_2_rule = matmul_factor_2_rule
-        self.rope_detach = rope_detach
-        self.signed_epsilon = signed_epsilon
-        self.epsilon = epsilon
-        super().__init__(self._attribute_map)
-
-    def _attribute_map(self, _name, module):
-        try:
-            from timm.models.eva import EvaAttention
-        except ImportError:
-            return None
-        if not isinstance(module, EvaAttention):
-            return None
-        m2 = self.matmul_factor_2_rule
-        rd = self.rope_detach
-        sgn = self.signed_epsilon
-        eps = self.epsilon
-
-        def fwd(self, x, rope=None, attn_mask=None, is_causal=False):
-            return _eva_attention_forward(
-                self, x, rope=rope, attn_mask=attn_mask, is_causal=is_causal,
-                matmul_factor_2_rule=m2, rope_detach=rd,
-                signed_epsilon=sgn, epsilon=eps,
-            )
-
-        return _bind_forward(module, fwd)
-
-    def copy(self):
-        return type(self)(
-            matmul_factor_2_rule=self.matmul_factor_2_rule,
-            rope_detach=self.rope_detach,
-            signed_epsilon=self.signed_epsilon,
-            epsilon=self.epsilon,
-        )
+# NOTE: ``EvaAttentionForwardCanonizer`` was removed in the unfolding
+# refactor. Eva attention is now handled by
+# :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`.
 
 
 class TimmBlockResidualCanonizer(AttributeCanonizer):
@@ -995,30 +764,53 @@ class VitPosEmbedPALRPCanonizer(AttributeCanonizer):
 
 
 class TimmViTCanonizer(CompositeCanonizer):
-    """Aggregator: bundles all single-responsibility canonizers needed for
-    AttnLRP on a timm ViT (standard or Eva-stack).
+    """Aggregator: bundles the per-module canonizers needed for AttnLRP on
+    a timm ViT (standard or Eva-stack).
 
     Combines:
 
-    * :class:`AttentionTapsCanonizer`
-    * :class:`LayerNormForwardCanonizer`
-    * :class:`GELUIdentityRuleCanonizer`
-    * :class:`DropoutPassthroughCanonizer`
-    * :class:`TimmAttentionForwardCanonizer` and
-      :class:`EvaAttentionForwardCanonizer` (each only fires on its own
-      module type, so safe to install both)
-    * :class:`VitPosEmbedPALRPCanonizer` (when ``palrp=True``)
+    * :class:`LayerNormForwardCanonizer` — LayerNorm with stop-gradient(std).
+    * :class:`GELUIdentityRuleCanonizer` — AttnLRP identity rule on GELU.
+    * :class:`DropoutPassthroughCanonizer` — disable Dropout for backward.
+    * :class:`TimmAttentionForwardCanonizer` — standard timm Attention
+      forward replacement (vit_base / vit_small / vit_tiny).
+    * :class:`VitPosEmbedPALRPCanonizer` (when ``palrp=True``) — PA-LRP on
+      the ``x + pos_embed`` step (Bakish et al. 2025).
     * :class:`TimmBlockResidualCanonizer` and
-      :class:`EvaBlockResidualCanonizer` (when ``residual_lrp`` is set)
+      :class:`EvaBlockResidualCanonizer` (when ``residual_lrp`` is set) —
+      ratio or symmetric residual rule.
 
-    All mutations are instance-level and reversible. Bundled into the
-    named composites below; pass it explicitly to other composites if you
-    want a custom rule map.
+    Eva attention itself (the bilinear path inside ``EvaAttention``) is NOT
+    handled here. Use
+    :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`
+    alongside this aggregator to substitute Eva attention modules with the
+    unfolded variant. The composites below
+    (:class:`AttnLRPCombinedComposite` etc.) install the substitution
+    canonizer automatically when needed.
 
-    The remedy-flag parameters (``matmul_factor_2_rule`` etc.) propagate
-    to the relevant per-module canonizer. Each is also exposed as a
-    standalone composite — use those instead of toggling here unless
-    deliberately combining several remedies.
+    All mutations are instance-level and reversible (revert on
+    ``composite.context()`` exit).
+
+    Parameters
+    ----------
+    palrp : bool
+        Enable PA-LRP on the absolute pos_embed addition. Only relevant
+        for ViTs with ``self.pos_embed`` (vit_base etc.); no-op for
+        DINOv3 (RoPE only).
+    residual_lrp : {None, 'symmetric', 'ratio'}
+        Block-level residual rule. ``'ratio'`` is the recommended
+        default for transformers; ``'symmetric'`` matches the ResNet
+        AttnLRP paper baseline.
+    matmul_factor_2_rule : bool
+        Pass-through to the standard-timm attention forward (turns on
+        the AttnLRP Prop 3.3 ``2y+ε`` denominator on the QKᵀ and attn·V
+        bilinears). Eva attention's bilinear rule is set on the
+        substitution canonizer instead.
+    layerscale_uniform : bool
+        Apply the uniform allocation rule to LayerScale γ
+        multiplications (CaiT / Eva blocks only).
+    epsilon : float
+        ε for ε-stabilised rules.
     """
 
     def __init__(
@@ -1027,25 +819,15 @@ class TimmViTCanonizer(CompositeCanonizer):
         palrp: bool = False,
         residual_lrp: Optional[str] = None,
         matmul_factor_2_rule: bool = False,
-        rope_detach: bool = False,
-        signed_epsilon: bool = False,
         layerscale_uniform: bool = False,
         epsilon: float = 1e-6,
     ):
         canonizers: List[Canonizer] = [
-            AttentionTapsCanonizer(),
             LayerNormForwardCanonizer(),
-            GELUIdentityRuleCanonizer(signed_epsilon=signed_epsilon, epsilon=epsilon),
+            GELUIdentityRuleCanonizer(epsilon=epsilon),
             DropoutPassthroughCanonizer(),
             TimmAttentionForwardCanonizer(
                 matmul_factor_2_rule=matmul_factor_2_rule,
-                signed_epsilon=signed_epsilon,
-                epsilon=epsilon,
-            ),
-            EvaAttentionForwardCanonizer(
-                matmul_factor_2_rule=matmul_factor_2_rule,
-                rope_detach=rope_detach,
-                signed_epsilon=signed_epsilon,
                 epsilon=epsilon,
             ),
         ]
@@ -1058,9 +840,9 @@ class TimmViTCanonizer(CompositeCanonizer):
                 layerscale_uniform=layerscale_uniform,
             ))
         elif layerscale_uniform:
-            # User asked for layerscale_uniform but didn't pick a residual rule;
-            # default to ratio so the EvaBlock forward gets installed (the
-            # layerscale_uniform wrapper lives inside that forward).
+            # User asked for layerscale_uniform but didn't pick a residual
+            # rule; default to ratio so the EvaBlock forward gets installed
+            # (the layerscale_uniform wrapper lives inside that forward).
             canonizers.append(EvaBlockResidualCanonizer(
                 residual_rule="ratio", layerscale_uniform=True,
             ))
@@ -1070,41 +852,15 @@ class TimmViTCanonizer(CompositeCanonizer):
 # ─── 5. Hooks — LRP backward for Linear / Conv2d ─────────────────────────────
 #
 # We use zennit's stock :class:`zennit.rules.Epsilon` and
-# :class:`zennit.rules.Gamma` directly. The previous version of this module
-# shipped a ``GradientTimesInputBasicHook`` subclass that pre-multiplied
-# ``grad_output`` by the layer's output and post-divided the returned
-# relevance by ``stabilize(input)`` — neither of those factors is part of the
-# LRP-ε rule (Bach et al. 2015; Montavon et al. 2019,
-# iphome.hhi.de/samek/pdf/MonXAI19.pdf). The conservation audit in
-# ``experiments/audit_gti_hook.py`` confirmed the discrepancy: standard
-# ``Epsilon`` gives sum(R_in)/sum(R_out) ≈ 1 + O(ε), the GTI hook gave
-# −2.1 (i.e. 210 % deviation) on ordinary inputs, blowing up further
-# whenever input components were near ε. The thin aliases below preserve
-# the public symbol names (back-compat with existing imports / tests).
+# :class:`zennit.rules.Gamma` directly. The previous version shipped a
+# ``GradientTimesInputBasicHook`` subclass under names ``GTIEpsilon`` /
+# ``GTIGamma`` that violated conservation by 100-200% on ordinary inputs
+# (audited in ``experiments/audit_gti_hook.py``); those names were
+# removed in the unfolding-refactor cleanup. Use ``zennit.rules.Epsilon``
+# and ``zennit.rules.Gamma`` directly.
 
 
-class GTIEpsilon(Epsilon):
-    """**Deprecated alias** for :class:`zennit.rules.Epsilon`.
-
-    Earlier versions of this module shipped a custom
-    ``GradientTimesInputBasicHook`` subclass under this name with a
-    rule that did *not* match LRP-ε and violated conservation by 100×
-    on ordinary inputs (audited in ``experiments/audit_gti_hook.py``).
-    Now a thin alias for zennit's stock ε-LRP rule. Kept for back-compat;
-    new code should import :class:`zennit.rules.Epsilon` directly.
-    """
-
-
-class GTIGamma(Gamma):
-    """**Deprecated alias** for :class:`zennit.rules.Gamma`.
-
-    Same story as :class:`GTIEpsilon`: previously a buggy GTI subclass,
-    now a thin alias for zennit's stock γ-LRP rule. AttnLRP §3.2.1
-    recommends γ ≈ 0.25 on ViT linears.
-    """
-
-
-# ─── 6. Composites — one per remedy / recipe ─────────────────────────────────
+# ─── 6. Composites — one per recipe (3 total after cleanup) ──────────────────
 
 
 def _epsilon_layer_map(epsilon: float):
@@ -1199,168 +955,64 @@ class AttnLRPGammaComposite(LayerMapComposite):
         )
 
 
-class AttnLRPMatmulFactor2Composite(AttnLRPEpsilonComposite):
-    """AttnLRP-ε with the bilinear matmul rule from Achtibat et al. Prop. 3.3
-    enabled (the ``2·Y + ε`` stabiliser on ``QKᵀ`` and ``attn·V``).
-
-    Drops the operand-side ``divide_gradient(q,4)/(k,4)/(v,2)`` calls in
-    favour of the AttnLRP rule's output-side stabilisation. See
-    :class:`_MatmulFactor2Fn`. Identical to :class:`AttnLRPEpsilonComposite`
-    in every other respect.
-
-    Reference: Achtibat et al. ICML 2024, arXiv:2402.05602, Proposition 3.3
-    and Eq. 14.
-    """
-
-    def __init__(
-        self, epsilon: float = 1e-6, canonizers=None, *,
-        palrp: bool = False, residual_lrp: Optional[str] = None,
-    ):
-        canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
-                palrp=palrp, residual_lrp=residual_lrp,
-                matmul_factor_2_rule=True, epsilon=epsilon,
-            ),
-        ]
-        # Skip the parent constructor's canonizer wiring; install our own.
-        LayerMapComposite.__init__(
-            self, layer_map=_epsilon_layer_map(epsilon), canonizers=canonizers,
-        )
-
-
-class AttnLRPSignedEpsilonComposite(AttnLRPEpsilonComposite):
-    """AttnLRP-ε with sign-aware ε in the identity rule (and the matmul rule
-    if a future composite combines them).
-
-    The identity rule's stabiliser becomes ``input + ε·sign(input)``
-    instead of ``input + ε``, preserving sign behaviour around zero
-    crossings (AttnLRP Eq. 16, arXiv:2402.05602).
-    """
-
-    def __init__(
-        self, epsilon: float = 1e-6, canonizers=None, *,
-        palrp: bool = False, residual_lrp: Optional[str] = None,
-    ):
-        canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
-                palrp=palrp, residual_lrp=residual_lrp,
-                signed_epsilon=True, epsilon=epsilon,
-            ),
-        ]
-        LayerMapComposite.__init__(
-            self, layer_map=_epsilon_layer_map(epsilon), canonizers=canonizers,
-        )
-
-
-class AttnLRPRopeDetachComposite(AttnLRPEpsilonComposite):
-    """AttnLRP-ε with the RoPE rotary embedding detached from the autograd
-    graph (RoFormer; Su et al. 2021, arXiv:2104.09864).
-
-    No effect on models without RoPE — the canonizer only fires on
-    ``timm.models.eva.EvaAttention`` and the detach happens inside the
-    rope-application branch (no rope, no detach).
-    """
-
-    def __init__(
-        self, epsilon: float = 1e-6, canonizers=None, *,
-        palrp: bool = False, residual_lrp: Optional[str] = None,
-    ):
-        canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
-                palrp=palrp, residual_lrp=residual_lrp,
-                rope_detach=True, epsilon=epsilon,
-            ),
-        ]
-        LayerMapComposite.__init__(
-            self, layer_map=_epsilon_layer_map(epsilon), canonizers=canonizers,
-        )
-
-
-class AttnLRPLayerScaleUniformComposite(AttnLRPEpsilonComposite):
-    """AttnLRP-ε with the uniform allocation rule on the LayerScale γ
-    multiplications inside ``EvaBlock``.
-
-    The ``γ·branch`` step is wrapped in :func:`divide_gradient(., 2)` so
-    γ (a learned scalar with no upstream input) absorbs half the relevance
-    by the AttnLRP uniform rule (Eq. 7 of arXiv:2402.05602). LayerScale
-    introduced by Touvron et al. (CaiT, arXiv:2103.17239); without
-    explicit handling it acts as a transparent multiplier and shrinks the
-    branch's relevance by the small initial value of γ (1e-4 to 1e-5).
-
-    This composite installs the residual rule too (defaults to ``'ratio'``)
-    because the LayerScale wrapper lives inside the block-forward
-    replacement.
-    """
-
-    def __init__(
-        self, epsilon: float = 1e-6, canonizers=None, *,
-        palrp: bool = False, residual_lrp: Optional[str] = "ratio",
-    ):
-        canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
-                palrp=palrp, residual_lrp=residual_lrp,
-                layerscale_uniform=True, epsilon=epsilon,
-            ),
-        ]
-        LayerMapComposite.__init__(
-            self, layer_map=_epsilon_layer_map(epsilon), canonizers=canonizers,
-        )
-
-
-class AttnLRPLinearGammaComposite(AttnLRPGammaComposite):
-    """Conservative variant of :class:`AttnLRPGammaComposite` with γ=0.05
-    on ``nn.Linear`` instead of the AttnLRP-paper default γ=0.25.
-
-    Smaller γ shifts the rule toward ε-LRP — useful when the standard γ
-    inflates relevance on deep stacks (we have observed ~10¹⁶ inflation
-    on vit_base under γ=0.25 with the milestone-A audit pipeline).
-    """
-
-    def __init__(
-        self, gamma: float = 0.05, epsilon: float = 1e-6, canonizers=None, *,
-        palrp: bool = False, residual_lrp: Optional[str] = None,
-    ):
-        super().__init__(
-            gamma=gamma, epsilon=epsilon, canonizers=canonizers,
-            palrp=palrp, residual_lrp=residual_lrp,
-        )
-
-
 class AttnLRPCombinedComposite(LayerMapComposite):
-    """Combine multiple already-validated remedies into one composite.
+    """Combination composite — the canonical recipe-builder for AttnLRP.
 
-    Use this **after** each remedy has been individually evaluated with its
-    dedicated composite class — it's the single composite whose
-    responsibility is "express a deliberate combination". Toggles here are
-    therefore appropriate (the responsibility of this class is precisely
-    to compose).
+    Combines individually-validated rules into one composite. The choice
+    of which rules to enable is the user's, made via constructor flags.
+    For Eva-stack models (DINOv3 etc.), the unfolded attention path is
+    installed automatically when ``use_unfolded_attention`` is True
+    (the default), giving access to the AlphaBeta-on-bilinear rule.
 
     Parameters
     ----------
     matmul_factor_2 : bool
-        Enable :class:`_MatmulFactor2Fn` (see
-        :class:`AttnLRPMatmulFactor2Composite`).
-    signed_epsilon : bool
-        Enable sign-aware ε in the identity rule and the matmul rule (see
-        :class:`AttnLRPSignedEpsilonComposite`).
-    rope_detach : bool
-        Detach RoPE (see :class:`AttnLRPRopeDetachComposite`).
+        Enable :class:`_MatmulFactor2Fn` (AttnLRP Prop 3.3 ``2y+ε``
+        bilinear rule). When ``use_unfolded_attention`` is True, this
+        applies to the unfolded ``BilinearMatmul`` modules; otherwise to
+        the in-place ``_timm_attention_forward`` for standard timm ViTs.
+    use_unfolded_attention : bool
+        Install :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`
+        to substitute Eva attention modules with the unfolded variant.
+        Required for AlphaBeta-on-bilinear, concept conditioning, and the
+        per-rule conservation probes. Default True. Set False to fall
+        back to the legacy in-place forward (no concept support).
+    alpha, beta : float
+        AlphaBeta-on-bilinear hyperparameters (Bach 2015 generalised to
+        bilinear; see ``RESEARCH_NOTES.md`` Entry 6). Used only when
+        ``use_unfolded_attention`` is True. ``α + β = 1`` for exact
+        conservation. Common choices:
+
+        * ``α=0.5, β=0.5`` — balanced; tightest magnitude control.
+        * ``α=1, β=0`` — z+ rule (positive only); slightly looser.
+        * ``α=2, β=-1`` — Bach's classical "alpha2beta1"; amplifies
+          positive evidence, suppresses negative.
+
+        When the matmul rule is set to AlphaBeta (the default for
+        unfolded), these select the variant. Defaults below match the
+        recommended ``α=0.5, β=0.5``.
     layerscale_uniform : bool
-        Uniform rule on LayerScale (see
-        :class:`AttnLRPLayerScaleUniformComposite`).
+        Uniform allocation rule on the LayerScale γ multiplication
+        (CaiT / Eva blocks).
     linear_gamma : float | None
-        If non-None, use γ-LRP on Linears with this γ instead of ε-LRP.
-        Recommended ≤0.25 per AttnLRP §3.2.1.
+        If non-None, use γ-LRP on Linears with this γ value instead of
+        ε-LRP. Recommended ≤0.25 per AttnLRP §3.2.1.
     epsilon : float
-        ε for the LRP rule denominators. Default 1e-6.
-    palrp, residual_lrp : as elsewhere.
+        ε for ε-stabilised rules. Default 1e-6.
+    palrp : bool
+        PA-LRP on the ``x + pos_embed`` step (Bakish et al. 2025).
+        Only relevant for ViTs with absolute pos_embed; no-op on DINOv3
+        (RoPE only).
+    residual_lrp : {None, 'symmetric', 'ratio'}
+        Block-level residual rule. ``'ratio'`` recommended.
     """
 
     def __init__(
         self, *,
         matmul_factor_2: bool = False,
-        signed_epsilon: bool = False,
-        rope_detach: bool = False,
+        use_unfolded_attention: bool = True,
+        alpha: float = 0.5,
+        beta: float = 0.5,
         layerscale_uniform: bool = False,
         linear_gamma: Optional[float] = None,
         epsilon: float = 1e-6,
@@ -1373,31 +1025,38 @@ class AttnLRPCombinedComposite(LayerMapComposite):
         canonizers = list(canonizers or []) + [
             TimmViTCanonizer(
                 palrp=palrp, residual_lrp=residual_lrp,
-                matmul_factor_2_rule=matmul_factor_2,
-                rope_detach=rope_detach,
-                signed_epsilon=signed_epsilon,
+                # The standard-timm forward path uses matmul_factor_2 only
+                # via this flag — Eva forward (when unfolded) is set below.
+                matmul_factor_2_rule=matmul_factor_2 and not use_unfolded_attention,
                 layerscale_uniform=layerscale_uniform,
                 epsilon=epsilon,
             ),
         ]
+        if use_unfolded_attention:
+            # Lazy import to avoid the cycle:
+            # transformer_patches → attention_unfolded → transformer_patches.
+            from crp.attention_unfolded import EvaAttentionSubstitutionCanonizer
+            # When matmul_factor_2 is True, use the AlphaBeta variant of the
+            # bilinear rule (with the user's α/β); otherwise fall back to
+            # the AttnLRP Prop 3.3 ``2y+ε`` rule.
+            if matmul_factor_2:
+                # AlphaBeta is the new default winning bilinear rule.
+                substitution = EvaAttentionSubstitutionCanonizer(
+                    block_indices=None,  # all blocks
+                    matmul_rule="alpha_beta", alpha=alpha, beta=beta,
+                    epsilon=epsilon,
+                )
+            else:
+                substitution = EvaAttentionSubstitutionCanonizer(
+                    block_indices=None,
+                    matmul_rule="matmul_factor_2", epsilon=epsilon,
+                )
+            canonizers.append(substitution)
         if linear_gamma is not None:
             layer_map = _gamma_layer_map(linear_gamma, epsilon)
         else:
             layer_map = _epsilon_layer_map(epsilon)
         super().__init__(layer_map=layer_map, canonizers=canonizers)
-
-
-# ─── 7. Public-name aliases for the underscored helper forwards ──────────────
-#
-# Pre-restructure (when there was no remedies system) these were the public
-# entry points for advanced users wanting to install a custom forward. We keep
-# the names exported but mark them as advanced — the canonizer classes are the
-# preferred API.
-
-timm_attention_forward = _timm_attention_forward
-eva_attention_forward = _eva_attention_forward
-eva_block_forward = _eva_block_forward
-timm_block_forward = _timm_block_forward
 
 
 __all__ = [
@@ -1415,33 +1074,18 @@ __all__ = [
     # forward replacements (advanced; canonizers install them automatically)
     "layer_norm_forward",
     "dropout_passthrough_forward",
-    "timm_attention_forward",
-    "eva_attention_forward",
-    "timm_block_forward",
-    "eva_block_forward",
     "vit_pos_embed_palrp",
     # canonizers (one per kind of mutation)
-    "AttentionTapsCanonizer",
-    "QKVTapCanonizer",  # back-compat alias
     "LayerNormForwardCanonizer",
     "GELUIdentityRuleCanonizer",
     "DropoutPassthroughCanonizer",
     "TimmAttentionForwardCanonizer",
-    "EvaAttentionForwardCanonizer",
     "TimmBlockResidualCanonizer",
     "EvaBlockResidualCanonizer",
     "VitPosEmbedPALRPCanonizer",
     "TimmViTCanonizer",
-    # hooks (deprecated aliases — prefer zennit.rules.Epsilon / .Gamma)
-    "GTIEpsilon",
-    "GTIGamma",
-    # composites
+    # composites (3 total — clean, no remedy-toggle bloat)
     "AttnLRPEpsilonComposite",
     "AttnLRPGammaComposite",
-    "AttnLRPMatmulFactor2Composite",
-    "AttnLRPSignedEpsilonComposite",
-    "AttnLRPRopeDetachComposite",
-    "AttnLRPLayerScaleUniformComposite",
-    "AttnLRPLinearGammaComposite",
     "AttnLRPCombinedComposite",
 ]

@@ -1,432 +1,543 @@
-"""Vision-transformer concept-detector classes for CRP.
+"""Concept classes for conditional attribution on unfolded ViT attention.
 
-There are **two orthogonal granularity dimensions** for an attention block:
+This module defines the *axes of conditioning* exposed by the unfolded
+attention refactor. Each concept class is a thin wrapper around a CRP
+``ChannelConcept`` that:
 
-1. **Where** the relevance is read.
-   * **Output side (default)** — at the per-head pre-projection output tokens
-     ``attn @ v`` (shape ``(B, N, num_heads*head_dim)``). Hooked at the named
-     ``attn.attn_out_tap`` Identity submodule injected by
-     :class:`crp.transformer_patches.AttentionTapsCanonizer`. This treats the
-     attention head as a single concept detector (the standard CRP analogue
-     to a CNN filter).
-   * **K/Q/V side** — at the post-``qkv``-Linear pre-attention pack
-     (shape ``(B, N, 3*num_heads*head_dim)``). Hooked at ``attn.qkv_tap``.
-     Splits each head into three concept detectors, one per
-     query / key / value projection.
+* knows which **named submodule** of :class:`crp.attention_unfolded.EvaAttentionUnfolded`
+  to target (its ``LAYER_SUFFIX``),
+* knows the **shape convention** of that submodule's tensor,
+* implements ``mask`` (zero-out non-selected concepts during attribution
+  backward) and ``attribute`` (per-concept relevance reduction).
 
-2. **Whether the per-head ``head_dim`` axis is split.** Either treat all
-   ``head_dim`` indices within a head as one concept (``head_dim`` summed
-   out), or treat each individual index as its own concept (kept).
+There are **four conditioning points** inside one attention block, each
+with its own concept class:
 
-Crossing these two dimensions gives the four supported concept classes:
+1. **Q / K / V inputs to the bilinears** — :class:`QConcept`,
+   :class:`KConcept`, :class:`VConcept`. Hook the per-head Q (post
+   q_norm + RoPE), K (post k_norm + RoPE), or V (post per-head reshape)
+   tensors of shape ``(B, num_heads, N, head_dim)``. Per-head
+   conditioning by default; per-(head, dim) via ``dim_split=True``.
 
-| class               | tap            | concept id                | ``attribute()`` shape                |
-|---------------------|----------------|---------------------------|--------------------------------------|
-| :class:`HeadConcept`         | ``attn_out_tap`` | ``head``               | ``(B, num_heads)``                  |
-| :class:`HeadDimConcept`      | ``attn_out_tap`` | ``(head, dim)``         | ``(B, num_heads, head_dim)``        |
-| :class:`KQVHeadConcept`      | ``qkv_tap``      | ``(part, head)``        | ``(B, 3, num_heads)``               |
-| :class:`KQVHeadDimConcept`   | ``qkv_tap``      | ``(part, head, dim)``    | ``(B, 3, num_heads, head_dim)``     |
+2. **Post-softmax attention weights** — :class:`AttnWeightConcept`.
+   Hooks the ``softmax`` output of shape ``(B, num_heads, N, N)``.
+   Per (head, query_pos, key_pos) conditioning, or coarser variants.
 
-``part`` is one of ``'q'``, ``'k'``, ``'v'`` (or its int index 0/1/2). All
-classes also accept a flat row-major ``int`` concept id in the layout of
-``attribute()``'s output (after the batch dim), which is what
-:class:`crp.maximization.Maximization` / :class:`crp.visualization.FeatureVisualization`
-pass through when iterating ``argsort``ed indices.
+3. **Per-head context output** — :class:`HeadConcept`. Hooks the
+   ``context`` output (= ``attn @ V``, before the reshape that merges
+   heads back) of shape ``(B, num_heads, N, head_dim)``. This is the
+   "per-head contribution to the attention output" view — the natural
+   CRP analogue to a CNN filter.
 
-All four classes share one base (:class:`_AttentionConcept`); the four
-subclasses differ only in the two boolean flags ``KQV_SPLIT`` and
-``DIM_SPLIT``.
+4. **Post-projection residual contribution** — :class:`AttnOutputConcept`.
+   Hooks the ``proj_drop`` output (= the attention block's contribution
+   to the residual stream, shape ``(B, N, embed_dim)``). Per-channel
+   conditioning. The "OV-circuit-output" view used by the Anthropic
+   mathematical-framework / induction-heads line of work.
+
+All concepts auto-discover their target submodules from the model on
+construction (``concept = HeadConcept(model)``), or layers can be
+registered manually with ``concept.register_layer(name, num_heads,
+head_dim)``.
+
+Naming convention for layer paths: a model with attention modules at
+``blocks.0.attn``, …, ``blocks.23.attn`` (substituted by
+:class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`) will
+expose hookable submodules like ``blocks.6.attn.context``,
+``blocks.6.attn.softmax``, ``blocks.6.attn.rope_q``, etc. The concept
+classes below build the full path as ``f"{attn_name}.{LAYER_SUFFIX}"``.
 """
-
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from crp.concepts import ChannelConcept
 
 
-PART_OFFSETS: Dict[str, int] = {"q": 0, "k": 1, "v": 2}
-PARTS: Tuple[str, ...] = ("q", "k", "v")
+def _find_unfolded_attentions(model: nn.Module):
+    """Yield ``(name, EvaAttentionUnfolded_instance)`` for every unfolded
+    attention submodule in ``model``. Skips modules that haven't been
+    substituted (so concepts are silently no-op on a non-substituted
+    model — call ``register_layer`` explicitly in that case)."""
+    # Lazy import to avoid a hard cycle: attention_concepts → attention_unfolded
+    # → transformer_patches → attention_concepts (via crp/__init__.py).
+    from crp.attention_unfolded import EvaAttentionUnfolded
+    for name, module in model.named_modules():
+        if isinstance(module, EvaAttentionUnfolded):
+            yield name, module
 
 
-def _coerce_part(part: Union[str, int]) -> int:
-    """Normalise a ``part`` argument to its 0/1/2 int index."""
-    if isinstance(part, str):
-        if part not in PART_OFFSETS:
-            raise ValueError(f"part must be one of {tuple(PART_OFFSETS)}; got {part!r}")
-        return PART_OFFSETS[part]
-    if isinstance(part, (int, np.integer)):
-        if not 0 <= int(part) < 3:
-            raise ValueError(f"part-as-int must be in [0,2]; got {part}")
-        return int(part)
-    raise TypeError(f"part must be str or int; got {type(part).__name__}")
+def _resolve_dims(layer_name: str, dims: Dict[str, Tuple[int, int]]) -> Tuple[int, int]:
+    """Return ``(num_heads, head_dim)`` for ``layer_name``, with a
+    parent-prefix fallback so e.g. ``blocks.6.attn.context.subthing``
+    resolves from a registration on ``blocks.6.attn.context``."""
+    if layer_name in dims:
+        return dims[layer_name]
+    parts = layer_name.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        parent = ".".join(parts[:i])
+        if parent in dims:
+            return dims[parent]
+    raise ValueError(
+        f"No attention dims registered for {layer_name!r}. Pass the model "
+        "to the concept constructor, call register_layer(...), or check "
+        "that the model's attention modules have been substituted by "
+        "EvaAttentionSubstitutionCanonizer."
+    )
 
 
-class _AttentionConcept(ChannelConcept):
-    """Shared base for the four ViT attention-concept classes.
+# ─── 1. Per-head concepts (Q, K, V, Head) ────────────────────────────────────
 
-    Subclasses set two class-level booleans:
 
-    * ``KQV_SPLIT`` — if True, the concept lives on the ``qkv_tap`` (last dim
-      ``3*D``) and the concept id has a leading ``part`` axis. If False,
-      lives on ``attn_out_tap`` (last dim ``D``).
-    * ``DIM_SPLIT`` — if True, the per-head ``head_dim`` axis is split into
-      individual concepts; if False, summed out per head.
+class _PerHeadAttentionConcept(ChannelConcept):
+    """Shared base for concepts on per-head tensors of shape
+    ``(B, num_heads, N, head_dim)``.
 
-    See the module docstring for the resulting ``(class, tap, shape)``
-    matrix.
+    Subclasses set:
+
+    * ``LAYER_SUFFIX`` — the named submodule of
+      :class:`EvaAttentionUnfolded` to target (e.g. ``"context"``,
+      ``"rope_q"``, ``"v_id"``).
+
+    Construction-time flag:
+
+    * ``dim_split`` — if ``False`` (default), one concept per attention
+      head; if ``True``, one concept per ``(head, dim)`` pair.
+
+    Concept id encoding:
+    * with ``dim_split=False``: ``int head_id`` or ``(head_id,)``;
+      ``attribute()`` returns shape ``(B, num_heads)``.
+    * with ``dim_split=True``: ``(head_id, dim_id)`` tuple or flat
+      row-major ``int`` over ``(num_heads, head_dim)``;
+      ``attribute()`` returns shape ``(B, num_heads, head_dim)``.
     """
 
-    KQV_SPLIT: bool = False
-    DIM_SPLIT: bool = False
+    LAYER_SUFFIX: str = ""  # subclass override
 
-    def __init__(self, model: torch.nn.Module = None) -> None:
-        # layer_name -> (num_heads, head_dim).
-        self._layer_dims: Dict[str, Tuple[int, int]] = {}
+    def __init__(self, model: Optional[nn.Module] = None, *, dim_split: bool = False):
+        self.dim_split = bool(dim_split)
+        # layer_name -> (num_heads, head_dim)
+        self._dims: Dict[str, Tuple[int, int]] = {}
         if model is not None:
-            self.register_from_model(model)
-
-    # ── tap name (subclass-driven) ────────────────────────────────────────────
-
-    @property
-    def tap_name(self) -> str:
-        """Suffix the concept's hook tap appears under on each Attention module."""
-        return "qkv_tap" if self.KQV_SPLIT else "attn_out_tap"
-
-    def _expected_last_dim(self, num_heads: int, head_dim: int) -> int:
-        return (3 if self.KQV_SPLIT else 1) * num_heads * head_dim
-
-    # ── registration ──────────────────────────────────────────────────────────
+            for attn_name, attn in _find_unfolded_attentions(model):
+                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
+                    int(attn.num_heads), int(attn.head_dim),
+                )
 
     def register_layer(self, layer_name: str, num_heads: int, head_dim: int) -> None:
-        if not isinstance(num_heads, int) or num_heads <= 0:
-            raise ValueError("num_heads must be a positive integer")
-        if not isinstance(head_dim, int) or head_dim <= 0:
-            raise ValueError("head_dim must be a positive integer")
-        self._layer_dims[layer_name] = (num_heads, head_dim)
+        self._dims[layer_name] = (int(num_heads), int(head_dim))
 
-    def register_from_model(self, model: torch.nn.Module) -> None:
-        """Discover every attention-like submodule in ``model`` and record
-        its ``(num_heads, head_dim)`` under the module's name and under both
-        tap names ``<name>.qkv_tap`` / ``<name>.attn_out_tap``.
+    # ── concept id decode ───────────────────────────────────────────────────
 
-        ``head_dim`` is inferred from a per-module attribute (``head_dim``)
-        or computed from ``embed_dim / num_heads`` if only the embedding
-        size is exposed. Recognises the common ViT/Transformer attribute
-        spellings on timm, HuggingFace, and torchvision attention modules.
-        """
-        head_attrs = ("num_heads", "n_heads", "num_attention_heads")
-        dim_attrs = ("head_dim",)
-        embed_attrs = ("embed_dim", "hidden_dim", "hidden_size", "d_model")
-
-        for name, module in model.named_modules():
-            num_heads = next(
-                (getattr(module, a) for a in head_attrs if hasattr(module, a)),
-                None,
-            )
-            head_dim = next(
-                (getattr(module, a) for a in dim_attrs if hasattr(module, a)),
-                None,
-            )
-            if num_heads is None:
-                continue
-            if head_dim is None:
-                embed = next(
-                    (getattr(module, a) for a in embed_attrs if hasattr(module, a)),
-                    None,
-                )
-                if embed is None or num_heads == 0 or embed % num_heads != 0:
-                    continue
-                head_dim = embed // num_heads
-            if not isinstance(num_heads, int) or not isinstance(head_dim, int):
-                continue
-            self._layer_dims[name] = (num_heads, head_dim)
-            self._layer_dims[f"{name}.qkv_tap"] = (num_heads, head_dim)
-            self._layer_dims[f"{name}.attn_out_tap"] = (num_heads, head_dim)
-
-    def _resolve_dims(self, layer_name: str) -> Tuple[int, int]:
-        """Resolve ``(num_heads, head_dim)`` for ``layer_name`` with a
-        parent-name fallback (so ``blocks.6.attn.attn_out_tap`` resolves
-        from a registration on ``blocks.6.attn``)."""
-        if not layer_name:
-            raise ValueError("layer_name must be provided to resolve attention dims")
-        if layer_name in self._layer_dims:
-            return self._layer_dims[layer_name]
-        parts = layer_name.split(".")
-        for i in range(len(parts) - 1, 0, -1):
-            parent = ".".join(parts[:i])
-            if parent in self._layer_dims:
-                return self._layer_dims[parent]
-        raise ValueError(
-            f"No attention dims registered for layer {layer_name!r}. "
-            "Pass the model to the concept constructor, call "
-            "concept.register_from_model(model), or use concept.register_layer(...)."
-        )
-
-    # ── concept-id decode ─────────────────────────────────────────────────────
-
-    def _axis_sizes(self, num_heads: int, head_dim: int) -> List[int]:
-        """The active axes of this concept's id, row-major. Used both for
-        flat-int decode and for tuple-arity validation."""
-        sizes: List[int] = []
-        if self.KQV_SPLIT:
-            sizes.append(3)
-        sizes.append(num_heads)
-        if self.DIM_SPLIT:
-            sizes.append(head_dim)
-        return sizes
-
-    def _decode_concept_id(
-        self, concept_id, num_heads: int, head_dim: int
-    ) -> Tuple[int, int, int]:
-        """Decode a concept id into ``(part_idx_or_0, head_id, dim_id_or_0)``.
-
-        Accepted forms:
-
-        * Bare ``int`` — flat row-major index across the active axes.
-        * Tuple of int/str matching the active axes' arity. ``part`` may be
-          ``'q'|'k'|'v'`` or its int alias.
-        """
-        sizes = self._axis_sizes(num_heads, head_dim)
-        total = math.prod(sizes)
-
+    def _decode(
+        self, concept_id, num_heads: int, head_dim: int,
+    ) -> Tuple[int, Optional[int]]:
+        """Decode a concept id into ``(head, dim_or_None)``."""
         if isinstance(concept_id, (int, np.integer)):
             flat = int(concept_id)
-            if not 0 <= flat < total:
+            if self.dim_split:
+                total = num_heads * head_dim
+                if not 0 <= flat < total:
+                    raise IndexError(
+                        f"flat concept index {flat} out of range "
+                        f"[0, {total}) for {type(self).__name__}(dim_split=True)"
+                    )
+                head, dim = divmod(flat, head_dim)
+                return head, dim
+            if not 0 <= flat < num_heads:
                 raise IndexError(
-                    f"flat concept index {flat} out of range [0, {total}) for "
-                    f"{type(self).__name__} (axes={sizes})"
+                    f"head index {flat} out of range [0, {num_heads}) for "
+                    f"{type(self).__name__}"
                 )
-            coords: List[int] = []
-            for s in reversed(sizes):
-                coords.append(flat % s)
-                flat //= s
-            coords = list(reversed(coords))
-        elif isinstance(concept_id, (tuple, list)):
-            if len(concept_id) != len(sizes):
+            return flat, None
+        if isinstance(concept_id, (tuple, list)):
+            if self.dim_split:
+                if len(concept_id) != 2:
+                    raise ValueError(
+                        f"{type(self).__name__}(dim_split=True) expects "
+                        f"a 2-tuple (head, dim); got {concept_id!r}"
+                    )
+                head, dim = int(concept_id[0]), int(concept_id[1])
+                if not 0 <= head < num_heads:
+                    raise IndexError(f"head {head} out of [0, {num_heads})")
+                if not 0 <= dim < head_dim:
+                    raise IndexError(f"dim {dim} out of [0, {head_dim})")
+                return head, dim
+            if len(concept_id) != 1:
                 raise ValueError(
-                    f"{type(self).__name__} expects a {len(sizes)}-tuple "
-                    f"(axes={sizes}); got {concept_id!r}"
+                    f"{type(self).__name__} expects a 1-tuple (head,); got {concept_id!r}"
                 )
-            coords = list(concept_id)
-        else:
-            raise ValueError(
-                f"concept id must be int or tuple; got {type(concept_id).__name__} "
-                f"({concept_id!r})"
-            )
+            head = int(concept_id[0])
+            if not 0 <= head < num_heads:
+                raise IndexError(f"head {head} out of [0, {num_heads})")
+            return head, None
+        raise TypeError(
+            f"concept id must be int or tuple; got {type(concept_id).__name__}"
+        )
 
-        # Normalise + range-check axis-by-axis.
-        it = iter(coords)
-        part = _coerce_part(next(it)) if self.KQV_SPLIT else 0
-        head = int(next(it))
-        if not 0 <= head < num_heads:
-            raise IndexError(f"head index {head} out of range [0, {num_heads})")
-        if self.DIM_SPLIT:
-            dim = int(next(it))
-            if not 0 <= dim < head_dim:
-                raise IndexError(f"dim index {dim} out of range [0, {head_dim})")
-        else:
-            dim = 0
-        return part, head, dim
+    # ── mask (zero out non-selected concepts during backward) ───────────────
 
-    def _concept_to_slices(
-        self, concept_id, num_heads: int, head_dim: int
-    ) -> List[slice]:
-        """One slice on the tap tensor's last dim for one concept id.
-
-        Layout of the last dim:
-
-        * ``qkv_tap``: ``[Q[h0..d_h-1], Q[h1...], ..., K[...], V[...]]``
-          — three contiguous ``D``-blocks, each with heads contiguous.
-        * ``attn_out_tap``: ``[head0[d0..d_h-1], head1[...], ...]`` —
-          one ``D``-block, heads contiguous.
-        """
-        part, head, dim = self._decode_concept_id(concept_id, num_heads, head_dim)
-        D = num_heads * head_dim
-        prefix = part * D if self.KQV_SPLIT else 0
-
-        if self.DIM_SPLIT:
-            offset = prefix + head * head_dim + dim
-            return [slice(offset, offset + 1)]
-        offset = prefix + head * head_dim
-        return [slice(offset, offset + head_dim)]
-
-    def _per_token_relevance(
-        self, relevance: torch.Tensor, num_heads: int, head_dim: int
-    ) -> torch.Tensor:
-        """Reshape ``(B, N, last_dim)`` relevance to per-concept-id shape,
-        keeping the token axis ``N`` for downstream sum / argmax."""
-        B, N, _ = relevance.shape
-        if self.KQV_SPLIT:
-            rel = relevance.view(B, N, 3, num_heads, head_dim)
-        else:
-            rel = relevance.view(B, N, num_heads, head_dim)
-        if not self.DIM_SPLIT:
-            rel = rel.sum(dim=-1)
-        return rel
-
-    # ── mask ──────────────────────────────────────────────────────────────────
-
-    def mask(self, batch_id: int, concept_ids: List, layer_name: str = None):
-        num_heads, head_dim = self._resolve_dims(layer_name)
-        d_total = self._expected_last_dim(num_heads, head_dim)
-
-        slice_list: List[slice] = []
-        for cid in concept_ids:
-            slice_list.extend(self._concept_to_slices(cid, num_heads, head_dim))
+    def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
+        num_heads, head_dim = _resolve_dims(layer_name, self._dims)
+        decoded = [self._decode(cid, num_heads, head_dim) for cid in concept_ids]
 
         def mask_fct(grad: torch.Tensor) -> torch.Tensor:
-            if grad[batch_id].shape[-1] != d_total:
+            # grad shape: (B, num_heads, N, head_dim).
+            t = grad[batch_id]
+            if t.dim() != 3 or t.shape[0] != num_heads or t.shape[2] != head_dim:
                 raise ValueError(
-                    f"{type(self).__name__} expects last-dim {d_total} on layer "
-                    f"{layer_name!r}; got {grad[batch_id].shape[-1]}. "
-                    f"Hook is not on the {self.tap_name} tensor."
+                    f"{type(self).__name__} expects per-head tensor of shape "
+                    f"(B, {num_heads}, N, {head_dim}) on layer {layer_name!r}; "
+                    f"got {tuple(grad.shape)} (per-batch slice {tuple(t.shape)})"
                 )
-            mask = torch.zeros_like(grad[batch_id])
-            for sl in slice_list:
-                mask[..., sl] = 1
-            grad[batch_id] = grad[batch_id] * mask
+            mask = torch.zeros_like(t)
+            for head, dim in decoded:
+                if dim is None:
+                    mask[head, :, :] = 1
+                else:
+                    mask[head, :, dim] = 1
+            grad[batch_id] = t * mask
             return grad
 
         return mask_fct
 
-    # ── attribute (per-concept relevance from masked tensor) ──────────────────
+    # ── attribute (per-concept relevance reduction) ─────────────────────────
 
     def attribute(
         self,
         relevance: torch.Tensor,
-        mask: torch.Tensor = None,
-        layer_name: str = None,
+        mask: Optional[torch.Tensor] = None,
+        layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
-
-        num_heads, head_dim = self._resolve_dims(layer_name)
-        rel_l = self._per_token_relevance(relevance, num_heads, head_dim).sum(dim=1)
-
+        # (B, num_heads, N, head_dim)
+        if self.dim_split:
+            # Sum out the token (N) axis only → (B, num_heads, head_dim).
+            rel = relevance.sum(dim=2)
+        else:
+            # Sum out tokens AND head_dim → (B, num_heads).
+            rel = relevance.sum(dim=(2, 3))
         if abs_norm:
-            shape = rel_l.shape
-            flat = rel_l.reshape(shape[0], -1)
+            shape = rel.shape
+            flat = rel.reshape(shape[0], -1)
             denom = flat.abs().sum(dim=-1, keepdim=True) + 1e-10
-            rel_l = (flat / denom).reshape(shape)
+            rel = (flat / denom).reshape(shape)
+        return rel
 
-        return rel_l
-
-    # ── FeatureVisualization compatibility ────────────────────────────────────
+    # ── reference_sampling for FeatureVisualization compat ──────────────────
 
     def reference_sampling(
         self,
         relevance: torch.Tensor,
-        layer_name: str = None,
+        layer_name: Optional[str] = None,
         max_target: str = "sum",
         abs_norm: bool = True,
     ):
-        """Sort the batch dim by per-concept relevance — required by
-        :class:`crp.maximization.Maximization` (and therefore
-        :class:`crp.visualization.FeatureVisualization`).
-
-        Returns ``(d_c_sorted, rel_c_sorted, rf_c_sorted)`` each of shape
-        ``(batch, num_concepts)`` where ``num_concepts`` is the row-major
-        flatten of the concept axes (matching :meth:`attribute`).
-        ``rf_c_sorted`` holds the **token (sequence) index** at which the
-        concept's relevance peaks — the closest analogue of the
-        "receptive field neuron" used by :class:`~crp.concepts.ChannelConcept`
-        for 2D conv layers.
-        """
-        num_heads, head_dim = self._resolve_dims(layer_name)
+        # (B, num_heads, N, head_dim) → (B, num_concepts, N) for argmax-over-N.
         B = relevance.shape[0]
-        rel_pt = self._per_token_relevance(relevance, num_heads, head_dim)
-        N = rel_pt.shape[1]
-        flat = rel_pt.reshape(B, N, -1)  # (B, N, num_concepts)
-
-        rf_neuron = torch.argmax(flat, dim=1)  # (B, num_concepts)
-
+        if self.dim_split:
+            # (B, num_heads, N, head_dim) → permute to (B, num_heads, head_dim, N)
+            rel = relevance.permute(0, 1, 3, 2).reshape(B, -1, relevance.shape[2])
+        else:
+            # Sum head_dim out: (B, num_heads, N, head_dim) → (B, num_heads, N)
+            rel = relevance.sum(dim=-1)
+        N = rel.shape[-1]
+        # rel shape: (B, num_concepts, N). Find the receptive-field token
+        # (= argmax-N) per concept.
+        rf_neuron = torch.argmax(rel, dim=-1)  # (B, num_concepts)
         if max_target == "sum":
-            rel_c = flat.sum(dim=1)
+            rel_c = rel.sum(dim=-1)
         elif max_target == "max":
-            rel_c = torch.gather(flat, 1, rf_neuron.unsqueeze(1)).squeeze(1)
+            rel_c = torch.gather(rel, -1, rf_neuron.unsqueeze(-1)).squeeze(-1)
         else:
             raise ValueError("'max_target' supports only 'max' or 'sum'.")
-
         if abs_norm:
             rel_c = rel_c / (rel_c.abs().sum(-1, keepdim=True) + 1e-10)
-
         d_c_sorted = torch.argsort(rel_c, dim=0, descending=True)
         rel_c_sorted = torch.gather(rel_c, 0, d_c_sorted)
         rf_c_sorted = torch.gather(rf_neuron, 0, d_c_sorted)
         return d_c_sorted, rel_c_sorted, rf_c_sorted
 
 
-# ── concrete classes (flag combinations) ─────────────────────────────────────
+class HeadConcept(_PerHeadAttentionConcept):
+    """One concept per attention head, conditioned at the per-head context
+    output (= ``attn @ V``, before head-merging reshape).
 
+    Targets ``EvaAttentionUnfolded.context``. Tensor shape:
+    ``(B, num_heads, N, head_dim)``.
 
-class HeadConcept(_AttentionConcept):
-    """One concept per attention head, measured at the **output tokens**.
+    With ``dim_split=True`` the granularity becomes ``(head, dim)``.
 
-    Tap: ``attn_out_tap``.
-    Concept id: ``head_id`` (int) or ``(head_id,)``.
-    ``attribute()`` shape: ``(B, num_heads)``.
+    This is the "per-head contribution to the attention sub-output"
+    view — the natural CRP analogue of a CNN filter. To condition on a
+    specific head's effect on the *residual stream* (post-projection),
+    use :class:`AttnOutputConcept` instead.
     """
 
-    KQV_SPLIT = False
-    DIM_SPLIT = False
+    LAYER_SUFFIX = "context"
 
 
-class HeadDimConcept(_AttentionConcept):
-    """One concept per ``(head, dim)`` of the attention output tokens.
+class QConcept(_PerHeadAttentionConcept):
+    """One concept per attention head's Q vector (post q_norm + RoPE).
 
-    Tap: ``attn_out_tap``.
-    Concept id: ``(head_id, dim_id)`` or flat ``int`` row-major over
-    ``(num_heads, head_dim)``.
-    ``attribute()`` shape: ``(B, num_heads, head_dim)``.
+    Targets ``EvaAttentionUnfolded.rope_q``. Tensor shape:
+    ``(B, num_heads, N, head_dim)``.
+
+    With ``dim_split=True`` the granularity becomes ``(head, dim)`` —
+    one concept per query feature.
     """
 
-    KQV_SPLIT = False
-    DIM_SPLIT = True
+    LAYER_SUFFIX = "rope_q"
 
 
-class KQVHeadConcept(_AttentionConcept):
-    """One concept per ``(part, head)`` on the K/Q/V projections.
+class KConcept(_PerHeadAttentionConcept):
+    """One concept per attention head's K vector (post k_norm + RoPE).
 
-    Tap: ``qkv_tap``.
-    Concept id: ``(part, head_id)`` with ``part ∈ {'q','k','v'}`` (or int
-    0/1/2), or flat ``int`` row-major over ``(3, num_heads)``.
-    ``attribute()`` shape: ``(B, 3, num_heads)``.
+    Targets ``EvaAttentionUnfolded.rope_k``. Tensor shape:
+    ``(B, num_heads, N, head_dim)``. ``dim_split=True`` selects per
+    key feature.
     """
 
-    KQV_SPLIT = True
-    DIM_SPLIT = False
+    LAYER_SUFFIX = "rope_k"
 
 
-class KQVHeadDimConcept(_AttentionConcept):
-    """One concept per ``(part, head, dim)`` — a single column of W_Q / W_K
-    / W_V per head.
+class VConcept(_PerHeadAttentionConcept):
+    """One concept per attention head's V vector (post per-head reshape).
 
-    Tap: ``qkv_tap``.
-    Concept id: ``(part, head_id, dim_id)`` or flat ``int`` row-major over
-    ``(3, num_heads, head_dim)``.
-    ``attribute()`` shape: ``(B, 3, num_heads, head_dim)``.
-
-    Row vs column resolution: in ``Q = X · W_Q`` with ``W_Q ∈ R^{D×D}``, each
-    column of W_Q maps to one output feature of Q (i.e. one of the
-    ``head_dim`` indices within a head). CRP's CNN convention treats one
-    output filter as one concept; the analogue here is one **column**.
+    Targets ``EvaAttentionUnfolded.v_id`` (an ``nn.Identity`` placed
+    after the per-head reshape so V is hookable; V is otherwise
+    reshape-only between the qkv split and the bilinear). Tensor
+    shape: ``(B, num_heads, N, head_dim)``.
     """
 
-    KQV_SPLIT = True
-    DIM_SPLIT = True
+    LAYER_SUFFIX = "v_id"
+
+
+# ─── 2. Attention-weight concept (post-softmax) ──────────────────────────────
+
+
+class AttnWeightConcept(ChannelConcept):
+    """One concept per attention weight position (head × query × key).
+
+    Targets ``EvaAttentionUnfolded.softmax``. Tensor shape:
+    ``(B, num_heads, N, N)`` — the row-stochastic attention map per
+    head. Concept id forms:
+
+    * ``int head_id`` — sum across all (query, key) for that head.
+    * ``(head, query_pos)`` — sum across all keys.
+    * ``(head, query_pos, key_pos)`` — single weight cell.
+
+    Construction-time ``granularity`` controls which axis the concept
+    lives on: ``'head'`` (default), ``'head_query'``, or
+    ``'head_query_key'``.
+
+    **Status: experimental.** Class is exposed for future use but no
+    notebook in the current set demonstrates it. Open question: what
+    interpretive use cases benefit from per-weight conditioning beyond
+    direct attention-map visualisation?
+    """
+
+    LAYER_SUFFIX = "softmax"
+    _GRANULARITIES = ("head", "head_query", "head_query_key")
+
+    def __init__(
+        self,
+        model: Optional[nn.Module] = None,
+        *,
+        granularity: str = "head",
+    ):
+        if granularity not in self._GRANULARITIES:
+            raise ValueError(
+                f"granularity must be one of {self._GRANULARITIES}; got {granularity!r}"
+            )
+        self.granularity = granularity
+        self._dims: Dict[str, Tuple[int, int]] = {}
+        if model is not None:
+            for attn_name, attn in _find_unfolded_attentions(model):
+                # AttnWeightConcept needs num_heads and N (sequence length).
+                # N varies per forward (token count after patch_embed +
+                # prefix); the concept resolves it from the actual tensor
+                # shape at mask-time. We still store num_heads here for
+                # decoding and validation.
+                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
+                    int(attn.num_heads), 0,  # N filled in at mask-time
+                )
+
+    def register_layer(self, layer_name: str, num_heads: int) -> None:
+        self._dims[layer_name] = (int(num_heads), 0)
+
+    def _decode(self, cid, num_heads: int, N: int):
+        """Return ``(head, query_or_None, key_or_None)``."""
+        if self.granularity == "head":
+            head = int(cid[0]) if isinstance(cid, (tuple, list)) else int(cid)
+            return head, None, None
+        if self.granularity == "head_query":
+            if not isinstance(cid, (tuple, list)) or len(cid) != 2:
+                raise ValueError("head_query granularity expects (head, query)")
+            return int(cid[0]), int(cid[1]), None
+        # head_query_key
+        if not isinstance(cid, (tuple, list)) or len(cid) != 3:
+            raise ValueError("head_query_key granularity expects (head, query, key)")
+        return int(cid[0]), int(cid[1]), int(cid[2])
+
+    def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
+        num_heads, _ = _resolve_dims(layer_name, self._dims)
+
+        def mask_fct(grad: torch.Tensor) -> torch.Tensor:
+            # grad shape: (B, num_heads, N, N).
+            t = grad[batch_id]
+            if t.dim() != 3 or t.shape[0] != num_heads or t.shape[1] != t.shape[2]:
+                raise ValueError(
+                    f"AttnWeightConcept expects (B, {num_heads}, N, N) on layer "
+                    f"{layer_name!r}; got per-batch shape {tuple(t.shape)}"
+                )
+            N = t.shape[1]
+            mask = torch.zeros_like(t)
+            for cid in concept_ids:
+                head, q, k = self._decode(cid, num_heads, N)
+                if q is None:
+                    mask[head, :, :] = 1
+                elif k is None:
+                    mask[head, q, :] = 1
+                else:
+                    mask[head, q, k] = 1
+            grad[batch_id] = t * mask
+            return grad
+
+        return mask_fct
+
+    def attribute(
+        self,
+        relevance: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        layer_name: Optional[str] = None,
+        abs_norm: bool = True,
+    ) -> torch.Tensor:
+        if isinstance(mask, torch.Tensor):
+            relevance = relevance * mask
+        # (B, num_heads, N, N) → reduce based on granularity.
+        if self.granularity == "head":
+            rel = relevance.sum(dim=(2, 3))             # (B, num_heads)
+        elif self.granularity == "head_query":
+            rel = relevance.sum(dim=3)                  # (B, num_heads, N)
+        else:                                            # head_query_key
+            rel = relevance                              # (B, num_heads, N, N)
+        if abs_norm:
+            shape = rel.shape
+            flat = rel.reshape(shape[0], -1)
+            denom = flat.abs().sum(dim=-1, keepdim=True) + 1e-10
+            rel = (flat / denom).reshape(shape)
+        return rel
+
+
+# ─── 3. Post-projection concept (residual-stream contribution) ──────────────
+
+
+class AttnOutputConcept(ChannelConcept):
+    """One concept per output channel of the post-projection attention output
+    (= attention block's contribution to the residual stream).
+
+    Targets ``EvaAttentionUnfolded.proj_drop``. Tensor shape:
+    ``(B, N, embed_dim)``. Concept id forms:
+
+    * ``int channel_id`` — one output channel of ``proj``.
+    * ``(channel_id,)`` tuple — same.
+
+    This is the "OV-circuit-output" view used in the Anthropic
+    mathematical-framework / induction-heads line of work
+    (Elhage et al., Olsson et al.). Conditioning on a single channel
+    asks: "which feature in the attention block's residual contribution
+    is most relevant to the prediction?". Different from
+    :class:`HeadConcept` (pre-proj per-head) because ``proj`` mixes
+    head outputs into the residual-stream basis — channels here are
+    in the *embed_dim* coordinates, not per-head coordinates.
+
+    To condition per-token instead of per-channel, sum over the channel
+    axis upstream and pass per-token concept ids instead — not currently
+    exposed; would be straightforward to add as a sibling class.
+    """
+
+    LAYER_SUFFIX = "proj_drop"
+
+    def __init__(self, model: Optional[nn.Module] = None):
+        # layer_name -> embed_dim
+        self._dims: Dict[str, int] = {}
+        if model is not None:
+            for attn_name, attn in _find_unfolded_attentions(model):
+                embed_dim = int(attn.num_heads) * int(attn.head_dim)
+                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = embed_dim
+
+    def register_layer(self, layer_name: str, embed_dim: int) -> None:
+        self._dims[layer_name] = int(embed_dim)
+
+    def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
+        if layer_name not in self._dims:
+            # Try parent prefix.
+            for k in self._dims:
+                if layer_name.startswith(k.rsplit(".", 1)[0]):
+                    embed_dim = self._dims[k]
+                    break
+            else:
+                raise ValueError(f"AttnOutputConcept: layer {layer_name!r} not registered")
+        else:
+            embed_dim = self._dims[layer_name]
+
+        channels = []
+        for cid in concept_ids:
+            if isinstance(cid, (int, np.integer)):
+                ch = int(cid)
+            elif isinstance(cid, (tuple, list)) and len(cid) == 1:
+                ch = int(cid[0])
+            else:
+                raise ValueError(f"AttnOutputConcept expects int or 1-tuple; got {cid!r}")
+            if not 0 <= ch < embed_dim:
+                raise IndexError(f"channel {ch} out of [0, {embed_dim})")
+            channels.append(ch)
+
+        def mask_fct(grad: torch.Tensor) -> torch.Tensor:
+            # grad shape: (B, N, embed_dim).
+            t = grad[batch_id]
+            if t.dim() != 2 or t.shape[1] != embed_dim:
+                raise ValueError(
+                    f"AttnOutputConcept expects (B, N, {embed_dim}) on layer "
+                    f"{layer_name!r}; got per-batch shape {tuple(t.shape)}"
+                )
+            mask = torch.zeros_like(t)
+            mask[:, channels] = 1
+            grad[batch_id] = t * mask
+            return grad
+
+        return mask_fct
+
+    def attribute(
+        self,
+        relevance: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        layer_name: Optional[str] = None,
+        abs_norm: bool = True,
+    ) -> torch.Tensor:
+        if isinstance(mask, torch.Tensor):
+            relevance = relevance * mask
+        # (B, N, embed_dim) → sum over tokens → (B, embed_dim).
+        rel = relevance.sum(dim=1)
+        if abs_norm:
+            denom = rel.abs().sum(dim=-1, keepdim=True) + 1e-10
+            rel = rel / denom
+        return rel
 
 
 __all__ = [
-    "PARTS",
-    "PART_OFFSETS",
     "HeadConcept",
-    "HeadDimConcept",
-    "KQVHeadConcept",
-    "KQVHeadDimConcept",
+    "QConcept",
+    "KConcept",
+    "VConcept",
+    "AttnWeightConcept",
+    "AttnOutputConcept",
 ]
