@@ -30,6 +30,7 @@ from crp.transformer_patches import (
     AttentionTapsCanonizer,
     AttnLRPEpsilonComposite,
     AttnLRPGammaComposite,
+    AttnLRPMatmulFactor2Composite,
     TimmViTCanonizer,
     timm_attention_forward,
 )
@@ -116,12 +117,18 @@ class TestAttentionTapsCanonizer:
 
 class TestTimmViTCanonizer:
     def test_forward_swap_is_reversible(self, vit_tiny):
+        # The canonizer installs a parameter-bound closure (built by
+        # ``TimmAttentionForwardCanonizer._attribute_map``) — the public
+        # contract is "forward got swapped, and .remove() reverts it",
+        # not the closure identity.
         attn = vit_tiny.blocks[0].attn
         original_class_forward = type(attn).forward
+        assert "forward" not in attn.__dict__
         canonizer = TimmViTCanonizer()
         instances = canonizer.apply(vit_tiny)
         try:
-            assert attn.forward.__func__ is timm_attention_forward
+            assert "forward" in attn.__dict__, "canonizer did not swap forward"
+            assert attn.forward.__func__ is not original_class_forward
         finally:
             for inst in instances:
                 inst.remove()
@@ -305,28 +312,39 @@ class TestConservation:
         return sum_R / logit_val, sum_R, logit_val
 
     def test_epsilon_conservation_diagnostic(self, vit_base):
+        # Bare ``AttnLRPEpsilonComposite()`` without the residual rule
+        # *or* the bilinear matmul rule gives NaN on vit_base — bare
+        # PyTorch matmul has no LRP rule and bare residual additions
+        # double the relevance per layer. Earlier in the project the
+        # ``GTIEpsilon`` hook (now removed: it was mathematically not
+        # LRP-ε; see ``experiments/audit_gti_hook.py``) accidentally
+        # masked these issues with its extra ``* output`` and
+        # ``/ stab(input)`` factors. Now they surface, and the proper
+        # conservation-preserving recipe is the one assembled below.
         ratio, sum_R, logit = self._conservation_ratio(
-            vit_base, AttnLRPEpsilonComposite()
+            vit_base,
+            AttnLRPMatmulFactor2Composite(residual_lrp="ratio"),
         )
-        # Diagnostic: conservation requires ratio ≈ 1.0 ideally; the current
-        # pipeline (no residual-LRP, no PA-LRP) on a 12-block ViT gives
-        # |ratio| ~ O(100). Bound is loose to keep the test green; turning on
-        # ``residual_lrp='ratio'`` should narrow it sharply.
         assert torch.isfinite(torch.tensor(sum_R)).item(), (
             f"R_input.sum() = {sum_R} is not finite"
         )
-        assert abs(ratio) < 10000, (
-            f"ε-LRP conservation ratio {ratio} blew up beyond loose bound; "
-            f"sum(R_input)={sum_R}, logit={logit}"
+        # With the proper recipe (matmul Prop. 3.3 + ratio residuals)
+        # conservation should narrow to within ~2 OOM of 1.0 on
+        # vit_base/12-block, untrained random weights.
+        assert abs(ratio) < 100, (
+            f"ε-LRP + matmul + ratio residual conservation ratio {ratio} "
+            f"is wider than expected; sum(R_input)={sum_R}, logit={logit}"
         )
 
     def test_gamma_conservation_diagnostic(self, vit_base):
         ratio, sum_R, logit = self._conservation_ratio(
-            vit_base, AttnLRPGammaComposite(gamma=0.25)
+            vit_base,
+            AttnLRPGammaComposite(gamma=0.25, residual_lrp="ratio"),
         )
-        # γ-LRP at γ=0.25 produces dramatically larger ratios still — the
-        # positive-weight clamp on every linear amplifies the residual /
-        # pos_embed leak. Loosest of the three bounds; pure regression guard.
+        # γ-LRP at γ=0.25 produces wider ratios than ε — positive-weight
+        # clamp on every linear amplifies the residual leak even with the
+        # ratio rule. Pure regression guard; compose with the matmul rule
+        # for a tighter bound when needed.
         assert torch.isfinite(torch.tensor(sum_R)).item(), (
             f"R_input.sum() = {sum_R} is not finite"
         )
