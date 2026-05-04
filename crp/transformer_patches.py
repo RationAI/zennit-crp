@@ -244,6 +244,14 @@ def gemma3_norm_forward(self, x):
     return x * stop_gradient(torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps))
 
 
+# ─── HuggingFace GELUActivation patch ────────────────────────────────────────
+
+
+def gelu_activation_forward(self, x):
+    """Identity rule for HuggingFace GELUActivation (delegates to self.act)."""
+    return identity_rule_implicit(self.act, x)
+
+
 # ─── GPT-2 MLP patch (inline, identity rule on activation) ───────────────────
 
 
@@ -347,6 +355,22 @@ def _build_default_map():
             nn.MultiheadAttention: partial(
                 patch_method, cp_multi_head_attention_forward, keep_original=True
             ),
+        }
+    except ImportError:
+        pass
+
+    # HuggingFace ViT (e.g. ViTForImageClassification from transformers)
+    try:
+        import torch.nn as nn
+        from torch.nn import Dropout
+        from transformers.activations import GELUActivation
+        from transformers.models.vit import modeling_vit
+
+        default_map[modeling_vit] = {
+            GELUActivation: partial(patch_method, gelu_activation_forward),
+            nn.LayerNorm: partial(patch_method, layer_norm_forward),
+            Dropout: partial(patch_method, dropout_forward),
+            modeling_vit: patch_cp_attention,
         }
     except ImportError:
         pass
