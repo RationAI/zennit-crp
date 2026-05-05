@@ -34,11 +34,16 @@ import time
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as _torch_mp
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from timm.data import resolve_data_config, create_transform
 import timm
+
+# Use file-system sharing instead of /dev/shm so DataLoader workers work
+# in containerised environments where /dev/shm is tiny (often 64 MB).
+_torch_mp.set_sharing_strategy("file_system")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from datasets import load as load_dataset  # noqa: E402
