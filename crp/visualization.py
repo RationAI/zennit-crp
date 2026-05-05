@@ -21,7 +21,16 @@ from crp.cache import Cache
 
 class FeatureVisualization:
 
-    DEFAULT_VARIANTS = [("head", "sum"), ("head", "max"), ("token", "sum"), ("token", "max")]
+    # Attention-layer variants (head / token / dimension) are automatically skipped
+    # for ChannelConcept layers; the (None, ...) variants are skipped for attention
+    # layers. Both sets are registered so a single FeatureVisualization instance can
+    # handle mixed layer_maps containing both CNN and transformer layers.
+    DEFAULT_VARIANTS = [
+        ("head",      "sum"), ("head",      "max"),
+        ("token",     "sum"), ("token",     "max"),
+        ("dimension", "sum"), ("dimension", "max"),
+        (None,        "sum"), (None,        "max"),   # channel concepts for CNN layers
+    ]
 
     def __init__(
             self, attribution: CondAttribution, dataset, layer_map: Dict[str, Concept], preprocess_fn: Callable=None,
@@ -186,10 +195,16 @@ class FeatureVisualization:
         return self.saved_checkpoints
 
     def _variant_applies(self, concept_mode, concept):
-        """Head-mode variants only apply to AttentionHeadConcept layers."""
-        if concept_mode == "head" and not isinstance(concept, AttentionHeadConcept):
-            return False
-        return True
+        """
+        Gate variants to the right concept class.
+        - head / token / dimension → only AttentionHeadConcept layers
+        - None (legacy channel mode) → only non-attention layers (ChannelConcept, etc.)
+        """
+        is_attention = isinstance(concept, AttentionHeadConcept)
+        if concept_mode in ("head", "token", "dimension"):
+            return is_attention
+        # concept_mode is None: legacy channel/CNN mode
+        return not is_attention
 
     @torch.no_grad()
     def analyze_relevance(self, rel, layer_name, concept, data_indices, targets):
@@ -401,7 +416,7 @@ class FeatureVisualization:
             d_indices = d_c_sorted[r_range[0]:r_range[1], c_id]
             n_indices = rf_c_sorted[r_range[0]:r_range[1], c_id]
 
-            ref_c[c_id] = self._load_ref_and_attribution(d_indices, c_id, n_indices, layer_name, composite, rf, plot_fn, batch_size)
+            ref_c[c_id] = self._load_ref_and_attribution(d_indices, c_id, n_indices, layer_name, composite, rf, plot_fn, batch_size, concept_mode=concept_mode)
 
         return ref_c
 
@@ -465,17 +480,17 @@ class FeatureVisualization:
             d_indices = d_c_sorted[r_range[0]:r_range[1], concept_id]
             n_indices = rf_c_sorted[r_range[0]:r_range[1], concept_id]
 
-            ref_t[f"{concept_id}:{t}"] = self._load_ref_and_attribution(d_indices, concept_id, n_indices, layer_name, composite, rf, plot_fn, batch_size)
+            ref_t[f"{concept_id}:{t}"] = self._load_ref_and_attribution(d_indices, concept_id, n_indices, layer_name, composite, rf, plot_fn, batch_size, concept_mode=concept_mode)
 
         return ref_t
 
-    def _load_ref_and_attribution(self, d_indices, c_id, n_indices, layer_name, composite, rf, plot_fn, batch_size):
+    def _load_ref_and_attribution(self, d_indices, c_id, n_indices, layer_name, composite, rf, plot_fn, batch_size, concept_mode=None):
 
         data_batch, _ = self.get_data_concurrently(d_indices, preprocessing=False)
 
         if composite:
             data_p = self.preprocess_data(data_batch)
-            heatmaps = self._attribution_on_reference(data_p, c_id, layer_name, composite, rf, n_indices, batch_size)
+            heatmaps = self._attribution_on_reference(data_p, c_id, layer_name, composite, rf, n_indices, batch_size, concept_mode=concept_mode)
 
             if callable(plot_fn):
                 return plot_fn(data_batch.detach(), heatmaps.detach(), rf)
@@ -485,7 +500,7 @@ class FeatureVisualization:
         else:
             return data_batch.detach().cpu()
 
-    def _attribution_on_reference(self, data, concept_id: int, layer_name: str, composite, rf=False, neuron_ids: list=[], batch_size=32):
+    def _attribution_on_reference(self, data, concept_id: int, layer_name: str, composite, rf=False, neuron_ids: list=[], batch_size=32, concept_mode=None):
 
         n_samples = len(data)
         if n_samples > batch_size:
@@ -497,19 +512,31 @@ class FeatureVisualization:
         if rf and (len(neuron_ids) != n_samples):
             raise ValueError("length of 'neuron_ids' must be equal to the length of 'data'")
 
+        # Select gradient mask functions based on concept mode.
+        # - dimension: column mask for full-concept heatmap; element mask for rf heatmap
+        # - head/token/None: existing behaviour (AttentionHeadConcept.mask or ChannelConcept.mask_rf)
+        if concept_mode == "dimension":
+            full_mask_map = ChannelConcept.dimension_mask
+            rf_mask_map   = ChannelConcept.dimension_mask_rf
+        else:
+            full_mask_map = None        # let AttentionAttribution use its default
+            rf_mask_map   = ChannelConcept.mask_rf
+
         heatmaps = []
         for b in range(batches):
             data_batch = data[b * batch_size: (b + 1) * batch_size].detach().requires_grad_()
-            
+
             if rf:
                 batch_neuron_ids = neuron_ids[b * batch_size: (b + 1) * batch_size]
                 conditions = [{layer_name: {concept_id: n_index}} for n_index in batch_neuron_ids]
-                attr = self.attribution(data_batch, conditions, composite, mask_map=ChannelConcept.mask_rf, start_layer=layer_name, on_device=self.device, 
-                    exclude_parallel=False)
+                attr = self.attribution(data_batch, conditions, composite, mask_map=rf_mask_map,
+                    start_layer=layer_name, on_device=self.device, exclude_parallel=False)
             else:
-                conditions = [{layer_name: [concept_id]}] 
-                # initialize relevance with activation before non-linearity (could be changed in a future release)
-                attr = self.attribution(data_batch, conditions, composite, start_layer=layer_name, on_device=self.device, exclude_parallel=False)
+                conditions = [{layer_name: [concept_id]}]
+                kwargs = dict(start_layer=layer_name, on_device=self.device, exclude_parallel=False)
+                if full_mask_map is not None:
+                    kwargs["mask_map"] = full_mask_map
+                attr = self.attribution(data_batch, conditions, composite, **kwargs)
 
             heatmaps.append(attr.heatmap)
 
