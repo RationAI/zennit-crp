@@ -26,10 +26,9 @@ class FeatureVisualization:
     # layers. Both sets are registered so a single FeatureVisualization instance can
     # handle mixed layer_maps containing both CNN and transformer layers.
     DEFAULT_VARIANTS = [
-        ("head",      "sum"), ("head",      "max"),
-        ("token",     "sum"), ("token",     "max"),
-        ("dimension", "sum"), ("dimension", "max"),
-        (None,        "sum"), (None,        "max"),   # channel concepts for CNN layers
+        ("head",  "sum"), ("head",  "max"),
+        ("token", "sum"), ("token", "max"),
+        (None,    "sum"), (None,    "max"),   # channel concepts for CNN layers
     ]
 
     def __init__(
@@ -348,7 +347,7 @@ class FeatureVisualization:
         """
         if concept_mode is None:
             concept = self.layer_map.get(layer_name)
-            concept_mode = "head" if isinstance(concept, AttentionHeadConcept) else "token"
+            concept_mode = "head" if isinstance(concept, AttentionHeadConcept) else None
         key = (concept_mode, max_target)
         if key in self.RelMax:
             return key
@@ -513,13 +512,16 @@ class FeatureVisualization:
             raise ValueError("length of 'neuron_ids' must be equal to the length of 'data'")
 
         # Select gradient mask functions based on concept mode.
-        # - dimension: column mask for full-concept heatmap; element mask for rf heatmap
-        # - head/token/None: existing behaviour (AttentionHeadConcept.mask or ChannelConcept.mask_rf)
         if concept_mode == "dimension":
-            full_mask_map = ChannelConcept.dimension_mask
-            rf_mask_map   = ChannelConcept.dimension_mask_rf
+            full_mask_map = AttentionHeadConcept.dimension_mask
+            rf_mask_map   = AttentionHeadConcept.dimension_mask_rf
+        elif concept_mode == "token":
+            # Token concepts = row indices in [seq_len, hidden_dim]; use channel mask (row mask).
+            full_mask_map = ChannelConcept.mask
+            rf_mask_map   = ChannelConcept.mask_rf
         else:
-            full_mask_map = None        # let AttentionAttribution use its default
+            # "head" or None (CNN): let attribution class apply its registered default mask.
+            full_mask_map = None
             rf_mask_map   = ChannelConcept.mask_rf
 
         heatmaps = []
