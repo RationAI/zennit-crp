@@ -38,12 +38,13 @@ subclass) yielding ``(PIL.Image, target_class)`` pairs and exposing
 
 from __future__ import annotations
 
+import io
 import random
 import tarfile
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from PIL import Image
 from torch.utils.data import Dataset
@@ -210,7 +211,9 @@ def load_imagenette(
 # Path to the canonical synset list shipping with this package — line N is
 # the WordNet ID for ImageNet-1k class N. Generated from the standard
 # ILSVRC2012 metadata; identical to torchvision/timm/HuggingFace ordering.
-IMAGENET_SYNSETS_PATH = Path(__file__).resolve().parent / "_data" / "imagenet_synsets.txt"
+IMAGENET_SYNSETS_PATH = (
+    Path(__file__).resolve().parent.parent / "_data" / "imagenet_synsets.txt"
+)
 
 
 def _load_imagenet_synsets() -> list[str]:
@@ -302,9 +305,121 @@ def load_imagenet_val(
 # ── unified entry point ──────────────────────────────────────────────────────
 
 
+@dataclass
+class _ParquetImageDataset(Dataset):
+    """In-memory list of ``(image_bytes, imagenet_class)`` pairs from
+    HuggingFace parquet files. Decodes JPEG/PNG on the fly.
+
+    Behaves like :class:`CuratedDataset` (same ``items``/``num_classes``
+    interface where applicable) but ``__getitem__`` reads from the
+    in-memory bytes blob, not from disk per call. Used by
+    :func:`load_imagenet_val_hf`."""
+
+    name: str
+    rows: List[Tuple[bytes, int]] = field(default_factory=list)
+    transform: Optional[Callable] = None
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i: int):
+        b, cls = self.rows[i]
+        img = Image.open(io.BytesIO(b)).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, cls
+
+    @property
+    def class_indices(self) -> list[int]:
+        return sorted({c for _, c in self.rows})
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_indices)
+
+
+def load_imagenet_val_hf(
+    root: Path,
+    *,
+    n_per_class: Optional[int] = None,
+    classes: Optional[Sequence[int]] = None,
+    transform: Optional[Callable] = None,
+    seed: int = 0,
+    log=print,
+) -> _ParquetImageDataset:
+    """ImageNet-1k validation split via the un-gated HuggingFace mirror
+    ``evanarlian/imagenet_1k_resized_256`` (50K images at 256x256, 1000
+    classes, ~830 MB).
+
+    Auto-downloads on first call into
+    ``<root>/imagenet_val_hf/cache/`` (HF Hub format). Subsequent calls
+    are cache hits.
+
+    Drop-in replacement for :func:`load_imagenet_val` (the disk-tree
+    backend) that does not require manual setup. Same return contract,
+    same parameters. Mapping is identity (label = ImageNet-1k class
+    index 0..999).
+    """
+    try:
+        import pyarrow.parquet as pq
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise RuntimeError(
+            "load_imagenet_val_hf requires pyarrow + huggingface_hub. "
+            "Install with `uv add pyarrow huggingface_hub`."
+        ) from e
+
+    cache_dir = (Path(root) / "imagenet_val_hf" / "cache").resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    log(f"  loading ImageNet-1k val from HF mirror (cache: {cache_dir})")
+
+    repo = "evanarlian/imagenet_1k_resized_256"
+    parquet_files = [
+        "data/val-00000-of-00002-b5248be478d25e41.parquet",
+        "data/val-00001-of-00002-85f3d9c8fa1edb63.parquet",
+    ]
+    rows: List[Tuple[bytes, int]] = []
+    for f in parquet_files:
+        local = hf_hub_download(
+            repo_id=repo, filename=f, repo_type="dataset",
+            cache_dir=str(cache_dir),
+        )
+        log(f"  reading {Path(local).name}")
+        table = pq.read_table(local, columns=["image", "label"])
+        # The 'image' column is a struct {bytes, path}; we only want bytes.
+        img_bytes = table["image"].combine_chunks().field("bytes").to_pylist()
+        labels = table["label"].to_pylist()
+        rows.extend(zip(img_bytes, labels))
+
+    log(f"  total: {len(rows)} samples, {len(set(c for _, c in rows))} classes")
+
+    # Optional class restriction.
+    if classes is not None:
+        keep = set(int(c) for c in classes)
+        rows = [(b, c) for b, c in rows if c in keep]
+        log(f"  after class filter ({len(keep)} classes): {len(rows)} samples")
+
+    # Optional per-class subsampling.
+    if n_per_class is not None:
+        rng = random.Random(seed)
+        per_class: dict[int, list[bytes]] = {}
+        for b, c in rows:
+            per_class.setdefault(c, []).append(b)
+        sampled: List[Tuple[bytes, int]] = []
+        for c, blobs in per_class.items():
+            rng.shuffle(blobs)
+            sampled.extend((b, c) for b in blobs[:n_per_class])
+        rng.shuffle(sampled)
+        rows = sampled
+        log(f"  after n_per_class={n_per_class}: {len(rows)} samples")
+
+    return _ParquetImageDataset(name="imagenet_val_hf", rows=rows, transform=transform)
+
+
 DATASETS: dict[str, Callable[..., CuratedDataset]] = {
-    "imagenette":   load_imagenette,
-    "imagenet_val": load_imagenet_val,
+    "imagenette":      load_imagenette,
+    "imagenet_val":    load_imagenet_val,
+    "imagenet_val_hf": load_imagenet_val_hf,
 }
 
 
@@ -344,4 +459,5 @@ __all__ = [
     "load",
     "load_imagenette",
     "load_imagenet_val",
+    "load_imagenet_val_hf",
 ]

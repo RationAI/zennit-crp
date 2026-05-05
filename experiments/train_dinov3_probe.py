@@ -106,6 +106,60 @@ def cached_features(
     return feats, labels
 
 
+def train_test_split(
+    feats: torch.Tensor, labels: torch.Tensor, *, test_frac: float = 0.1,
+    seed: int = 0,
+):
+    """Stratified per-class split: from each class's samples, hold out
+    ``test_frac`` for evaluation. Stratification matters because some
+    datasets (e.g. dsprites) have a single dominant class — random
+    unstratified would leave classes unrepresented in the test set.
+    Backbone features are deterministic given the input, so the split
+    on (cached) features yields the same train/test partition the
+    backbone would have given on the raw images.
+    """
+    g = torch.Generator().manual_seed(seed)
+    train_idx, test_idx = [], []
+    for c in labels.unique().tolist():
+        cls_idx = (labels == c).nonzero(as_tuple=True)[0]
+        n_test = max(1, int(round(len(cls_idx) * test_frac)))
+        perm = cls_idx[torch.randperm(len(cls_idx), generator=g)]
+        test_idx.append(perm[:n_test])
+        train_idx.append(perm[n_test:])
+    train_idx = torch.cat(train_idx)
+    test_idx = torch.cat(test_idx)
+    return (
+        feats[train_idx], labels[train_idx],
+        feats[test_idx], labels[test_idx],
+    )
+
+
+@torch.no_grad()
+def evaluate_probe(
+    head: nn.Linear, feats: torch.Tensor, labels: torch.Tensor,
+    *, batch_size: int = 1024, device: str = "cuda",
+) -> dict:
+    """Held-out top-1 / top-5 accuracy + cross-entropy on a feature cache."""
+    head.eval()
+    feats = feats.to(device); labels = labels.to(device)
+    n = feats.shape[0]
+    correct1 = correct5 = 0
+    loss_sum = 0.0
+    for i in range(0, n, batch_size):
+        x, y = feats[i:i + batch_size], labels[i:i + batch_size]
+        logits = head(x)
+        loss_sum += F.cross_entropy(logits, y, reduction="sum").item()
+        topk = logits.topk(min(5, logits.shape[-1]), dim=-1).indices  # (B, k)
+        correct1 += (topk[:, 0] == y).sum().item()
+        correct5 += (topk == y.unsqueeze(-1)).any(dim=-1).sum().item()
+    return {
+        "n": n,
+        "loss": loss_sum / n,
+        "top1": correct1 / n,
+        "top5": correct5 / n,
+    }
+
+
 def train_probe(
     feats: torch.Tensor,
     labels: torch.Tensor,
@@ -164,8 +218,14 @@ def main():
     data_dir = repo_root / "data"
     p.add_argument("--model", default="vit_large_patch16_dinov3")
     p.add_argument("--dataset", default="imagenette",
-                   choices=("imagenette", "imagenet_val", "imagenet_train"))
-    p.add_argument("--split", default="train", choices=("train", "val"))
+                   choices=("imagenette", "imagenet_val", "imagenet_val_hf",
+                            "imagenet_train", "funny_birds", "dsprites"))
+    p.add_argument("--split", default="train", choices=("train", "val", "test"))
+    p.add_argument(
+        "--dsprites-target", default="shape",
+        choices=("shape", "scale", "orientation", "posX", "posY"),
+        help="Latent factor used as the classification label for dsprites.",
+    )
     p.add_argument("--num-classes", type=int, default=1000)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64,
@@ -185,6 +245,18 @@ def main():
     p.add_argument(
         "--cache", type=Path, default=None,
         help="path to cached features (default: <out_stem>_feats.pt)",
+    )
+    p.add_argument(
+        "--test-frac", type=float, default=0.1,
+        help="Fraction of features to hold out from training for the "
+             "test-set sanity check (stratified per class).",
+    )
+    p.add_argument(
+        "--min-test-top1", type=float, default=None,
+        help="If set, fail (exit non-zero) when the held-out test top-1 "
+             "is below this threshold. Per-dataset defaults applied if "
+             "this flag is omitted: funny_birds=0.30, dsprites=0.85, "
+             "imagenette=0.70, imagenet_val_hf=0.40.",
     )
     args = p.parse_args()
 
@@ -224,6 +296,23 @@ def main():
             "see plan; populate the layout under data/imagenet_train/<wnid>/ "
             "first, then re-run after the loader supports --split=train."
         )
+    elif args.dataset == "imagenet_val_hf":
+        # HF mirror — auto-downloads, no split arg.
+        dataset = load_dataset(
+            "imagenet_val_hf", n_per_class=None, transform=transform,
+        )
+    elif args.dataset == "funny_birds":
+        split = "test" if args.split in ("val", "test") else "train"
+        dataset = load_dataset(
+            "funny_birds", split=split, transform=transform,
+        )
+    elif args.dataset == "dsprites":
+        # dsprites images are 64×64; the timm transform handles upsampling
+        # to the model's input resolution. image_mode='RGB' tiles the
+        # grayscale channel for ImageNet-pretrained backbones.
+        dataset = load_dataset(
+            "dsprites", target=args.dsprites_target, transform=transform,
+        )
     else:
         dataset = load_dataset(
             args.dataset,
@@ -233,6 +322,18 @@ def main():
         )
     print(f"  {dataset.name}: {len(dataset)} images, {dataset.num_classes} classes")
 
+    # Auto-derive num_classes from the dataset for non-ImageNet sources, where
+    # the natural class count differs from the default 1000. Imagenette also
+    # has 10 classes but we keep it at 1000 by convention (probe head is
+    # ImageNet-1k-shaped; only 10 logits get trained).
+    if args.dataset in ("funny_birds", "dsprites"):
+        if args.num_classes != dataset.num_classes:
+            print(
+                f"  overriding --num-classes {args.num_classes} → "
+                f"{dataset.num_classes} (auto-detected from dataset)"
+            )
+            args.num_classes = dataset.num_classes
+
     print(f"\nextracting features (or loading cache)")
     feats, labels = cached_features(
         model, dataset, args.cache, device=device, batch_size=args.batch_size,
@@ -241,12 +342,54 @@ def main():
     print(f"  feats: {feats.shape}, labels: {labels.shape}, "
           f"unique labels: {labels.unique().numel()}")
 
-    print(f"\ntraining linear probe")
+    print(f"\nstratified train/test split (test_frac={args.test_frac})")
+    feats_tr, labels_tr, feats_te, labels_te = train_test_split(
+        feats, labels, test_frac=args.test_frac, seed=0,
+    )
+    print(f"  train: {len(feats_tr)} samples, test: {len(feats_te)} samples")
+
+    print(f"\ntraining linear probe (frozen backbone, head only)")
     head = train_probe(
-        feats, labels, embed_dim=embed_dim, num_classes=args.num_classes,
+        feats_tr, labels_tr, embed_dim=embed_dim, num_classes=args.num_classes,
         epochs=args.epochs, batch_size=args.probe_batch_size,
         lr=args.lr, weight_decay=args.weight_decay, device=device,
     )
+
+    print(f"\nsanity check on held-out test split")
+    test_metrics = evaluate_probe(head, feats_te, labels_te, device=device)
+    print(
+        f"  test: n={test_metrics['n']}  loss={test_metrics['loss']:.4f}  "
+        f"top1={test_metrics['top1']:.4f}  top5={test_metrics['top5']:.4f}"
+    )
+    train_metrics = evaluate_probe(head, feats_tr, labels_tr, device=device)
+    print(
+        f"  train: n={train_metrics['n']}  loss={train_metrics['loss']:.4f}  "
+        f"top1={train_metrics['top1']:.4f}  top5={train_metrics['top5']:.4f}"
+    )
+    gen_gap = train_metrics["top1"] - test_metrics["top1"]
+    print(f"  generalisation gap (train top1 − test top1): {gen_gap:+.4f}")
+
+    # Sanity-check thresholds. Below these, attribution / concept work
+    # would be meaningless (probe didn't learn the task).
+    DEFAULT_MIN_TOP1 = {
+        "funny_birds": 0.30,
+        "dsprites":    0.85,
+        "imagenette":  0.70,
+        "imagenet_val_hf": 0.40,
+    }
+    threshold = (
+        args.min_test_top1
+        if args.min_test_top1 is not None
+        else DEFAULT_MIN_TOP1.get(args.dataset, 0.10)
+    )
+    if test_metrics["top1"] < threshold:
+        raise SystemExit(
+            f"\nFAIL: test top-1 = {test_metrics['top1']:.4f} < threshold "
+            f"{threshold:.2f} for dataset {args.dataset!r}. Probe did not "
+            f"learn the task — re-train with more epochs or check the "
+            f"feature/label pipeline. Probe checkpoint NOT saved."
+        )
+    print(f"  PASS: test top-1 ≥ {threshold:.2f} threshold")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -256,6 +399,9 @@ def main():
             "embed_dim": embed_dim,
             "dataset": args.dataset,
             "head_state_dict": head.state_dict(),
+            "test_top1": test_metrics["top1"],
+            "test_top5": test_metrics["top5"],
+            "train_top1": train_metrics["top1"],
         },
         args.out,
     )
