@@ -144,26 +144,25 @@ def main():
     data_dir = Path(__file__).resolve().parents[1] / "data"
     p.add_argument(
         "--dataset",
-        choices=("imagenette", "imagenet_val"),
+        choices=("imagenette", "imagenet_val_hf"),
         default="imagenette",
         help="evaluation set source. ``imagenette`` (default) is fast and "
-             "auto-downloads (~98 MB); ``imagenet_val`` requires a manually "
-             "populated <repo>/data/imagenet_val/ tree (see "
-             "experiments/datasets.py docstring).",
+             "auto-downloads (~98 MB); ``imagenet_val_hf`` is the un-gated "
+             "HuggingFace mirror of the full ImageNet-1k val (~830 MB).",
     )
     p.add_argument(
         "--n-per-class",
         type=int,
         default=None,
         help="images per class. Default 16 for imagenette (4 classes × 16 = "
-             "64 imgs), 1 for imagenet_val (1000 classes × 1 = 1000 imgs).",
+             "64 imgs), 1 for imagenet_val_hf (1000 classes × 1 = 1000 imgs).",
     )
     p.add_argument(
         "--classes",
         default="",
         help="comma-separated ImageNet-1k class indices to restrict to. "
              "Default: a 4-class Imagenette subset for --dataset=imagenette, "
-             "all classes for imagenet_val.",
+             "all classes for imagenet_val_hf.",
     )
     p.add_argument("--layer", type=int, default=6)
     p.add_argument(

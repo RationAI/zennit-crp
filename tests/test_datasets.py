@@ -28,12 +28,12 @@ sys.path.insert(0, str(REPO_ROOT / "experiments"))
 def test_imports():
     """All expected classes + functions importable from the package."""
     from datasets import (
-        CuratedDataset, DATASETS, IMAGENETTE_TO_IMAGENET, IMAGENET_SYNSETS_PATH,
-        load, load_imagenette, load_imagenet_val, load_imagenet_val_hf,
-        ImagenetteDataset, ImagenetValDataset, ImagenetValHFDataset,
+        CuratedDataset, DATASETS, IMAGENETTE_TO_IMAGENET,
+        load, load_imagenette, load_imagenet_val_hf,
+        ImagenetteDataset, ImagenetValHFDataset,
         FunnyBirdsDataset, DSpritesDataset,
     )
-    expected_names = {"imagenette", "imagenet_val", "imagenet_val_hf",
+    expected_names = {"imagenette", "imagenet_val_hf",
                       "funny_birds", "dsprites"}
     assert set(DATASETS) == expected_names
 

@@ -49,14 +49,14 @@ def main():
     data_dir = Path(__file__).resolve().parents[1] / "data"
     p.add_argument(
         "--dataset",
-        choices=("imagenette", "imagenet_val"),
+        choices=("imagenette", "imagenet_val_hf"),
         default="imagenette",
     )
     p.add_argument(
         "--n-per-class",
         type=int,
         default=None,
-        help="Default 16 for imagenette, 1 for imagenet_val.",
+        help="Default 16 for imagenette, 1 for imagenet_val_hf.",
     )
     p.add_argument(
         "--classes",

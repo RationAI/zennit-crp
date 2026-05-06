@@ -87,7 +87,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}")
     ckpt = torch.load(args.probe, map_location=device, weights_only=False)
-    print(f"probe: {args.probe}  (test_top1={ckpt.get('test_top1', '?'):.4f})")
+    print(f"probe: {args.probe}  (val_acc={ckpt.get('val_acc', '?')})")
 
     model = timm.create_model(
         ckpt["model_name"], pretrained=True, num_classes=ckpt["num_classes"],

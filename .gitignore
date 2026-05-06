@@ -11,6 +11,10 @@ tests/results/
 # demo.py figure outputs (default --out is figures/comparison.png).
 figures/
 
+# Lightning's default CSVLogger output dir — created by Trainer when no
+# logger is passed. Best-epoch metrics are saved into the probe .pt.
+lightning_logs/
+
 ### uv (uv.lock is committed for reproducibility)
 .python-version
 

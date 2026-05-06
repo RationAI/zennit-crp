@@ -27,6 +27,9 @@ dependencies = [
   "matplotlib",
   "timm>=1.0.26",
   "pillow>=12.2.0",
+  "lightning>=2.0",
+  "torchmetrics>=1.0",
+  "typer>=0.12",
 ]
 
 [project.optional-dependencies]
