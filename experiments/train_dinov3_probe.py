@@ -1,25 +1,58 @@
-"""Train an ImageNet-1k linear probe on top of frozen DINOv3 features.
+"""Train a linear probe on top of frozen DINOv3 features.
 
-Dev recipe (Imagenette, ~9k train imgs):
+Recipes — copy-paste ready, paths match what the walkthrough notebook
+expects (``data/vit_large_patch16_dinov3_probe_<dataset>.pt``):
+
+FunnyBirds (50 synthetic bird classes, ~50k train imgs, 1.5 GB auto-DL):
+
+    uv run python experiments/train_dinov3_probe.py \\
+        --dataset funny_birds --epochs 5 \\
+        --out data/vit_large_patch16_dinov3_probe_funny_birds.pt
+
+dsprites (3 shape classes by default, ~26 MB auto-DL):
+
+    uv run python experiments/train_dinov3_probe.py \\
+        --dataset dsprites --dsprites-target shape --epochs 5 \\
+        --out data/vit_large_patch16_dinov3_probe_dsprites.pt
+
+ImageNet-1k val (un-gated HF mirror, ~830 MB auto-DL):
+
+    uv run python experiments/train_dinov3_probe.py \\
+        --dataset imagenet_val_hf --epochs 5 \\
+        --out data/vit_large_patch16_dinov3_probe_imagenet.pt
+
+Imagenette (10-class ImageNet subset, ~98 MB auto-DL — quick dev loop):
 
     uv run python experiments/train_dinov3_probe.py \\
         --dataset imagenette --split train --epochs 10 \\
-        --out data/dinov3_vitl16_probe_imagenette.pt
+        --out data/vit_large_patch16_dinov3_probe_imagenette.pt
 
-Prod recipe (full ImageNet train, ~1.28M imgs; gated, see datasets.py):
+Full ImageNet train (~1.28M imgs; gated, manual setup; see
+experiments/datasets/imagenet.py):
 
     uv run python experiments/train_dinov3_probe.py \\
         --dataset imagenet_train --split train --epochs 5 \\
-        --out data/dinov3_vitl16_probe_in1k.pt
+        --out data/vit_large_patch16_dinov3_probe_in1k.pt
+
+Container note: if ``/dev/shm`` is small (~64 MB), pass
+``--num-workers 0`` to bypass DataLoader shared-memory entirely. The
+file_system sharing strategy is set by default but workers > 0 still
+allocate small amounts of shm during startup.
 
 Pipeline:
 
-1. Load ``vit_large_patch16_dinov3`` (304 M params), freeze backbone.
+1. Load ``vit_large_patch16_dinov3`` (304 M params), freeze backbone
+   (``requires_grad_=False`` on every param).
 2. One pass over the dataset: extract cls-token features per image, cache
    to ``<out_stem>_feats.pt``. Subsequent epochs read the cache (instant).
-3. Train an ``nn.Linear(1024, 1000)`` head — AdamW, cosine schedule,
-   cross-entropy. ImageNet-1k targets (Imagenette → maps to 10 of 1000).
-4. Save head state-dict to ``<out>``.
+3. Stratified per-class 90/10 train/test split on the cached features
+   (``--test-frac`` to override).
+4. Train an ``nn.Linear(1024, num_classes)`` head — AdamW, cosine
+   schedule, cross-entropy. ``num_classes`` auto-detected from the
+   dataset (e.g., 50 for funny_birds).
+5. Sanity-check on the held-out test split; abort with non-zero exit if
+   test top-1 below ``--min-test-top1`` (per-dataset default).
+6. Save head state-dict + train/test metrics to ``<out>``.
 
 The head is what the CRP pipeline attribute-conditions on (``y =
 class_idx``). Backbone is never updated — DINOv3 weights stay frozen.
