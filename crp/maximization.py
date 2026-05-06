@@ -12,13 +12,14 @@ from crp.concepts import Concept
 
 class Maximization:
 
-    def __init__(self, mode="relevance", max_target="sum", abs_norm=False, path=None):
+    def __init__(self, mode="relevance", max_target="sum", abs_norm=False, path=None, concept_mode=None):
 
         self.d_c_sorted, self.rel_c_sorted, self.rf_c_sorted = {}, {}, {}
         self.SAMPLE_SIZE = 40
 
         self.max_target = max_target
         self.abs_norm = abs_norm
+        self.concept_mode = concept_mode
 
         # generate path string for filenames
         if abs_norm:
@@ -26,10 +27,12 @@ class Maximization:
         else:
             norm_str = "unnormed"
 
+        cm_part = f"{concept_mode}_" if concept_mode else ""
+
         if mode == "relevance":
-            self.sub_folder = Path(f"RelMax_{max_target}_{norm_str}/")
+            self.sub_folder = Path(f"RelMax_{cm_part}{max_target}_{norm_str}/")
         elif mode == "activation":
-            self.sub_folder = Path(f"ActMax_{max_target}_{norm_str}/")
+            self.sub_folder = Path(f"ActMax_{cm_part}{max_target}_{norm_str}/")
         else:
             raise ValueError("<mode> must be 'relevance' or 'activation'.")
 
@@ -43,7 +46,7 @@ class Maximization:
     def analyze_layer(self, rel, concept: Concept, layer_name: str, data_indices, targets):
 
         b_c_sorted, rel_c_sorted, rf_c_sorted = concept.reference_sampling(
-            rel, layer_name, self.max_target, self.abs_norm)
+            rel, layer_name, self.max_target, self.abs_norm, concept_mode=self.concept_mode)
         # convert batch index to dataset wide index
         data_indices = torch.from_numpy(data_indices).to(b_c_sorted)
         d_c_sorted = torch.take(data_indices, b_c_sorted)

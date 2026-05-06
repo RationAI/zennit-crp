@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import warnings
 from typing import List, Dict
 
 
@@ -16,7 +17,7 @@ class Concept:
 
         raise NotImplementedError("'Concept'class must be implemented!")
 
-    def reference_sampling(self, relevance, layer_name: str = None, max_target: str = "sum", abs_norm=True):
+    def reference_sampling(self, relevance, layer_name: str = None, max_target: str = "sum", abs_norm=True, concept_mode: str = None):
 
         raise NotImplementedError("'Concept'class must be implemented!")
 
@@ -116,11 +117,14 @@ class ChannelConcept(Concept):
 
         return rel_l
 
-    def reference_sampling(self, relevance, layer_name: str = None, max_target: str = "sum", abs_norm=True):
+    def reference_sampling(self, relevance, layer_name: str = None, max_target: str = "sum", abs_norm=True, concept_mode: str = None):
         """
         Parameters:
             max_target: str. Either 'sum' or 'max'.
+            concept_mode: ignored by ChannelConcept (accepted for API parity with AttentionHeadConcept).
         """
+
+        del concept_mode
 
         # position of receptive field neuron
         rel_l = relevance.view(*relevance.shape[:2], -1)
@@ -156,6 +160,7 @@ class AttentionHeadConcept(ChannelConcept):
 
     def __init__(self):
         self._num_heads_by_layer = {}
+        self._fallback_warned = set()
 
     def register_num_heads(self, layer_name: str, num_heads: int):
         """Register number of attention heads for a specific layer name."""
@@ -261,6 +266,47 @@ class AttentionHeadConcept(ChannelConcept):
 
         return mask_fct
 
+    @staticmethod
+    def dimension_mask(batch_id: int, concept_ids: List, layer_name=None):
+        """
+        Column-wise mask for hidden-dimension concepts in transformer layers.
+
+        Each concept corresponds to one hidden-dimension index shared across all
+        token positions. For a gradient of shape [batch, seq_len, hidden_dim],
+        this keeps only the selected columns (dimension indices) and zeroes all others.
+        """
+
+        def mask_fct(grad):
+
+            mask = torch.zeros_like(grad[batch_id])
+            mask[:, concept_ids] = 1
+            grad[batch_id] = grad[batch_id] * mask
+
+            return grad
+
+        return mask_fct
+
+    @staticmethod
+    def dimension_mask_rf(batch_id: int, c_n_map: Dict[int, List], layer_name=None):
+        """
+        Receptive-field mask for hidden-dimension concepts in transformer layers.
+
+        Activates the single element at (token_position, dim_id) for each concept,
+        restricting the conditional heatmap to the token position that was most
+        relevant for that dimension concept.
+        """
+
+        def mask_fct(grad):
+
+            mask = torch.zeros_like(grad[batch_id])   # [seq_len, hidden_dim]
+            for dim_id, token_positions in c_n_map.items():
+                mask[token_positions, dim_id] = 1
+            grad[batch_id] = grad[batch_id] * mask
+
+            return grad
+
+        return mask_fct
+
     def attribute(self, relevance, mask=None, layer_name: str = None, abs_norm=True):
 
         if isinstance(mask, torch.Tensor):
@@ -279,3 +325,87 @@ class AttentionHeadConcept(ChannelConcept):
             rel_l = rel_l / (torch.abs(rel_l).sum(-1).view(-1, 1) + 1e-10)
 
         return rel_l
+
+    def reference_sampling(self, relevance, layer_name: str = None, max_target: str = "sum", abs_norm=True, concept_mode: str = None):
+        """
+        Reference sampling for attention layers.
+
+        concept_mode:
+            'head'      -> concepts are attention heads. Reshape [B, S, H*D] -> [B, H, S*D],
+                           reduce over (S, D). rf index is flat over S*D for that head.
+            'token'     -> falls back to ChannelConcept.reference_sampling (token = channel).
+            'dimension' -> concepts are hidden-dim indices. Reduce over token positions;
+                           rf index is the token position with max relevance for that dim.
+            None        -> defaults to 'head'.
+        """
+
+        if concept_mode is None:
+            concept_mode = "head"
+
+        if concept_mode == "token":
+            return ChannelConcept.reference_sampling(
+                self, relevance, layer_name, max_target, abs_norm)
+
+        if concept_mode == "dimension":
+            if relevance.dim() != 3:
+                raise ValueError(
+                    f"AttentionHeadConcept: 'dimension' mode expects 3-D relevance "
+                    f"[B, N, D], got shape {tuple(relevance.shape)}."
+                )
+            batch, seq_len, hidden_dim = relevance.shape
+            # rf: for each (image, dim), which token position has max relevance
+            rf_neuron = torch.argmax(relevance, dim=1)          # [B, hidden_dim]
+            if max_target == "sum":
+                rel_l = relevance.sum(dim=1)                    # [B, hidden_dim]
+            elif max_target == "max":
+                rel_l = torch.gather(
+                    relevance, 1, rf_neuron.unsqueeze(1)
+                ).squeeze(1)                                     # [B, hidden_dim]
+            else:
+                raise ValueError("'max_target' supports only 'max' or 'sum'.")
+            if abs_norm:
+                rel_l = rel_l / (torch.abs(rel_l).sum(-1).view(-1, 1) + 1e-10)
+            d_ch_sorted = torch.argsort(rel_l, dim=0, descending=True)
+            rel_ch_sorted = torch.gather(rel_l, 0, d_ch_sorted)
+            rf_ch_sorted = torch.gather(rf_neuron, 0, d_ch_sorted)
+            return d_ch_sorted, rel_ch_sorted, rf_ch_sorted
+
+        if concept_mode != "head":
+            raise ValueError(f"AttentionHeadConcept: unknown concept_mode '{concept_mode}'.")
+
+        num_heads = self._resolve_num_heads(layer_name) if layer_name else None
+
+        if num_heads is None or relevance.dim() != 3 or relevance.shape[-1] % num_heads != 0:
+            if layer_name not in self._fallback_warned:
+                warnings.warn(
+                    f"AttentionHeadConcept: cannot resolve head layout for layer '{layer_name}' "
+                    f"(num_heads={num_heads}, shape={tuple(relevance.shape)}). "
+                    "Falling back to token-mode (channel) reference sampling.")
+                self._fallback_warned.add(layer_name)
+            return ChannelConcept.reference_sampling(
+                self, relevance, layer_name, max_target, abs_norm)
+
+        batch, seq_len, hidden_dim = relevance.shape
+        head_dim = hidden_dim // num_heads
+
+        # [B, S, H, D] -> [B, H, S, D] -> [B, H, S*D]
+        rel_h = relevance.view(batch, seq_len, num_heads, head_dim)
+        rel_h = rel_h.permute(0, 2, 1, 3).contiguous().view(batch, num_heads, seq_len * head_dim)
+
+        rf_neuron = torch.argmax(rel_h, dim=-1)
+
+        if max_target == "sum":
+            rel_l = torch.sum(rel_h, dim=-1)
+        elif max_target == "max":
+            rel_l = torch.gather(rel_h, -1, rf_neuron.unsqueeze(-1)).squeeze(-1)
+        else:
+            raise ValueError("'max_target' supports only 'max' or 'sum'.")
+
+        if abs_norm:
+            rel_l = rel_l / (torch.abs(rel_l).sum(-1).view(-1, 1) + 1e-10)
+
+        d_ch_sorted = torch.argsort(rel_l, dim=0, descending=True)
+        rel_ch_sorted = torch.gather(rel_l, 0, d_ch_sorted)
+        rf_ch_sorted = torch.gather(rf_neuron, 0, d_ch_sorted)
+
+        return d_ch_sorted, rel_ch_sorted, rf_ch_sorted

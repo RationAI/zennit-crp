@@ -11,7 +11,7 @@ from tqdm import tqdm
 from zennit.composites import NameMapComposite, Composite
 from crp.attribution import CondAttribution
 from crp.maximization import Maximization
-from crp.concepts import ChannelConcept, Concept
+from crp.concepts import ChannelConcept, Concept, AttentionHeadConcept
 from crp.statistics import Statistics
 from crp.hooks import FeatVisHook
 from crp.helper import load_maximization, load_statistics, load_stat_targets
@@ -21,9 +21,21 @@ from crp.cache import Cache
 
 class FeatureVisualization:
 
+    # Attention-layer variants (head / token / dimension) are automatically skipped
+    # for ChannelConcept layers; the (None, ...) variants are skipped for attention
+    # layers. Both sets are registered so a single FeatureVisualization instance can
+    # handle mixed layer_maps containing both CNN and transformer layers.
+    DEFAULT_VARIANTS = [
+        ("head",      "sum"), ("head",      "max"),
+        ("token",     "sum"), ("token",     "max"),
+        ("dimension", "sum"), ("dimension", "max"),
+        (None,        "sum"), (None,        "max"),   # channel concepts for CNN layers
+    ]
+
     def __init__(
             self, attribution: CondAttribution, dataset, layer_map: Dict[str, Concept], preprocess_fn: Callable=None,
-            max_target="sum", abs_norm=True, path="FeatureVisualization", device=None, cache: Cache=None):
+            max_target=None, abs_norm=True, path="FeatureVisualization", device=None, cache: Cache=None,
+            variants: List[Tuple[str, str]]=None):
 
         self.dataset = dataset
         self.layer_map = layer_map
@@ -33,11 +45,26 @@ class FeatureVisualization:
 
         self.device = attribution.device if device is None else device
 
-        self.RelMax = Maximization("relevance", max_target, abs_norm, path)
-        self.ActMax = Maximization("activation", max_target, abs_norm, path)
+        # Resolve variants. Back-compat: if user passes only `max_target` (legacy),
+        # build a single variant with concept_mode=None so the old folder name
+        # `RelMax_{max_target}_{norm}/` is preserved.
+        if variants is None:
+            if max_target is not None:
+                variants = [(None, max_target)]
+            else:
+                variants = list(self.DEFAULT_VARIANTS)
+        self.variants = variants
 
-        self.RelStats = Statistics("relevance", max_target, abs_norm, path)
-        self.ActStats = Statistics("activation", max_target, abs_norm, path)
+        self.RelMax: Dict[Tuple, Maximization] = {}
+        self.ActMax: Dict[Tuple, Maximization] = {}
+        self.RelStats: Dict[Tuple, Statistics] = {}
+        self.ActStats: Dict[Tuple, Statistics] = {}
+
+        for cm, mt in self.variants:
+            self.RelMax[(cm, mt)] = Maximization("relevance", mt, abs_norm, path, concept_mode=cm)
+            self.ActMax[(cm, mt)] = Maximization("activation", mt, abs_norm, path, concept_mode=cm)
+            self.RelStats[(cm, mt)] = Statistics("relevance", mt, abs_norm, path, concept_mode=cm)
+            self.ActStats[(cm, mt)] = Statistics("activation", mt, abs_norm, path, concept_mode=cm)
 
         self.Cache = cache
 
@@ -86,7 +113,12 @@ class FeatureVisualization:
         data_end: exclusively counted
         """
 
-        self.saved_checkpoints = {"r_max": [], "a_max": [], "r_stats": [], "a_stats": []}
+        self.saved_checkpoints = {
+            "r_max": {key: [] for key in self.variants},
+            "a_max": {key: [] for key in self.variants},
+            "r_stats": {key: [] for key in self.variants},
+            "a_stats": {key: [] for key in self.variants},
+        }
         last_checkpoint = 0
 
         n_samples = data_end - data_start
@@ -162,15 +194,30 @@ class FeatureVisualization:
 
         return self.saved_checkpoints
 
+    def _variant_applies(self, concept_mode, concept):
+        """
+        Gate variants to the right concept class.
+        - head / token / dimension → only AttentionHeadConcept layers
+        - None (legacy channel mode) → only non-attention layers (ChannelConcept, etc.)
+        """
+        is_attention = isinstance(concept, AttentionHeadConcept)
+        if concept_mode in ("head", "token", "dimension"):
+            return is_attention
+        # concept_mode is None: legacy channel/CNN mode
+        return not is_attention
+
     @torch.no_grad()
     def analyze_relevance(self, rel, layer_name, concept, data_indices, targets):
         """
         Finds input samples that maximally activate each neuron in a layer and most relevant samples
         """
-        d_c_sorted, rel_c_sorted, rf_c_sorted, t_c_sorted = self.RelMax.analyze_layer(
-            rel, concept, layer_name, data_indices, targets)
-
-        self.RelStats.analyze_layer(d_c_sorted, rel_c_sorted, rf_c_sorted, t_c_sorted, layer_name)
+        for key in self.variants:
+            cm, _ = key
+            if not self._variant_applies(cm, concept):
+                continue
+            d_c_sorted, rel_c_sorted, rf_c_sorted, t_c_sorted = self.RelMax[key].analyze_layer(
+                rel, concept, layer_name, data_indices, targets)
+            self.RelStats[key].analyze_layer(d_c_sorted, rel_c_sorted, rf_c_sorted, t_c_sorted, layer_name)
 
     @torch.no_grad()
     def analyze_activation(self, act, layer_name, concept, data_indices, targets):
@@ -184,26 +231,31 @@ class FeatureVisualization:
         act = act[unique_indices]
         targets = targets[unique_indices]
 
-        d_c_sorted, act_c_sorted, rf_c_sorted, t_c_sorted = self.ActMax.analyze_layer(
-            act, concept, layer_name, data_indices, targets)
-
-        self.ActStats.analyze_layer(d_c_sorted, act_c_sorted, rf_c_sorted, t_c_sorted, layer_name)
+        for key in self.variants:
+            cm, _ = key
+            if not self._variant_applies(cm, concept):
+                continue
+            d_c_sorted, act_c_sorted, rf_c_sorted, t_c_sorted = self.ActMax[key].analyze_layer(
+                act, concept, layer_name, data_indices, targets)
+            self.ActStats[key].analyze_layer(d_c_sorted, act_c_sorted, rf_c_sorted, t_c_sorted, layer_name)
 
     def _save_results(self, d_index=None):
 
-        self.saved_checkpoints["r_max"].extend(self.RelMax._save_results(d_index))
-        self.saved_checkpoints["a_max"].extend(self.ActMax._save_results(d_index))
-        self.saved_checkpoints["r_stats"].extend(self.RelStats._save_results(d_index))
-        self.saved_checkpoints["a_stats"].extend(self.ActStats._save_results(d_index))
+        for key in self.variants:
+            self.saved_checkpoints["r_max"][key].extend(self.RelMax[key]._save_results(d_index))
+            self.saved_checkpoints["a_max"][key].extend(self.ActMax[key]._save_results(d_index))
+            self.saved_checkpoints["r_stats"][key].extend(self.RelStats[key]._save_results(d_index))
+            self.saved_checkpoints["a_stats"][key].extend(self.ActStats[key]._save_results(d_index))
 
-    def collect_results(self, checkpoints: Dict[str, List[str]], d_index: Tuple[int, int] = None):
+    def collect_results(self, checkpoints: Dict[str, Dict[Tuple, List[str]]], d_index: Tuple[int, int] = None):
 
-        saved_files = {}
+        saved_files = {"r_max": {}, "a_max": {}, "r_stats": {}, "a_stats": {}}
 
-        saved_files["r_max"] = self.RelMax.collect_results(checkpoints["r_max"], d_index)
-        saved_files["a_max"] = self.ActMax.collect_results(checkpoints["a_max"], d_index)
-        saved_files["r_stats"] = self.RelStats.collect_results(checkpoints["r_stats"], d_index)
-        saved_files["a_stats"] = self.ActStats.collect_results(checkpoints["a_stats"], d_index)
+        for key in self.variants:
+            saved_files["r_max"][key] = self.RelMax[key].collect_results(checkpoints["r_max"][key], d_index)
+            saved_files["a_max"][key] = self.ActMax[key].collect_results(checkpoints["a_max"][key], d_index)
+            saved_files["r_stats"][key] = self.RelStats[key].collect_results(checkpoints["r_stats"][key], d_index)
+            saved_files["a_stats"][key] = self.ActStats[key].collect_results(checkpoints["a_stats"][key], d_index)
 
         return saved_files
 
@@ -289,10 +341,27 @@ class FeatureVisualization:
 
         return wrapper
 
+    def _resolve_variant_key(self, layer_name, concept_mode=None, max_target="sum"):
+        """
+        Resolve which (concept_mode, max_target) variant to use for `layer_name`.
+        Falls back to legacy single-variant key (None, max_target) if present.
+        """
+        if concept_mode is None:
+            concept = self.layer_map.get(layer_name)
+            concept_mode = "head" if isinstance(concept, AttentionHeadConcept) else None
+        key = (concept_mode, max_target)
+        if key in self.RelMax:
+            return key
+        if (None, max_target) in self.RelMax:
+            return (None, max_target)
+        raise KeyError(
+            f"FeatureVisualization: variant {key} not configured for layer '{layer_name}'. "
+            f"Available variants: {list(self.RelMax.keys())}.")
+
     @cache_reference
     def get_max_reference(
             self, concept_ids: Union[int,list], layer_name: str, mode="relevance", r_range: Tuple[int, int] = (0, 8), composite: Composite=None,
-            rf=False, plot_fn=vis_img_heatmap, batch_size=32)-> Dict:
+            rf=False, plot_fn=vis_img_heatmap, batch_size=32, concept_mode: str=None, max_target: str="sum")-> Dict:
         """
         Retreive reference samples for a list of concepts in a layer. Relevance and Activation Maximization
         are availble if FeatureVisualization was computed for the mode. In addition, conditional heatmaps can be computed on reference samples.
@@ -331,10 +400,11 @@ class FeatureVisualization:
         ref_c = {}
         if not isinstance(concept_ids, Iterable):
             concept_ids = [concept_ids]
+        key = self._resolve_variant_key(layer_name, concept_mode, max_target)
         if mode == "relevance":
-            d_c_sorted, _, rf_c_sorted = load_maximization(self.RelMax.PATH, layer_name)
+            d_c_sorted, _, rf_c_sorted = load_maximization(self.RelMax[key].PATH, layer_name)
         elif mode == "activation":
-            d_c_sorted, _, rf_c_sorted = load_maximization(self.ActMax.PATH, layer_name)
+            d_c_sorted, _, rf_c_sorted = load_maximization(self.ActMax[key].PATH, layer_name)
         else:
             raise ValueError("`mode` must be `relevance` or `activation`")
 
@@ -346,13 +416,13 @@ class FeatureVisualization:
             d_indices = d_c_sorted[r_range[0]:r_range[1], c_id]
             n_indices = rf_c_sorted[r_range[0]:r_range[1], c_id]
 
-            ref_c[c_id] = self._load_ref_and_attribution(d_indices, c_id, n_indices, layer_name, composite, rf, plot_fn, batch_size)
+            ref_c[c_id] = self._load_ref_and_attribution(d_indices, c_id, n_indices, layer_name, composite, rf, plot_fn, batch_size, concept_mode=concept_mode)
 
         return ref_c
 
     @cache_reference
     def get_stats_reference(self, concept_id: int, layer_name: str, targets: Union[int, list], mode="relevance", r_range: Tuple[int, int] = (0, 8),
-            composite=None, rf=False, plot_fn=vis_img_heatmap, batch_size=32):
+            composite=None, rf=False, plot_fn=vis_img_heatmap, batch_size=32, concept_mode: str=None, max_target: str="sum"):
         """
         Retreive reference samples for a single concept in a layer wrt. different explanation targets i.e. returns the reference samples
         that are computed by self.compute_stats. Relevance and Activation are availble if FeatureVisualization was computed for the statitics mode. 
@@ -393,33 +463,34 @@ class FeatureVisualization:
         ref_t = {}
         if not isinstance(targets, Iterable):
             targets = [targets]
+        key = self._resolve_variant_key(layer_name, concept_mode, max_target)
         if mode == "relevance":
-            path = self.RelStats.PATH
+            path = self.RelStats[key].PATH
         elif mode == "activation":
-            path = self.ActStats.PATH 
+            path = self.ActStats[key].PATH
         else:
             raise ValueError("`mode` must be `relevance` or `activation`")
-        
+
         if rf and not composite:
             warnings.warn("The receptive field is only computed, if you fill the 'composite' argument with a zennit Composite.")
 
         for t in targets:
-            
+
             d_c_sorted, _, rf_c_sorted = load_statistics(path, layer_name, t)
             d_indices = d_c_sorted[r_range[0]:r_range[1], concept_id]
             n_indices = rf_c_sorted[r_range[0]:r_range[1], concept_id]
 
-            ref_t[f"{concept_id}:{t}"] = self._load_ref_and_attribution(d_indices, concept_id, n_indices, layer_name, composite, rf, plot_fn, batch_size)
+            ref_t[f"{concept_id}:{t}"] = self._load_ref_and_attribution(d_indices, concept_id, n_indices, layer_name, composite, rf, plot_fn, batch_size, concept_mode=concept_mode)
 
         return ref_t
 
-    def _load_ref_and_attribution(self, d_indices, c_id, n_indices, layer_name, composite, rf, plot_fn, batch_size):
+    def _load_ref_and_attribution(self, d_indices, c_id, n_indices, layer_name, composite, rf, plot_fn, batch_size, concept_mode=None):
 
         data_batch, _ = self.get_data_concurrently(d_indices, preprocessing=False)
 
         if composite:
             data_p = self.preprocess_data(data_batch)
-            heatmaps = self._attribution_on_reference(data_p, c_id, layer_name, composite, rf, n_indices, batch_size)
+            heatmaps = self._attribution_on_reference(data_p, c_id, layer_name, composite, rf, n_indices, batch_size, concept_mode=concept_mode)
 
             if callable(plot_fn):
                 return plot_fn(data_batch.detach(), heatmaps.detach(), rf)
@@ -429,7 +500,7 @@ class FeatureVisualization:
         else:
             return data_batch.detach().cpu()
 
-    def _attribution_on_reference(self, data, concept_id: int, layer_name: str, composite, rf=False, neuron_ids: list=[], batch_size=32):
+    def _attribution_on_reference(self, data, concept_id: int, layer_name: str, composite, rf=False, neuron_ids: list=[], batch_size=32, concept_mode=None):
 
         n_samples = len(data)
         if n_samples > batch_size:
@@ -441,25 +512,40 @@ class FeatureVisualization:
         if rf and (len(neuron_ids) != n_samples):
             raise ValueError("length of 'neuron_ids' must be equal to the length of 'data'")
 
+        # Select gradient mask functions based on concept mode.
+        if concept_mode == "dimension":
+            full_mask_map = AttentionHeadConcept.dimension_mask
+            rf_mask_map   = AttentionHeadConcept.dimension_mask_rf
+        elif concept_mode == "token":
+            # Token concepts = row indices in [seq_len, hidden_dim]; use channel mask (row mask).
+            full_mask_map = ChannelConcept.mask
+            rf_mask_map   = ChannelConcept.mask_rf
+        else:
+            # "head" or None (CNN): let attribution class apply its registered default mask.
+            full_mask_map = None
+            rf_mask_map   = ChannelConcept.mask_rf
+
         heatmaps = []
         for b in range(batches):
             data_batch = data[b * batch_size: (b + 1) * batch_size].detach().requires_grad_()
-            
+
             if rf:
                 batch_neuron_ids = neuron_ids[b * batch_size: (b + 1) * batch_size]
                 conditions = [{layer_name: {concept_id: n_index}} for n_index in batch_neuron_ids]
-                attr = self.attribution(data_batch, conditions, composite, mask_map=ChannelConcept.mask_rf, start_layer=layer_name, on_device=self.device, 
-                    exclude_parallel=False)
+                attr = self.attribution(data_batch, conditions, composite, mask_map=rf_mask_map,
+                    start_layer=layer_name, on_device=self.device, exclude_parallel=False)
             else:
-                conditions = [{layer_name: [concept_id]}] 
-                # initialize relevance with activation before non-linearity (could be changed in a future release)
-                attr = self.attribution(data_batch, conditions, composite, start_layer=layer_name, on_device=self.device, exclude_parallel=False)
+                conditions = [{layer_name: [concept_id]}]
+                kwargs = dict(start_layer=layer_name, on_device=self.device, exclude_parallel=False)
+                if full_mask_map is not None:
+                    kwargs["mask_map"] = full_mask_map
+                attr = self.attribution(data_batch, conditions, composite, **kwargs)
 
             heatmaps.append(attr.heatmap)
 
         return torch.cat(heatmaps, dim=0)
 
-    def compute_stats(self, concept_id, layer_name: str, mode="relevance", top_N=5, mean_N=10, norm=False) -> Tuple[list, list]:
+    def compute_stats(self, concept_id, layer_name: str, mode="relevance", top_N=5, mean_N=10, norm=False, concept_mode: str=None, max_target: str="sum") -> Tuple[list, list]:
         """
         Computes statistics about the targets i.e. classes that are most relevant or most activating for the concept with index 'concept_id'
         in layer 'layer_name'. Statistics must be computed before utilizing this method.
@@ -484,13 +570,14 @@ class FeatureVisualization:
         sorted_val: list of respective mean relevance/activation values for each target 
         """
 
+        key = self._resolve_variant_key(layer_name, concept_mode, max_target)
         if mode == "relevance":
-            path = self.RelStats.PATH
+            path = self.RelStats[key].PATH
         elif mode == "activation":
-            path = self.ActStats.PATH 
+            path = self.ActStats[key].PATH
         else:
             raise ValueError("`mode` must be `relevance` or `activation`")
-        
+
         targets = load_stat_targets(path)
 
         rel_target = torch.zeros(len(targets))

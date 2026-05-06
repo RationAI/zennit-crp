@@ -461,7 +461,24 @@ class CondAttribution:
             if isinstance(output, tuple):
                 output = output[0]
             layer_out[layer_name] = output
-            output.retain_grad()
+
+            # Capture gradient BEFORE any MaskHook.wrapper fires.
+            # retain_grad() stores .grad AFTER all register_hook callbacks (via C++ accumulate_grad),
+            # so it would capture the post-mask gradient — wrong for conditional attribution.
+            # This hook is registered first (recording forward hook fires before mask forward hook),
+            # so in FIFO backward order it fires before MaskHook.wrapper.
+            def _capture_pre_mask(g):
+                # Only capture on the first backward pass through this tensor.
+                # With exclude_parallel=True the backward() method calls
+                # torch.autograd.grad(pred → layer_out) followed by
+                # torch.autograd.backward(layer_out, masked_grad), so the hook
+                # fires twice.  The first fire carries the pre-mask gradient;
+                # the second carries the already-masked value — skip it.
+                if getattr(layer_out[layer_name], '_crp_grad', None) is None:
+                    layer_out[layer_name]._crp_grad = g.detach().clone()
+                return g
+
+            output.register_hook(_capture_pre_mask)
 
         return get_tensor_hook
 
@@ -523,14 +540,15 @@ class CondAttribution:
             activations[name] = act.to(on_device) if on_device else act
             activations[name].requires_grad = False
 
-            if layer_out[name].grad is None:
+            crp_grad = getattr(layer_out[name], '_crp_grad', None)
+            if crp_grad is None:
                 rel = torch.zeros_like(activations[name], requires_grad=False)[:length]
                 relevances[name] = rel.to(on_device) if on_device else rel
             else:
-                rel = layer_out[name].grad.detach()[:length]
+                rel = crp_grad[:length]
                 relevances[name] = rel.to(on_device) if on_device else rel
                 relevances[name].requires_grad = False
-                layer_out[name].grad = None
+                layer_out[name]._crp_grad = None  # clear for next backward in generate()
 
         return activations, relevances
 
