@@ -26,9 +26,10 @@ class FeatureVisualization:
     # layers. Both sets are registered so a single FeatureVisualization instance can
     # handle mixed layer_maps containing both CNN and transformer layers.
     DEFAULT_VARIANTS = [
-        ("head",  "sum"), ("head",  "max"),
-        ("token", "sum"), ("token", "max"),
-        (None,    "sum"), (None,    "max"),   # channel concepts for CNN layers
+        ("head",      "sum"), ("head",      "max"),
+        ("token",     "sum"), ("token",     "max"),
+        ("dimension", "sum"), ("dimension", "max"),
+        (None,        "sum"), (None,        "max"),   # channel concepts for CNN layers
     ]
 
     def __init__(
