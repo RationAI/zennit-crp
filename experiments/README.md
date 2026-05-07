@@ -1,81 +1,54 @@
 # Experiments
 
-Sweeps, audits, and one-off analyses that drove the design choices in
-`crp.attention_concepts` and `crp.transformer_patches`. None of these are
-prerequisites for using the library — they are research artefacts. The
-narrative findings live in [`CURRENT_STATE.md`](../CURRENT_STATE.md);
-each entry below points at its corresponding milestone there.
+Composable building blocks for the explainability work in this repo:
+
+* [`models/`](models/) — frozen ViT bases (`vit_base`, `vit_dinov3`) and
+  trainable heads (`linear`, `attentive`), composed via
+  `build_probe(...)`. Same registry the CLI and walkthrough notebook
+  consume.
+* [`datasets/`](datasets/) — auto-downloading dataset loaders
+  (`imagenette`, `imagenet_val_hf`, `funny_birds`, `dsprites`).
+* [`train_probe.py`](train_probe.py) — typer CLI with two commands:
+  `cache` (one-shot feature extraction) and `train` (head training on
+  cached features).
+* [`viz_unfolded.py`](viz_unfolded.py) — plotting helpers used by the
+  walkthrough notebook (concept atlases, conditional cascade).
+* [`funnybirds_part_alignment.py`](funnybirds_part_alignment.py) —
+  attribution-on-parts vs background metric, FunnyBirds-only.
 
 All scripts read and write under [`<repo>/data/`](../data) (gitignored).
 Run them from the repo root via `uv run python experiments/<script>.py`.
 
-## Shared machinery
+## Training a probe — the two-step recipe
 
-* [`datasets.py`](datasets.py) — uniform loader for the two evaluation
-  sources. ``load("imagenette", ...)`` returns a 10-class fast.ai subset
-  (~98 MB, auto-downloaded); ``load("imagenet_val", ...)`` returns the
-  full 50 K-image ImageNet-1k val split (gated; expects manual setup
-  under `data/imagenet_val/`). Both yield a `CuratedDataset` whose
-  ``items`` is a list of ``(image_path, imagenet_class_idx)`` and which
-  is also a ``torch.utils.data.Dataset`` ready for FV indexing. The
-  canonical 1000-WordNet-ID list ships at
-  [`_data/imagenet_synsets.txt`](_data/imagenet_synsets.txt).
-* [`metrics.py`](metrics.py) — Petsiuk deletion / insertion AUC,
-  random-concept baseline, per-granularity top-k resolver, image-class
-  iteration helper, ε / γ composite factory. Imported by every milestone
-  driver and also runnable standalone as a single-config CLI.
+Cache features once per `(base, dataset, kind)`:
 
-## Sweep drivers
+```
+uv run train-probe cache vit_dinov3 funny_birds --kind cls
+uv run train-probe cache vit_dinov3 funny_birds --kind tokens
+```
 
-* [`run_milestone_a.py`](run_milestone_a.py) — Milestone A
-  (`CURRENT_STATE.md` § "Milestone A"). γ-LRP sweep on
-  `vit_base_patch16_224`. Builds a 4-class × 16-image curated subset of
-  Imagenette val (idempotent symlink farm), then evaluates ε-LRP plus
-  γ ∈ {0.0, 0.1, 0.25, 0.5} across all four concept granularities.
-  Output: `data/milestone_a_results.csv`.
+Train heads on top:
 
-* [`aggregate_milestone_a.py`](aggregate_milestone_a.py) — turns the
-  Milestone A CSV into a markdown table for the PR description / state
-  doc. Output: `data/milestone_a_table.md`.
+```
+uv run train-probe train vit_dinov3 linear    funny_birds
+uv run train-probe train vit_dinov3 attentive funny_birds --num-heads 8
+```
 
-* [`run_milestone_d.py`](run_milestone_d.py) — Milestone D
-  (`CURRENT_STATE.md` § "Milestone D"). Multi-model PA-LRP sweep across
-  `vit_small`, `vit_base`, `vit_large` × {palrp off, on} on ε-LRP. Tests
-  whether PA-LRP changes Petsiuk AUC (it doesn't — see milestone notes)
-  and how the kqv_head failure scales with model depth. Output:
-  `data/milestone_d_results.csv`.
+Output paths follow `data/<base>_<head>_probe_<dataset>.pt`. The
+walkthrough notebook in
+[`tutorials/vit_crp/dinov3_unfolded/`](../tutorials/vit_crp/dinov3_unfolded/)
+auto-loads them via the same `build_probe(...)` registry.
 
-* [`run_milestone_g.py`](run_milestone_g.py) — Milestone G
-  (`CURRENT_STATE.md` § "Milestone G"). Same multi-model layout × {none,
-  ratio} residual-LRP rules. The only configuration that fixes the
-  kqv_head AUC anomaly at vit_small / vit_base. Output:
-  `data/milestone_g_results.csv`.
+## Adding a new base or head
 
-## Diagnostics
+* New base — drop `models/bases/<name>.py` subclassing `Base` and
+  setting `timm_name`. Register in `models/__init__.py::BASES`.
+* New head — drop `models/heads/<name>.py` subclassing `Head` and
+  setting `input_kind` (`"cls"` or `"tokens"`). Register in
+  `models/__init__.py::HEADS`. If the head takes constructor params,
+  add them to the `train` typer command and forward them via
+  `head_kwargs`.
 
-* [`conservation_check.py`](conservation_check.py) — companion CLI to
-  `tests/test_vit_integration.py::TestConservation`. Measures
-  `R_input.sum() / target_logit` per (model, composite, ± PA-LRP) on a
-  real Imagenette image to surface the conservation drift the LRP rules
-  introduce. Useful when verifying a residual-LRP / PA-LRP change moved
-  the ratio in the right direction.
-
-## Conventions
-
-* All scripts target ε-LRP as default and accept knobs (`--gamma`,
-  `--palrp`, `--rules`) for the milestone-specific sweep variants.
-* `--dataset {imagenette|imagenet_val}` selects the source. Defaults to
-  `imagenette` everywhere; switch to `imagenet_val` for a final pre-PR
-  benchmark run (gated; see [`datasets.py`](datasets.py)).
-* `--n-per-class` and `--classes` further subset the dataset.
-  `--n-per-class` defaults to **16** for imagenette (4 default classes ×
-  16 imgs ≈ 64-image sweep, ~10 min on an A100 MIG slice) and **1** for
-  imagenet_val (1000 classes × 1 img = 1000-image class-balanced sweep,
-  ~1 hour for ε-LRP on vit_base).
-* Top-k is per-granularity by default: `head: 4, head_dim: 8,
-  kqv_head: 8, kqv_head_dim: 8`. Override with `--top-k <int>` to apply
-  one value (clamped to the granularity's concept count). Petsiuk-style
-  union heatmaps need `k ≪ num_concepts` — see
-  [`metrics.PER_GRANULARITY_TOP_K`](metrics.py).
-* Long sweeps print per-image lines; pipe through `tee data/<run>.log` if
-  you want to keep them. Set `PYTHONUNBUFFERED=1` for live progress.
+Both the training CLI and the notebook pick up new entries
+automatically — they iterate the registry.
