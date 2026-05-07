@@ -97,7 +97,7 @@ def _find_unfolded_attentions(model: nn.Module):
             yield name, module
 
 
-def _resolve_dims(layer_name: str, dims: Dict[str, Tuple[int, int]]) -> Tuple[int, int]:
+def _resolve_dims(layer_name: str, dims: Dict[str, tuple]) -> tuple:
     """Return ``(num_heads, head_dim)`` for ``layer_name``, with a
     parent-prefix fallback so e.g. ``blocks.6.attn.context.subthing``
     resolves from a registration on ``blocks.6.attn.context``."""
