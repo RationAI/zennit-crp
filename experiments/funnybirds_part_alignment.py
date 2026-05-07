@@ -41,7 +41,6 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
 import numpy as np
-import timm
 import torch
 from PIL import Image
 from timm.data import resolve_data_config, create_transform
@@ -50,6 +49,7 @@ from crp.attribution import CondAttribution
 from crp.transformer_patches import AttnLRPCombinedComposite
 from datasets import FunnyBirdsDataset
 from datasets.funny_birds import PART_COLORS_TO_NAME, BACKGROUND_COLOR
+from models import build_probe
 
 
 def part_mask_from_pm(part_map_uint8: torch.Tensor):
@@ -89,14 +89,16 @@ def main():
     ckpt = torch.load(args.probe, map_location=device, weights_only=False)
     print(f"probe: {args.probe}  (val_acc={ckpt.get('val_acc', '?')})")
 
-    model = timm.create_model(
-        ckpt["model_name"], pretrained=True, num_classes=ckpt["num_classes"],
+    model = build_probe(
+        base=ckpt["base"], head=ckpt["head"],
+        num_classes=ckpt["num_classes"],
+        head_kwargs=ckpt.get("head_kwargs", {}),
     ).eval().to(device)
     model.head.load_state_dict(ckpt["head_state_dict"])
     for p_ in model.parameters():
         p_.requires_grad_(False)
 
-    cfg = resolve_data_config({}, model=model)
+    cfg = resolve_data_config({}, model=model.backbone)
     transform = create_transform(**cfg, is_training=False)
 
     # Load FunnyBirds *test* split with part maps so we can measure alignment

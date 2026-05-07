@@ -24,6 +24,14 @@ class Base(nn.Module):
     * :meth:`extract_tokens` → ``(B, T, D)`` post-block-norm full token
       sequence (cls + register + patch). Expensive but needed by the
       attentive probe.
+
+    Neither extractor wraps the forward in ``torch.no_grad()`` — frozen
+    params (set in ``__init__``) are sufficient to keep weight updates
+    off during head training, and the AttnLRP composite *needs* the
+    autograd graph at attribution time so its custom backward rules can
+    fire. Wrap explicitly at call sites that don't need the graph
+    (e.g. one-shot feature caching), as :func:`train_probe.cache_cmd`
+    does.
     """
 
     timm_name: str
@@ -40,12 +48,10 @@ class Base(nn.Module):
             self.backbone, "embed_dim", self.backbone.num_features,
         )
 
-    @torch.no_grad()
     def extract_cls(self, x: torch.Tensor) -> torch.Tensor:
         out = self.backbone.forward_features(x)
         return self.backbone.forward_head(out, pre_logits=True)
 
-    @torch.no_grad()
     def extract_tokens(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone.forward_features(x)
 

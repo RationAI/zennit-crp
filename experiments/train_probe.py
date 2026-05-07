@@ -173,14 +173,18 @@ def cache_cmd(
     )
     feats, labels = [], []
     seen, t0 = 0, time.time()
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        f = extract(x).to(out_dtype).cpu()
-        feats.append(f)
-        labels.append(y if torch.is_tensor(y) else torch.as_tensor(y))
-        seen += x.shape[0]
-        if seen % (50 * batch_size) < batch_size:
-            print(f"  extracted {seen}/{len(ds)}  ({time.time() - t0:.1f}s)")
+    # Cache extraction is one-shot — no autograd graph needed.
+    # (Base.extract_* deliberately *don't* set no_grad themselves so the
+    # AttnLRP composite can build its backward graph at attribution time.)
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device, non_blocking=True)
+            f = extract(x).to(out_dtype).cpu()
+            feats.append(f)
+            labels.append(y if torch.is_tensor(y) else torch.as_tensor(y))
+            seen += x.shape[0]
+            if seen % (50 * batch_size) < batch_size:
+                print(f"  extracted {seen}/{len(ds)}  ({time.time() - t0:.1f}s)")
 
     feats = torch.cat(feats, 0)
     labels = torch.cat(labels, 0)
@@ -270,6 +274,21 @@ def train_cmd(
         8, "--num-heads",
         help="(attentive only) heads in the pooling MultiheadAttention.",
     ),
+    matmul_rule: str = typer.Option(
+        "alpha_beta", "--matmul-rule",
+        help="(attentive only) bilinear-matmul LRP rule baked into the "
+             "head's q@kᵀ and weights@v ops. {alpha_beta, matmul_factor_2, "
+             "passthrough}. Match the composite the walkthrough uses.",
+    ),
+    alpha: float = typer.Option(
+        0.5, "--alpha",
+        help="(attentive only) AlphaBeta-rule α. Default matches the "
+             "composite's α=β=0.5 working recipe.",
+    ),
+    beta: float = typer.Option(
+        0.5, "--beta",
+        help="(attentive only) AlphaBeta-rule β.",
+    ),
     out: Optional[Path] = typer.Option(
         None, "--out",
         help="Output .pt path. Default: data/<base>_<head>_probe_<dataset>.pt",
@@ -317,10 +336,18 @@ def train_cmd(
     num_classes = int(d["num_classes"])
     print(f"  feats={tuple(feats.shape)} {feats.dtype}, labels={tuple(labels.shape)}")
 
-    # Head construction kwargs — declared per head.
-    head_kwargs = {}
+    # Head construction kwargs — declared per head. These are recorded in
+    # the checkpoint and replayed at notebook load time, so the
+    # walkthrough's attribution-time backward stays consistent with how
+    # the head was trained.
+    head_kwargs: dict = {}
     if head == "attentive":
-        head_kwargs["num_heads"] = num_heads
+        head_kwargs.update(
+            num_heads=num_heads,
+            matmul_rule=matmul_rule,
+            alpha=alpha,
+            beta=beta,
+        )
     head_obj = build_head(
         head, embed_dim=embed_dim, num_classes=num_classes, head_kwargs=head_kwargs,
     )
