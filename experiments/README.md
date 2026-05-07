@@ -24,15 +24,15 @@ Run them from the repo root via `uv run python experiments/<script>.py`.
 Cache features once per `(base, dataset, kind)`:
 
 ```
-uv run python experiments/train_probe.py cache vit_dinov3 funny_birds --kind cls
-uv run python experiments/train_probe.py cache vit_dinov3 funny_birds --kind tokens
+uv run train-probe cache vit_dinov3 funny_birds --kind cls
+uv run train-probe cache vit_dinov3 funny_birds --kind tokens
 ```
 
 Train heads on top:
 
 ```
-uv run python experiments/train_probe.py train vit_dinov3 linear    funny_birds
-uv run python experiments/train_probe.py train vit_dinov3 attentive funny_birds --num-heads 8
+uv run train-probe train vit_dinov3 linear    funny_birds
+uv run train-probe train vit_dinov3 attentive funny_birds --num-heads 8
 ```
 
 Output paths follow `data/<base>_<head>_probe_<dataset>.pt`. The

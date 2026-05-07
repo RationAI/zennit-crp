@@ -15,19 +15,16 @@ Run::
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
 
-# Add experiments/ to path so we can `from datasets import ...`
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
 
 def test_imports():
     """All expected classes + functions importable from the package."""
-    from datasets import (
+    from experiments.datasets import (
         CuratedDataset, DATASETS, IMAGENETTE_TO_IMAGENET,
         load, load_imagenette, load_imagenet_val_hf,
         ImagenetteDataset, ImagenetValHFDataset,
@@ -40,14 +37,14 @@ def test_imports():
 
 def test_load_dispatcher_unknown_name():
     """Dispatcher rejects unknown dataset name with a clear error."""
-    from datasets import load
+    from experiments.datasets import load
     with pytest.raises(ValueError, match="unknown dataset"):
         load("not_a_real_dataset")
 
 
 def test_funny_birds_no_auto_download_missing():
     """FunnyBirdsDataset(auto_download=False) raises cleanly when data missing."""
-    from datasets import FunnyBirdsDataset
+    from experiments.datasets import FunnyBirdsDataset
     with pytest.raises(FileNotFoundError, match="auto_download=False"):
         FunnyBirdsDataset(
             root=REPO_ROOT / "tests" / "_nonexistent_data",
@@ -57,7 +54,7 @@ def test_funny_birds_no_auto_download_missing():
 
 def test_funny_birds_invalid_split():
     """FunnyBirdsDataset rejects invalid split."""
-    from datasets import FunnyBirdsDataset
+    from experiments.datasets import FunnyBirdsDataset
     with pytest.raises(ValueError, match="split must be"):
         FunnyBirdsDataset(
             root=REPO_ROOT / "tests" / "_nonexistent_data",
@@ -67,7 +64,7 @@ def test_funny_birds_invalid_split():
 
 def test_dsprites_no_auto_download_missing(tmp_path):
     """DSpritesDataset(auto_download=False) raises cleanly when data missing."""
-    from datasets import DSpritesDataset
+    from experiments.datasets import DSpritesDataset
     with pytest.raises(FileNotFoundError, match="auto_download=False"):
         DSpritesDataset(
             root=tmp_path / "no_dsprites",
@@ -77,7 +74,7 @@ def test_dsprites_no_auto_download_missing(tmp_path):
 
 def test_dsprites_invalid_target(tmp_path):
     """DSpritesDataset rejects invalid target factor."""
-    from datasets import DSpritesDataset
+    from experiments.datasets import DSpritesDataset
     with pytest.raises(ValueError, match="target must be one of"):
         DSpritesDataset(
             root=tmp_path / "no_dsprites",
@@ -93,7 +90,7 @@ def test_dsprites_invalid_target(tmp_path):
 
 def test_dsprites_invalid_image_mode(tmp_path):
     """DSpritesDataset rejects invalid image mode."""
-    from datasets import DSpritesDataset
+    from experiments.datasets import DSpritesDataset
     with pytest.raises(ValueError, match="image_mode must be"):
         DSpritesDataset(
             root=tmp_path / "no_dsprites",
@@ -110,7 +107,7 @@ def test_dsprites_invalid_image_mode(tmp_path):
 )
 def test_dsprites_end_to_end_cached():
     """If dsprites is already on disk, verify it loads + serves a sample."""
-    from datasets import DSpritesDataset
+    from experiments.datasets import DSpritesDataset
     ds = DSpritesDataset(root=REPO_ROOT / "data", target="shape")
     assert len(ds) == 737280
     assert ds.num_classes == 3

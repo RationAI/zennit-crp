@@ -33,12 +33,7 @@ the formal FunnyBirds explainability protocol from the paper.
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "experiments"))
 
 import numpy as np
 import torch
@@ -47,9 +42,13 @@ from timm.data import resolve_data_config, create_transform
 
 from crp.attribution import CondAttribution
 from crp.transformer_patches import AttnLRPCombinedComposite
-from datasets import FunnyBirdsDataset
-from datasets.funny_birds import PART_COLORS_TO_NAME, BACKGROUND_COLOR
-from models import build_probe
+from experiments.datasets import FunnyBirdsDataset
+from experiments.datasets.funny_birds import (
+    PART_COLORS_TO_NAME, BACKGROUND_COLOR,
+)
+from experiments.models import build_probe
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def part_mask_from_pm(part_map_uint8: torch.Tensor):

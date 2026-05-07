@@ -44,7 +44,6 @@ head_kwargs=ckpt["head_kwargs"])`` and loads ``head_state_dict`` into
 """
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -58,14 +57,14 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from torchmetrics.classification import MulticlassAccuracy
 
+from experiments.datasets import load as load_dataset
+from experiments.models import BASES, HEADS, build_base, build_head
+
 # File-system sharing → DataLoader workers don't need /dev/shm
 # (containers cap it at 64 MB).
 _torch_mp.set_sharing_strategy("file_system")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from datasets import load as load_dataset  # noqa: E402
-from models import BASES, HEADS, build_base, build_head  # noqa: E402
 
 DATA_DIR = REPO_ROOT / "data"
 DATASETS = ("funny_birds", "dsprites", "imagenet_val_hf", "imagenette")

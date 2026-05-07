@@ -59,7 +59,14 @@ dev = [
 Homepage = "https://github.com/RationAI/zennit-crp"
 
 [tool.setuptools.packages.find]
-include = ["crp*"]
+include = ["crp*", "experiments*"]
+
+[project.scripts]
+# Console-script entry points so users don't need to remember the file
+# path. After `uv sync`, run e.g.:
+#   uv run train-probe cache vit_dinov3 funny_birds --kind cls
+#   uv run train-probe train vit_dinov3 linear funny_birds
+train-probe = "experiments.train_probe:app"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
