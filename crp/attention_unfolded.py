@@ -1,321 +1,110 @@
-"""Atomic ``nn.Module`` kernels for AttnLRP-aware attention (Phase 1 of the
-attention-unfolding refactor).
+"""Atomic ``nn.Module`` kernels for AttnLRP-aware attention — VANILLA forwards.
 
-Each module here owns exactly one LRP rule, embedded in its forward via the
-autograd ``Function`` kernels already living in
-:mod:`crp.transformer_patches`. The outer container
-:class:`EvaAttentionUnfolded` wires them together with the same semantics as
-:func:`crp.transformer_patches._eva_attention_forward`, but exposes every
-intermediate tensor as the output of a *named submodule* so:
+Every module here is a plain PyTorch op with autograd's standard backward.
+LRP behaviour (custom backward = relevance flow, not Jacobian-vector
+product) is injected EXCLUSIVELY at attribution time by the per-module
+canonizers in this file (e.g. :class:`BilinearMatmulFactor2Canonizer`),
+which rebind the module's ``forward`` to route through an autograd
+``Function`` whose backward implements the LRP rule. The canonizers are
+applied by an outer composite (``composite.context(model) → enter`` →
+canonizers ``apply`` → forward+backward inside the context fires LRP
+rules → ``exit`` → canonizers ``remove`` → modules return to vanilla).
 
-* zennit hooks can attach by submodule name or type (no tap injection),
-* concept-conditioning can target Q/K/V or post-softmax weights without
-  hard-coded slice arithmetic on a fused ``qkv`` tap,
-* ``register_full_backward_hook`` reports per-rule relevance directly.
+This separation matters because these modules are also used inside
+trainable classification heads (``AttentiveHead``, ``BlockHead``). At
+training time no composite is active, so the modules behave like normal
+PyTorch ops and the optimizer receives correct chain-rule gradients.
 
-Phase 1 substitutes ONE attention block with this unfolded variant and
-verifies forward + backward parity with the existing canonizer-installed
-``_eva_attention_forward``. Phase 2 expands to all blocks and migrates the
-concept classes; Phase 3 retires ``_eva_attention_forward``.
+Module catalogue (all vanilla forwards)
+---------------------------------------
 
-See ``UNFOLDING_ATTENTION_REFACTOR.md`` for the full plan.
+Bilinear / multi-input modules:
 
-Module catalogue
-----------------
-
-Bilinear / multi-input modules (own custom autograd through their forward):
-
-* :class:`BilinearMatmul` — ``a @ b`` with the AttnLRP Prop. 3.3 ``2y+ε``
-  rule (or bare matmul when ``rule='passthrough'``).
-* :class:`AddBias` — ``x + bias`` where ``bias`` is a leaf constant
-  (typically the resolved attention mask). Identity-on-x backward.
-* :class:`ResidualAdd` — ``x + branch`` with the Otsuki ratio split rule
-  (or symmetric uniform rule).
+* :class:`BilinearMatmul` — ``a @ b``.
+* :class:`AddBias` — ``x + bias`` (bias may be None → identity).
+* :class:`ResidualAdd` — ``x + branch``.
 
 Single-input modules:
 
-* :class:`SoftmaxAlongLastDim` — ``F.softmax(dim=-1)`` with the AttnLRP
-  identity rule for normalisations (Eq. 9; ``R_in = R_out``).
-* :class:`RotaryEmbedding` — wraps ``apply_rot_embed_cat`` with optional
-  ``num_prefix_tokens`` skip and optional ``rope.detach()``.
-* :class:`ScaleByConstant` — ``x * scalar``; identity rule (constants
-  absorb no relevance).
-* :class:`ChunkAlongLastDim` — splits a tensor into ``n`` chunks along the
-  last dim. Backward is concatenation, which is identity in LRP terms.
-* :class:`ReshapeMergeHeads` — ``x.transpose(1,2).reshape(B,N,C)``. Pure
-  reshape, identity in LRP terms.
-* :class:`LayerScaleMul` — wraps the existing ``divide_gradient(γ·x, 2)``
-  uniform-rule for CaiT-style LayerScale (Touvron et al. 2021).
+* :class:`SoftmaxAlongLastDim` — ``F.softmax(x, dim=-1)``.
+* :class:`RotaryEmbedding` — RoPE; optional prefix-tokens skip and
+  optional ``rope.detach()`` (structural choice — RoPE has no learnable
+  parameters, not an LRP rule).
+* :class:`ScaleByConstant` — ``x * value``.
+* :class:`ChunkAlongLastDim` — ``x.chunk(n, dim=-1)``.
+* :class:`ReshapeMergeHeads` — ``x.transpose(1, 2).reshape(B, N, out_dim)``.
+* :class:`LayerScaleMul` — ``γ * x`` (γ is a learnable per-channel
+  parameter from the parent ``EvaBlock``).
 
-Container modules:
+Container module:
 
-* :class:`EvaAttentionUnfolded` — the unfolded analogue of
-  :class:`timm.models.eva.EvaAttention`. Constructor takes a real
-  ``EvaAttention`` instance and references its parameters/submodules
-  directly (no copy), so weight loading and grad parity are automatic.
+* :class:`EvaAttentionUnfolded` — composes the vanilla atomics into a
+  forward-parity replacement for ``timm.models.eva.EvaAttention``.
 
-Canonizers:
+Substitution canonizer:
 
-* :class:`EvaAttentionSubstitutionCanonizer` — replaces an
-  ``EvaAttention`` instance with an :class:`EvaAttentionUnfolded` wrapper
-  on ``apply()``, restores the original on ``remove()``. Phase 1 default
-  applies to a single block (``block_indices=(0,)``) so the rest of the
-  model continues to use the existing canonizer-installed forward.
+* :class:`EvaAttentionSubstitutionCanonizer` — swaps ``EvaAttention`` for
+  :class:`EvaAttentionUnfolded` on ``apply()``, restores on ``remove()``.
+
+LRP-rule canonizers (one per rule, registered at attribution time):
+
+* :class:`BilinearMatmulFactor2Canonizer` — AttnLRP Prop. 3.3 (Achtibat
+  et al. 2024, arXiv:2402.05602) ``2y+ε`` rule on :class:`BilinearMatmul`.
+* :class:`BilinearMatmulAlphaBetaCanonizer` — Bach 2015 generalised to
+  bilinear (RESEARCH_NOTES.md Entry 6) on :class:`BilinearMatmul`.
+* :class:`SoftmaxIdentityCanonizer` — AttnLRP Eq. 9 identity rule on
+  :class:`SoftmaxAlongLastDim`.
+* :class:`ScaleByConstantIdentityCanonizer` — graph-constant identity
+  rule on :class:`ScaleByConstant`.
+* :class:`ResidualRatioCanonizer` — Otsuki ratio split on
+  :class:`ResidualAdd`.
+* :class:`LayerScaleUniformCanonizer` — uniform allocation rule
+  (AttnLRP Eq. 7) on :class:`LayerScaleMul`.
+
+The autograd ``Function`` kernels (``_AlphaBetaMatmulFn``,
+``_SoftmaxIdentityRuleFn``, ``_ScaleIdentityRuleFn``) live near the
+canonizers that use them. Kernels reused from
+:mod:`crp.transformer_patches` (``_MatmulFactor2Fn``, ``_DivideGradientFn``,
+``_ResidualRatioFn``) are imported on demand by the canonizers.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 
-from zennit.canonizers import Canonizer
-
-# Re-use the autograd Function kernels already validated in transformer_patches.
-# Importing them keeps the LRP semantics consistent between the unfolded path
-# and the legacy single-forward path.
-from crp.transformer_patches import (
-    _DivideGradientFn,
-    _MatmulFactor2Fn,
-    _ResidualRatioFn,
-)
+from zennit.canonizers import AttributeCanonizer, Canonizer
 
 
-# ─── 1. New autograd Function kernels (only Softmax is genuinely new) ───────
-
-
-class _SoftmaxIdentityRuleFn(Function):
-    """Softmax with the AttnLRP identity rule (R_in = R_out).
-
-    AttnLRP §3.2.2 / Eq. 9 (Achtibat et al. 2024, arXiv:2402.05602): for
-    normalisations like softmax, the LRP-0 derivation reduces to identity
-    because the softmax outputs are 1×1-linear-equivalent in y/x. The
-    paper's recipe is to *pass relevance straight through softmax*: the
-    upstream relevance ``R_y`` is also the relevance on the pre-softmax
-    scores ``R_x``.
-
-    Why we need a custom Function: bare ``F.softmax`` would route relevance
-    through the actual Jacobian (which couples positions via the softmax
-    normalisation, producing non-conserving relevance flows). The identity
-    rule short-circuits that.
-
-    Forward: standard ``F.softmax(x, dim=-1)``.
-    Backward: ``grad_out`` (i.e. ``R_in = R_out``).
-    """
-
-    @staticmethod
-    def forward(ctx, x):
-        return F.softmax(x, dim=-1)
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        return grad_out
-
-
-class _ScaleIdentityRuleFn(Function):
-    """``y = x * scalar`` with R_in = R_out (constant absorbs no relevance).
-
-    AttnLRP treats multiplication by a graph-constant operand (no upstream
-    input, e.g. ``self.scale = head_dim**-0.5``) as identity — the constant
-    has no relevance to receive, so the bilinear's R_x is the full
-    upstream R_y. Bare autograd would multiply ``grad_out`` by the scalar,
-    which is wrong for an LRP allocation step (the scaling cancels out
-    when we compute ``R = grad·input`` — but because zennit's Linear hook
-    already accounts for the scale as part of ``W``, double-counting at
-    this node is what we avoid).
-
-    This module is most relevant when a downstream consumer (the matmul
-    rule, ε-LRP on a Linear) computes ``R = some_factor·grad``. Pulling
-    the scale out as identity keeps the backward magnitude correct.
-    """
-
-    @staticmethod
-    def forward(ctx, x, scalar: float):
-        ctx.scalar = scalar
-        return x * scalar
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        # Identity on the relevance: pass grad_out through unchanged.
-        # The scalar is a constant; no second-input grad to return.
-        return grad_out, None
-
-
-class _AlphaBetaMatmulFn(Function):
-    """AlphaBeta-on-bilinear LRP rule (Bach 2015 generalised to bilinear).
-
-    See ``RESEARCH_NOTES.md`` Entry 6 for the full derivation,
-    conservation proof, and motivation. Short version: replaces the
-    standard AttnLRP Prop. 3.3 ``2y+ε`` denominator with separate
-    ``Y^+`` and ``|Y^-|`` denominators built from sign-decomposed
-    operand contributions, structurally avoiding the LRP-0 Case-B
-    cancellation amplification of the standard bilinear rule on
-    near-orthogonal Q/K pairs and similar attention regimes.
-
-    Forward: standard ``Y = A @ B``.
-
-    Backward (per element of A):
-
-    .. math::
-
-        R_A = \\tfrac{1}{2} \\big\\{ A^+ \\odot [\\alpha (F B^{+T})
-              + \\beta (G B^{-T})] + A^- \\odot [\\alpha (F B^{-T})
-              + \\beta (G B^{+T})] \\big\\}
-
-    where ``A^± = max/min(A, 0)``, ``B^± = max/min(B, 0)``,
-    ``Y^+ = A^+ B^+ + A^- B^-`` (positive contributions sum,
-    always ≥ 0), ``Y^- = A^+ B^- + A^- B^+`` (negative contributions
-    sum, always ≤ 0), ``F = R_Y / (Y^+ + ε)``,
-    ``G = R_Y / (Y^- − ε)``. Symmetric formula for ``R_B``.
-
-    Conservation: ``Σ R_A + Σ R_B = (α+β)·Σ R_Y``; with the standard
-    constraint ``α + β = 1``, we get exact conservation modulo ε.
-
-    Hyperparameters
-    ---------------
-    alpha, beta : float
-        Bach 2015 mixture coefficients. Typical: ``α=1, β=0`` (z+,
-        positive only), ``α=2, β=-1`` ("alpha2beta1" — amplify
-        positive, suppress negative), ``α=0.5, β=0.5`` (balanced).
-        Constraint ``α + β = 1`` for exact conservation.
-    epsilon : float
-        Stabilizer. Default ``1e-6``.
-
-    Compute cost: ~4 sign-decomposed forward matmuls + 4 backward
-    matmuls; ~8× the standard ``_MatmulFactor2Fn`` cost. Negligible
-    for typical attention shapes.
-    """
-
-    @staticmethod
-    def forward(ctx, a, b, alpha=1.0, beta=0.0, epsilon=1e-6):
-        out = a @ b
-        # Sign-decomposed operands; saved for backward.
-        a_pos = a.clamp(min=0)
-        a_neg = a.clamp(max=0)
-        b_pos = b.clamp(min=0)
-        b_neg = b.clamp(max=0)
-        # Y^+ (≥ 0): same-sign products. Y^- (≤ 0): opposite-sign products.
-        # Computed under no_grad — the Function's backward handles all
-        # gradient routing; autograd shouldn't trace these intermediates.
-        with torch.no_grad():
-            y_pos = a_pos @ b_pos + a_neg @ b_neg
-            y_neg = a_pos @ b_neg + a_neg @ b_pos
-        ctx.save_for_backward(a_pos, a_neg, b_pos, b_neg, y_pos, y_neg)
-        ctx.alpha = alpha
-        ctx.beta = beta
-        ctx.epsilon = epsilon
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        a_pos, a_neg, b_pos, b_neg, y_pos, y_neg = ctx.saved_tensors
-        eps = ctx.epsilon
-        alpha = ctx.alpha
-        beta = ctx.beta
-        # Stabilized denominators. Y^+ ≥ 0 → +ε keeps positive sign and
-        # bounds 1/(Y^+ + ε) at 1/ε. Y^- ≤ 0 → -ε pushes more negative,
-        # keeps negative sign, bounds |1/(Y^- − ε)| at 1/ε.
-        f = grad_out / (y_pos + eps)
-        g = grad_out / (y_neg - eps)
-        bpT = b_pos.transpose(-1, -2)
-        bnT = b_neg.transpose(-1, -2)
-        grad_a = 0.5 * (
-            a_pos * (alpha * (f @ bpT) + beta * (g @ bnT))
-            + a_neg * (alpha * (f @ bnT) + beta * (g @ bpT))
-        )
-        apT = a_pos.transpose(-1, -2)
-        anT = a_neg.transpose(-1, -2)
-        grad_b = 0.5 * (
-            b_pos * (alpha * (apT @ f) + beta * (anT @ g))
-            + b_neg * (alpha * (anT @ f) + beta * (apT @ g))
-        )
-        return grad_a, grad_b, None, None, None
-
-
-# ─── 2. Bilinear / 2-input nn.Modules ────────────────────────────────────────
+# ─── 1. Vanilla atomic modules ──────────────────────────────────────────────
 
 
 class BilinearMatmul(nn.Module):
-    """``y = a @ b`` with one of the AttnLRP bilinear rules.
+    """``y = a @ b``. Vanilla bilinear matmul; autograd's standard backward.
 
-    Parameters
-    ----------
-    rule : {'matmul_factor_2', 'passthrough'}
-        ``'matmul_factor_2'`` (default) routes through
-        :class:`crp.transformer_patches._MatmulFactor2Fn` — the AttnLRP
-        Prop. 3.3 ``2y+ε`` stabiliser. Conservation:
-        ``sum(R_a) + sum(R_b) ≈ sum(R_y)``.
-        ``'passthrough'`` uses bare ``torch.matmul`` so autograd flows
-        the natural Jacobian. Used in tests for forward parity without
-        any LRP overlay.
-    epsilon : float
-        ε for the ``2y+ε`` denominator. Default 1e-6.
-    signed : bool
-        When True, use sign-aware ε (AttnLRP Eq. 16). Default False.
-
-    Notes on hook framework integration (plan §P1)
-    ----------------------------------------------
-    zennit's :class:`zennit.core.BasicHook` only attributes the *first*
-    positional input — it stores ``self.stored_tensors['input'] = args``
-    but its ``backward`` only re-runs the forward through the
-    ``input_modifiers`` on ``original_input = args[0]``, leaving any
-    further positional args as constants. That's a poor fit for true
-    bilinear ops where both ``a`` and ``b`` should receive relevance.
-
-    Rather than write a custom 2-input ``Hook`` subclass, we bake the
-    AttnLRP rule directly into the module's ``forward`` via the
-    autograd ``Function`` (``_MatmulFactor2Fn``). zennit then attaches
-    no rule to ``BilinearMatmul`` itself (use ``Pass`` in the layer
-    map). The Function's backward already returns the right ``(R_a,
-    R_b)`` pair. This keeps the design simple and inherits the
-    already-audited rule kernel.
+    Used inside :class:`EvaAttentionUnfolded` for ``q @ kᵀ`` and
+    ``weights @ v``, and inside classification heads that want these
+    matmuls exposed as named submodules. To enable an AttnLRP rule on
+    backward at attribution time, register
+    :class:`BilinearMatmulFactor2Canonizer` or
+    :class:`BilinearMatmulAlphaBetaCanonizer` via the composite.
     """
 
-    def __init__(
-        self,
-        *,
-        rule: str = "matmul_factor_2",
-        epsilon: float = 1e-6,
-        signed: bool = False,
-        alpha: float = 1.0,
-        beta: float = 0.0,
-    ):
-        super().__init__()
-        if rule not in ("matmul_factor_2", "passthrough", "alpha_beta"):
-            raise ValueError(
-                f"rule must be 'matmul_factor_2', 'alpha_beta', or 'passthrough'; "
-                f"got {rule!r}"
-            )
-        self.rule = rule
-        self.epsilon = epsilon
-        self.signed = signed
-        self.alpha = alpha
-        self.beta = beta
-
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        if self.rule == "matmul_factor_2":
-            return _MatmulFactor2Fn.apply(a, b, self.epsilon, self.signed)
-        if self.rule == "alpha_beta":
-            return _AlphaBetaMatmulFn.apply(a, b, self.alpha, self.beta, self.epsilon)
         return a @ b
-
-    def extra_repr(self) -> str:
-        if self.rule == "alpha_beta":
-            return (f"rule={self.rule!r}, alpha={self.alpha}, beta={self.beta}, "
-                    f"epsilon={self.epsilon}")
-        return f"rule={self.rule!r}, epsilon={self.epsilon}, signed={self.signed}"
 
 
 class AddBias(nn.Module):
-    """``y = x + bias`` where ``bias`` is a leaf constant (e.g. attention mask).
+    """``y = x + bias`` where ``bias`` is a leaf constant or ``None``.
 
-    When ``bias is None`` the forward is identity (no add). The mask
-    tensor has no upstream input — it's a graph constant — so it
-    absorbs no relevance under any LRP rule. Bare autograd does the
-    right thing: ``grad_x = grad_y`` and ``grad_bias`` is computed too
-    but discarded by the consumer.
+    When ``bias is None`` forward is identity (no add). Vanilla; autograd
+    handles the ``+`` correctly under any LRP composite's layer_map for
+    standard adds. (No dedicated rule canonizer because the typical use
+    site is the resolved attention mask, which is a constant — autograd
+    routes ``grad_x = grad_y`` and discards the unused ``grad_bias``.)
     """
 
     def forward(self, x: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
@@ -325,103 +114,53 @@ class AddBias(nn.Module):
 
 
 class ResidualAdd(nn.Module):
-    """``y = x + branch`` with one of the LRP residual rules.
+    """``y = x + branch``. Vanilla addition.
 
-    Parameters
-    ----------
-    rule : {'ratio', 'symmetric'}
-        ``'ratio'`` (default): Otsuki ratio split through
-        :class:`_ResidualRatioFn` — distributes ``R_y`` ∝ ``|x|`` /
-        ``|branch|``.
-        ``'symmetric'``: factor-2 uniform allocation through
-        :class:`_DivideGradientFn` — both ``x`` and ``branch`` receive
-        ``R_y / 2``.
-    epsilon : float
-        Stabiliser for the ratio rule. Default 1e-6.
+    For the LRP residual-ratio rule (Otsuki split: distribute ``R_y``
+    proportionally to ``|x|`` and ``|branch|``), register
+    :class:`ResidualRatioCanonizer` via the composite at attribution time.
     """
 
-    def __init__(self, *, rule: str = "ratio", epsilon: float = 1e-6):
-        super().__init__()
-        if rule not in ("ratio", "symmetric"):
-            raise ValueError(
-                f"rule must be 'ratio' or 'symmetric'; got {rule!r}"
-            )
-        self.rule = rule
-        self.epsilon = epsilon
-
     def forward(self, x: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
-        if self.rule == "ratio":
-            return _ResidualRatioFn.apply(x, branch, self.epsilon)
-        # symmetric: bare addition followed by /2 grad split.
-        return _DivideGradientFn.apply(x + branch, 2)
-
-    def extra_repr(self) -> str:
-        return f"rule={self.rule!r}"
-
-
-# ─── 3. Single-input nn.Modules ─────────────────────────────────────────────
+        return x + branch
 
 
 class SoftmaxAlongLastDim(nn.Module):
-    """``F.softmax(x, dim=-1)`` with the AttnLRP identity rule on backward.
+    """``y = F.softmax(x, dim=-1)``. Vanilla.
 
-    See :class:`_SoftmaxIdentityRuleFn` for the rule derivation. Used
-    inside :class:`EvaAttentionUnfolded` between ``q@kᵀ`` and
-    ``attn@v``.
-
-    Parameters
-    ----------
-    rule : {'identity', 'passthrough'}
-        ``'identity'`` (default): apply the AttnLRP identity rule on
-        backward — ``R_in = R_out`` per Eq. 9 of arXiv:2402.05602.
-        ``'passthrough'``: bare ``F.softmax``, autograd's natural
-        Jacobian. Used in tests to verify forward parity / autograd
-        backward parity against stock attention.
+    For the AttnLRP identity rule (``R_in = R_out``, AttnLRP Eq. 9),
+    register :class:`SoftmaxIdentityCanonizer` via the composite at
+    attribution time.
     """
 
-    def __init__(self, *, rule: str = "identity"):
-        super().__init__()
-        if rule not in ("identity", "passthrough"):
-            raise ValueError(
-                f"rule must be 'identity' or 'passthrough'; got {rule!r}"
-            )
-        self.rule = rule
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.rule == "identity":
-            return _SoftmaxIdentityRuleFn.apply(x)
         return F.softmax(x, dim=-1)
-
-    def extra_repr(self) -> str:
-        return f"rule={self.rule!r}"
 
 
 class RotaryEmbedding(nn.Module):
-    """Apply RoPE (rotary positional embedding) to a Q or K tensor.
+    """Apply RoPE to a Q or K tensor with optional prefix-tokens skip.
 
     Wraps ``timm.layers.apply_rot_embed_cat`` and handles the
-    ``num_prefix_tokens`` skip used by DINOv3 / EVA-style models (the
-    cls + register tokens at the front of the sequence are NOT
-    rotated).
+    ``num_prefix_tokens`` skip used by DINOv3 / EVA-style models (cls +
+    register tokens at the front of the sequence are NOT rotated).
 
     Parameters
     ----------
     num_prefix_tokens : int
         Number of leading positions left un-rotated.
     rotate_half : bool
-        Layout flag passed to ``apply_rot_embed_cat`` — ``False`` for the
-        interleaved layout, ``True`` for the half-split layout. Mirrors
+        Layout flag passed to ``apply_rot_embed_cat``. Mirrors
         ``EvaAttention.rotate_half``.
     detach_rope : bool
         When True, ``rope.detach()`` before the rotary op. RoPE has no
         learnable parameters (Su et al. 2021, arXiv:2104.09864), so
-        cos/sin can be treated as graph constants and relevance routes
-        purely through the rotated tensor. Equivalent to the
-        :class:`crp.transformer_patches.AttnLRPRopeDetachComposite`
-        remedy for this op.
+        cos/sin can be treated as graph constants and gradients route
+        purely through the rotated tensor. This is a structural choice
+        about whether RoPE owns parameters in the autograd graph — it
+        is NOT an LRP rule and is safe at training time. Default False
+        for forward parity with stock ``EvaAttention``.
 
-    Forward signature: ``(q, rope)``. ``rope`` may be ``None`` (no
-    rotation; identity).
+    Forward signature: ``(q, rope)``. ``rope`` may be ``None`` (identity).
     """
 
     def __init__(
@@ -459,39 +198,30 @@ class RotaryEmbedding(nn.Module):
 
 
 class ScaleByConstant(nn.Module):
-    """``y = x * value`` with the identity LRP rule (constant absorbs no R).
+    """``y = x * value`` where ``value`` is a graph constant.
 
-    See :class:`_ScaleIdentityRuleFn` for the rule. With ``rule='passthrough'``
-    the multiplication is bare and autograd's natural backward (which
-    multiplies by the scalar) is used — useful for verifying forward
-    parity / autograd backward parity against stock attention.
+    For the AttnLRP graph-constant identity rule on backward (constant
+    absorbs no relevance), register :class:`ScaleByConstantIdentityCanonizer`
+    via the composite at attribution time.
     """
 
-    def __init__(self, value: float, *, rule: str = "identity"):
+    def __init__(self, value: float):
         super().__init__()
-        if rule not in ("identity", "passthrough"):
-            raise ValueError(
-                f"rule must be 'identity' or 'passthrough'; got {rule!r}"
-            )
         self.value = float(value)
-        self.rule = rule
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.rule == "identity":
-            return _ScaleIdentityRuleFn.apply(x, self.value)
         return x * self.value
 
     def extra_repr(self) -> str:
-        return f"value={self.value}, rule={self.rule!r}"
+        return f"value={self.value}"
 
 
 class ChunkAlongLastDim(nn.Module):
     """Split a tensor into ``n`` equal chunks along the last dim.
 
-    Backward is ``torch.cat`` along the same dim, which is identity in
-    LRP terms (each chunk's relevance returns to its original slice in
-    the cat'd tensor; total ``sum(R)`` is preserved). Bare autograd
-    handles this correctly — no custom Function needed.
+    Backward is ``torch.cat`` along the same dim — identity in LRP terms
+    (each chunk's relevance returns to its original slice). No canonizer
+    needed; bare autograd routes relevance correctly.
     """
 
     def __init__(self, n: int):
@@ -510,14 +240,8 @@ class ChunkAlongLastDim(nn.Module):
 class ReshapeMergeHeads(nn.Module):
     """Merge per-head context back into ``(B, N, C)``.
 
-    Forward: ``x.transpose(1, 2).reshape(B, N, out_dim)``. ``out_dim``
-    defaults to the product ``num_heads * head_dim`` inferred from the
-    input shape; pass explicitly when the head dim differs from the
-    output dim (the rare ``attn_dim`` variant in some timm Attention
-    classes).
-
-    Identity in LRP terms — pure reshape preserves ``sum(R)`` and
-    bare autograd routes relevance correctly.
+    Forward: ``x.transpose(1, 2).reshape(B, N, out_dim)``. Identity in
+    LRP terms — pure reshape preserves ``sum(R)``; no canonizer needed.
     """
 
     def __init__(self, out_dim: Optional[int] = None):
@@ -537,52 +261,36 @@ class ReshapeMergeHeads(nn.Module):
 
 
 class LayerScaleMul(nn.Module):
-    """``y = γ * x`` with the AttnLRP uniform rule (CaiT-style LayerScale).
+    """``y = γ * x`` (CaiT-style LayerScale; Touvron et al. 2021).
 
-    γ is a learnable per-channel parameter (Touvron et al. 2021,
-    arXiv:2103.17239). With no upstream input it's a graph leaf, so the
-    AttnLRP uniform rule (Eq. 7, arXiv:2402.05602) allocates half the
-    relevance to γ (which is "absorbed") and half back to ``x``.
-
-    Implementation: forward computes ``γ·x`` then routes through
-    :class:`_DivideGradientFn` with ``factor=2``. With
-    ``layerscale_uniform=False`` the multiplication is bare and the
-    branch loses ``γ × …`` of its relevance — usually the wrong
-    behaviour for LayerScale's small initial γ (1e-4..1e-5).
+    γ is a learnable per-channel parameter. For the AttnLRP uniform rule
+    on backward (Eq. 7 — γ absorbs half the relevance, branch gets the
+    other half), register :class:`LayerScaleUniformCanonizer` via the
+    composite at attribution time.
 
     Parameters
     ----------
     gamma : nn.Parameter
-        The LayerScale parameter from the parent ``EvaBlock``. Shared
-        by reference; not copied.
-    layerscale_uniform : bool
-        When True (default for this Module — the whole point of using
-        it), divide the upstream gradient by 2.
+        The LayerScale parameter from the parent ``EvaBlock``. Shared by
+        reference; not copied.
     """
 
-    def __init__(self, gamma: nn.Parameter, *, layerscale_uniform: bool = True):
+    def __init__(self, gamma: nn.Parameter):
         super().__init__()
         # NB: ``gamma`` is a Parameter on the parent module; we reference
         # it without re-registering, so weight loading still flows through
         # the parent.
         self.gamma = gamma
-        self.layerscale_uniform = layerscale_uniform
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.gamma * x
-        if self.layerscale_uniform:
-            out = _DivideGradientFn.apply(out, 2)
-        return out
-
-    def extra_repr(self) -> str:
-        return f"layerscale_uniform={self.layerscale_uniform}"
+        return self.gamma * x
 
 
-# ─── 4. Container: EvaAttentionUnfolded ─────────────────────────────────────
+# ─── 2. Container: EvaAttentionUnfolded (vanilla forward) ───────────────────
 
 
 class EvaAttentionUnfolded(nn.Module):
-    """Unfolded ``timm.models.eva.EvaAttention`` analogue.
+    """Unfolded ``timm.models.eva.EvaAttention`` analogue — vanilla forward.
 
     Constructor takes a *real* ``EvaAttention`` instance and stores
     references to its parameters / sub-modules. The container does NOT
@@ -594,37 +302,25 @@ class EvaAttentionUnfolded(nn.Module):
     submodule).
 
     Forward signature matches ``EvaAttention.forward`` exactly:
-    ``(self, x, rope=None, attn_mask=None, is_causal=False)``. The
-    semantics mirror :func:`crp.transformer_patches._eva_attention_forward`
-    with the ``matmul_factor_2_rule=True, layerscale_uniform=True,
-    residual_lrp='ratio'`` recipe — the working_combo for DINOv3.
+    ``(self, x, rope=None, attn_mask=None, is_causal=False)``. All atomic
+    submodules are vanilla (see module docstrings); LRP behaviour is
+    opt-in via composite-time canonizers.
 
     Parameters
     ----------
     orig : timm.models.eva.EvaAttention
         Source module to wrap. Its parameters become this container's
         parameters by reference.
-    matmul_rule : {'matmul_factor_2', 'passthrough'}
-        Controls the rule on both bilinear matmuls. Default
-        ``'matmul_factor_2'`` (AttnLRP Prop. 3.3).
-    epsilon : float
-        ε for the matmul rule. Default 1e-6.
-    signed_epsilon : bool
-        Sign-aware ε in the matmul rule. Default False.
     rope_detach : bool
-        Detach RoPE in the rotary op. Default False.
+        Forwarded to :class:`RotaryEmbedding`. Structural choice (RoPE
+        has no parameters), not an LRP rule. Default False.
     """
 
     def __init__(
         self,
-        orig,  # timm.models.eva.EvaAttention; not type-annotated to allow import-light tests
+        orig,  # timm.models.eva.EvaAttention
         *,
-        matmul_rule: str = "matmul_factor_2",
-        epsilon: float = 1e-6,
-        signed_epsilon: bool = False,
         rope_detach: bool = False,
-        alpha: float = 1.0,
-        beta: float = 0.0,
     ):
         super().__init__()
         if not (
@@ -638,10 +334,10 @@ class EvaAttentionUnfolded(nn.Module):
             )
         # The DINOv3 ViT-L variant: q_bias=k_bias=v_bias=None, qkv.bias=False.
         # Variants with separate per-Q/K/V biases (vit_*_dinov3_qkvb) need
-        # a different qkv path; not handled in Phase 1.
+        # a different qkv path; not handled here.
         if getattr(orig, "q_bias", None) is not None:
             raise NotImplementedError(
-                "Phase 1 EvaAttentionUnfolded does not support per-Q/K/V bias "
+                "EvaAttentionUnfolded does not support per-Q/K/V bias "
                 "EvaAttention variants (q_bias is set). Lift the bias-cat "
                 "branch from the upstream forward when adding support."
             )
@@ -663,15 +359,8 @@ class EvaAttentionUnfolded(nn.Module):
         self.proj = orig.proj
         self.proj_drop = orig.proj_drop
 
-        # When the matmul kernels are in passthrough mode, also fall back
-        # the softmax + scale kernels to bare-autograd ('passthrough')
-        # so the unfolded backward bit-matches the stock EvaAttention
-        # autograd backward — this is what the Phase 1 backward-parity
-        # test asserts before we stack any LRP rule on top.
-        scalar_rule = "passthrough" if matmul_rule == "passthrough" else "identity"
-        softmax_rule = "passthrough" if matmul_rule == "passthrough" else "identity"
-
-        # Atomic LRP-aware kernels.
+        # Atomic vanilla submodules. LRP rules are layered in by the
+        # per-module canonizers at composite-context-entry time.
         self.split = ChunkAlongLastDim(3)
         self.rope_q = RotaryEmbedding(
             self.num_prefix_tokens, rotate_half=rotate_half, detach_rope=rope_detach,
@@ -679,34 +368,18 @@ class EvaAttentionUnfolded(nn.Module):
         self.rope_k = RotaryEmbedding(
             self.num_prefix_tokens, rotate_half=rotate_half, detach_rope=rope_detach,
         )
-        self.scale_q = ScaleByConstant(self.scale, rule=scalar_rule)
-        self.qk_scores = BilinearMatmul(
-            rule=matmul_rule, epsilon=epsilon, signed=signed_epsilon,
-            alpha=alpha, beta=beta,
-        )
+        self.scale_q = ScaleByConstant(self.scale)
+        self.qk_scores = BilinearMatmul()
         self.add_mask = AddBias()
-        self.softmax = SoftmaxAlongLastDim(rule=softmax_rule)
-        self.context = BilinearMatmul(
-            rule=matmul_rule, epsilon=epsilon, signed=signed_epsilon,
-            alpha=alpha, beta=beta,
-        )
+        self.softmax = SoftmaxAlongLastDim()
+        self.context = BilinearMatmul()
         self.reshape = ReshapeMergeHeads()
         # Identity hook points so concept-conditioning can target Q, K, V
         # individually (post per-head reshape, before they enter the
         # bilinear). q_norm / k_norm already exist as nn.Modules (LayerNorm
         # or Identity) so they're hookable directly; V has no analog
         # transformation, so we add an explicit Identity for symmetry.
-        # (rope_q / rope_k are also fine hook targets for "Q post-RoPE"
-        # / "K post-RoPE"; pick whichever is most informative.)
         self.v_id = nn.Identity()
-        # NB: we deliberately do NOT keep ``orig`` as an attribute here —
-        # PyTorch's ``__setattr__`` would re-register it as a submodule
-        # (even with a leading underscore, because it's an ``nn.Module``),
-        # and the dual-registration bloats ``named_modules`` and confuses
-        # any tooling that walks the module tree. The substitution
-        # canonizer keeps its own reference for ``remove()``.
-
-    # ─── forward ────────────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -717,42 +390,26 @@ class EvaAttentionUnfolded(nn.Module):
     ) -> torch.Tensor:
         B, N, C = x.shape
 
-        # Linear projection → (B, N, 3·D).
         qkv_flat = self.qkv(x)
-
-        # Split last dim into Q/K/V chunks of (B, N, D) each. This is
-        # equivalent to the upstream layout ``qkv.reshape(B, N, 3, H, hd)
-        # .permute(2, 0, 3, 1, 4).unbind(0)`` because both isolate
-        # ``qkv_flat[..., 0:D] / [D:2D] / [2D:3D]`` as Q / K / V before
-        # the per-head reshape.
         q_flat, k_flat, v_flat = self.split(qkv_flat)
 
-        # Per-chunk reshape to (B, num_heads, N, head_dim). This is a
-        # pure view operation — identity in LRP terms — so we don't
-        # bother with a Module wrapper.
         def _to_heads(t: torch.Tensor) -> torch.Tensor:
             return t.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
 
         q = _to_heads(q_flat)
         k = _to_heads(k_flat)
         v = _to_heads(v_flat)
-        v = self.v_id(v)  # hookable identity for VConcept
+        v = self.v_id(v)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
         q = self.rope_q(q, rope)
         k = self.rope_k(k, rope)
-        # Match the upstream's ``.type_as(v)`` cast (a no-op when q/k/v
-        # share dtype, the standard case).
         q = q.type_as(v)
         k = k.type_as(v)
 
         q = self.scale_q(q)
-
-        # q @ k.transpose — k.transpose is a view, autograd-trivial.
         scores = self.qk_scores(q, k.transpose(-2, -1))
-
-        # Resolve the additive mask (timm helper if available, else fall back).
         scores = self._resolve_and_add_mask(scores, attn_mask, is_causal, N)
 
         weights = self.softmax(scores)
@@ -766,9 +423,6 @@ class EvaAttentionUnfolded(nn.Module):
         return out
 
     def _resolve_and_add_mask(self, scores, attn_mask, is_causal, N):
-        # Mirrors the mask resolution in _eva_attention_forward. We pass
-        # the resolved bias through ``AddBias`` so the LRP graph contains
-        # an explicit add_mask submodule.
         try:
             from timm.models.eva import resolve_self_attn_mask
             attn_bias = resolve_self_attn_mask(N, scores, attn_mask, is_causal)
@@ -793,80 +447,48 @@ class EvaAttentionUnfolded(nn.Module):
         )
 
 
-# ─── 5. Substitution canonizer ──────────────────────────────────────────────
+# ─── 3. Substitution canonizer (no LRP knobs) ───────────────────────────────
 
 
 class EvaAttentionSubstitutionCanonizer(Canonizer):
-    """Replace one or more ``EvaAttention`` instances with
-    :class:`EvaAttentionUnfolded` wrappers (Phase 1).
+    """Replace ``EvaAttention`` instances with :class:`EvaAttentionUnfolded`.
 
     Lifecycle
     ---------
     * ``apply(root)`` walks ``root`` for ``EvaAttention`` modules whose
       block index is in ``block_indices`` (or all, if ``block_indices``
-      is None). For each one it constructs an :class:`EvaAttentionUnfolded`
-      around the original and re-binds the parent ``EvaBlock``'s
-      ``.attn`` attribute to the unfolded version. The original module
-      is stashed on the canonizer instance.
+      is None). For each one it constructs a vanilla
+      :class:`EvaAttentionUnfolded` around the original and re-binds the
+      parent ``EvaBlock``'s ``.attn`` attribute to the unfolded version.
     * ``remove()`` re-binds the parent's ``.attn`` to the original
-      module reference. Weight-sharing means no parameter state is
-      lost; the original module is intact (its parameters were
-      referenced, not moved, by the unfolded container).
+      module reference. Weight-sharing means no parameter state is lost.
 
-    The Phase 1 default (``block_indices=(0,)``) substitutes only the
-    first attention block — the rest of the model continues to use the
-    existing canonizer-installed forward (or no canonizer at all). This
-    lets us validate forward + backward parity on a single block before
-    expanding to all blocks in Phase 2.
+    This canonizer makes NO LRP-rule decisions — it just exposes the
+    attention as named submodules so other canonizers can register
+    forward-rebinds (e.g. :class:`BilinearMatmulAlphaBetaCanonizer`) on
+    the new ``BilinearMatmul`` / ``SoftmaxAlongLastDim`` / etc. instances.
 
     Parameters
     ----------
     block_indices : tuple[int, ...] | None
-        Indices of blocks to substitute. Default ``(0,)`` for Phase 1.
-        Pass ``None`` to substitute all attention blocks; pass an
-        explicit tuple to target a subset.
-    matmul_rule, epsilon, signed_epsilon, rope_detach
-        Forwarded to :class:`EvaAttentionUnfolded`.
-
-    Notes
-    -----
-    Round-trip safety (plan §P6): we verify reversibility in
-    ``tests/test_attention_unfolded.py`` — apply → forward → remove →
-    re-apply with a different composite → forward — and assert tensor
-    equality.
-
-    The unfolded container references the original module's parameter
-    submodules (``qkv``, ``proj``, etc.) by attribute, NOT by deep
-    copy, so:
-
-    * Optimizer state attached to the original parameters still
-      works after substitution.
-    * Restoring on ``remove()`` re-points ``.attn`` to the original
-      instance, which still owns the parameters.
-    * Re-applying picks up any in-place parameter updates between
-      apply / remove cycles.
+        Indices of blocks to substitute. ``None`` (default) means
+        substitute all attention blocks.
+    rope_detach : bool
+        Forwarded to :class:`EvaAttentionUnfolded` → :class:`RotaryEmbedding`.
+        Structural (whether RoPE owns parameters in the autograd graph),
+        not an LRP rule. Default False.
     """
 
     def __init__(
         self,
         *,
-        block_indices: Optional[Sequence[int]] = (0,),
-        matmul_rule: str = "matmul_factor_2",
-        epsilon: float = 1e-6,
-        signed_epsilon: bool = False,
+        block_indices: Optional[Sequence[int]] = None,
         rope_detach: bool = False,
-        alpha: float = 1.0,
-        beta: float = 0.0,
     ):
         self.block_indices = (
             None if block_indices is None else tuple(int(i) for i in block_indices)
         )
-        self.matmul_rule = matmul_rule
-        self.epsilon = epsilon
-        self.signed_epsilon = signed_epsilon
         self.rope_detach = rope_detach
-        self.alpha = alpha
-        self.beta = beta
 
         # State filled by ``register``.
         self.parent: Optional[nn.Module] = None
@@ -874,15 +496,12 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         self.original_module: Optional[nn.Module] = None
         self.unfolded_module: Optional[EvaAttentionUnfolded] = None
 
-    # ─── Canonizer interface ────────────────────────────────────────────────
-
     def apply(self, root_module: nn.Module) -> List["EvaAttentionSubstitutionCanonizer"]:
         try:
             from timm.models.eva import EvaAttention
         except ImportError:
             return []
 
-        # Find candidate (parent, attr_name, attn_module, block_index) tuples.
         instances: List[EvaAttentionSubstitutionCanonizer] = []
         for parent_name, parent in root_module.named_modules():
             for attr_name, child in parent.named_children():
@@ -906,21 +525,7 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         self.parent = parent
         self.attr_name = attr_name
         self.original_module = original
-        unfolded = EvaAttentionUnfolded(
-            original,
-            matmul_rule=self.matmul_rule,
-            epsilon=self.epsilon,
-            signed_epsilon=self.signed_epsilon,
-            rope_detach=self.rope_detach,
-            alpha=self.alpha,
-            beta=self.beta,
-        )
-        # Re-bind via setattr so the parent's module dict is updated AND
-        # nn.Module's __setattr__ moves the params/buffers to the right
-        # place. Because the unfolded module references the original's
-        # submodules, those submodules end up nested under the unfolded
-        # container — which is exactly what we want (same parameter
-        # names from the parent's POV: blocks.i.attn.qkv.weight etc.).
+        unfolded = EvaAttentionUnfolded(original, rope_detach=self.rope_detach)
         setattr(parent, attr_name, unfolded)
         self.unfolded_module = unfolded
 
@@ -928,27 +533,17 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         if self.parent is None or self.attr_name is None or self.original_module is None:
             return
         setattr(self.parent, self.attr_name, self.original_module)
-        # Don't null out the references — re-apply may want to use them.
         self.unfolded_module = None
 
     def copy(self) -> "EvaAttentionSubstitutionCanonizer":
         return type(self)(
             block_indices=self.block_indices,
-            matmul_rule=self.matmul_rule,
-            epsilon=self.epsilon,
-            signed_epsilon=self.signed_epsilon,
             rope_detach=self.rope_detach,
-            alpha=self.alpha,
-            beta=self.beta,
         )
 
 
 def _extract_block_index(parent_name: str) -> Optional[int]:
-    """Return ``i`` if ``parent_name`` ends in ``...blocks.i`` else None.
-
-    Matches ``"blocks.0"`` (top-level blocks) and any
-    ``"<sub>.blocks.0"`` nested-stack variant.
-    """
+    """Return ``i`` if ``parent_name`` ends in ``...blocks.i`` else None."""
     parts = parent_name.split(".")
     for j in range(len(parts) - 1):
         if parts[j] == "blocks":
@@ -959,22 +554,340 @@ def _extract_block_index(parent_name: str) -> Optional[int]:
     return None
 
 
+# ─── 4. Autograd Function kernels for the LRP rules ─────────────────────────
+# These are used ONLY by the canonizers below — never by the modules' own
+# forwards. They live here (not in transformer_patches) because their sole
+# consumers are the per-module canonizers right below them.
+
+
+class _SoftmaxIdentityRuleFn(Function):
+    """Softmax with the AttnLRP identity rule (R_in = R_out).
+
+    AttnLRP §3.2.2 / Eq. 9 (Achtibat et al. 2024, arXiv:2402.05602): for
+    normalisations like softmax, the LRP-0 derivation reduces to identity
+    because the softmax outputs are 1×1-linear-equivalent in y/x. The
+    paper's recipe is to *pass relevance straight through softmax*: the
+    upstream relevance ``R_y`` is also the relevance on the pre-softmax
+    scores ``R_x``.
+
+    Forward: standard ``F.softmax(x, dim=-1)``.
+    Backward: ``grad_out`` (i.e. ``R_in = R_out``).
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        return F.softmax(x, dim=-1)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out
+
+
+class _ScaleIdentityRuleFn(Function):
+    """``y = x * scalar`` with R_in = R_out (constant absorbs no relevance).
+
+    AttnLRP treats multiplication by a graph-constant operand as identity
+    — the constant has no relevance to receive, so R_x = R_y. Bare
+    autograd would multiply ``grad_out`` by the scalar; this Function
+    short-circuits that.
+    """
+
+    @staticmethod
+    def forward(ctx, x, scalar: float):
+        return x * scalar
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        return grad_out, None
+
+
+class _AlphaBetaMatmulFn(Function):
+    """AlphaBeta-on-bilinear LRP rule (Bach 2015 generalised to bilinear).
+
+    See ``RESEARCH_NOTES.md`` Entry 6. Replaces the standard AttnLRP
+    Prop. 3.3 ``2y+ε`` denominator with separate ``Y^+`` and ``|Y^-|``
+    denominators built from sign-decomposed operand contributions,
+    structurally avoiding the LRP-0 Case-B cancellation amplification.
+
+    Forward: standard ``Y = A @ B``.
+
+    Backward (per element of A):
+
+    .. math::
+
+        R_A = \\tfrac{1}{2} \\big\\{ A^+ \\odot [\\alpha (F B^{+T})
+              + \\beta (G B^{-T})] + A^- \\odot [\\alpha (F B^{-T})
+              + \\beta (G B^{+T})] \\big\\}
+
+    where ``A^± = max/min(A, 0)``, ``B^± = max/min(B, 0)``,
+    ``Y^+ = A^+ B^+ + A^- B^-``, ``Y^- = A^+ B^- + A^- B^+``,
+    ``F = R_Y / (Y^+ + ε)``, ``G = R_Y / (Y^- − ε)``. Symmetric for
+    ``R_B``.
+
+    Conservation: ``Σ R_A + Σ R_B = (α+β)·Σ R_Y``; with ``α + β = 1``
+    we get exact conservation modulo ε.
+    """
+
+    @staticmethod
+    def forward(ctx, a, b, alpha=1.0, beta=0.0, epsilon=1e-6):
+        out = a @ b
+        a_pos = a.clamp(min=0)
+        a_neg = a.clamp(max=0)
+        b_pos = b.clamp(min=0)
+        b_neg = b.clamp(max=0)
+        with torch.no_grad():
+            y_pos = a_pos @ b_pos + a_neg @ b_neg
+            y_neg = a_pos @ b_neg + a_neg @ b_pos
+        ctx.save_for_backward(a_pos, a_neg, b_pos, b_neg, y_pos, y_neg)
+        ctx.alpha = alpha
+        ctx.beta = beta
+        ctx.epsilon = epsilon
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        a_pos, a_neg, b_pos, b_neg, y_pos, y_neg = ctx.saved_tensors
+        eps = ctx.epsilon
+        alpha = ctx.alpha
+        beta = ctx.beta
+        f = grad_out / (y_pos + eps)
+        g = grad_out / (y_neg - eps)
+        bpT = b_pos.transpose(-1, -2)
+        bnT = b_neg.transpose(-1, -2)
+        grad_a = 0.5 * (
+            a_pos * (alpha * (f @ bpT) + beta * (g @ bnT))
+            + a_neg * (alpha * (f @ bnT) + beta * (g @ bpT))
+        )
+        apT = a_pos.transpose(-1, -2)
+        anT = a_neg.transpose(-1, -2)
+        grad_b = 0.5 * (
+            b_pos * (alpha * (apT @ f) + beta * (anT @ g))
+            + b_neg * (alpha * (anT @ f) + beta * (apT @ g))
+        )
+        return grad_a, grad_b, None, None, None
+
+
+# ─── 5. LRP-rule canonizers (one per rule, vanilla ↔ rule-aware swap) ───────
+#
+# Each canonizer rebinds the forward of a specific module class with a
+# wrapper that routes through an autograd Function whose backward
+# implements the LRP rule. On ``apply()`` the wrapper is bound; on
+# ``remove()`` the original ``forward`` is restored. Forward output is
+# numerically identical to vanilla in every case (Functions do
+# ``a @ b`` / ``F.softmax`` / ``x * scalar`` etc. — only backward differs).
+
+
+class BilinearMatmulFactor2Canonizer(AttributeCanonizer):
+    """Apply AttnLRP Prop. 3.3 ``2y+ε`` rule to :class:`BilinearMatmul`.
+
+    Achtibat et al. 2024, arXiv:2402.05602. Conservation:
+    ``sum(R_a) + sum(R_b) ≈ sum(R_y)``.
+
+    Parameters
+    ----------
+    epsilon : float
+        ε for the ``2y+ε`` denominator. Default ``1e-6``.
+    signed : bool
+        Sign-aware ε (AttnLRP Eq. 16). Default False.
+    """
+
+    def __init__(self, *, epsilon: float = 1e-6, signed: bool = False):
+        self.epsilon = epsilon
+        self.signed = signed
+        super().__init__(self._attribute_map)
+
+    def _attribute_map(self, _name, module):
+        if not isinstance(module, BilinearMatmul):
+            return None
+        from crp.transformer_patches import _MatmulFactor2Fn
+        eps = self.epsilon
+        signed = self.signed
+
+        def patched(self, a, b):
+            return _MatmulFactor2Fn.apply(a, b, eps, signed)
+
+        return _bind_forward(module, patched)
+
+    def copy(self):
+        return type(self)(epsilon=self.epsilon, signed=self.signed)
+
+
+class BilinearMatmulAlphaBetaCanonizer(AttributeCanonizer):
+    """Apply AlphaBeta-on-bilinear rule to :class:`BilinearMatmul`.
+
+    See :class:`_AlphaBetaMatmulFn` for the derivation. Default
+    ``α=0.5, β=0.5`` matches RESEARCH_NOTES.md Entry 6's working recipe.
+
+    Parameters
+    ----------
+    alpha, beta : float
+        Bach 2015 mixture coefficients. ``α + β = 1`` for exact
+        conservation. Common choices:
+        ``α=0.5, β=0.5`` (balanced; tightest magnitude control),
+        ``α=1, β=0`` (z+, positive only),
+        ``α=2, β=-1`` (Bach's classical "alpha2beta1").
+    epsilon : float
+        Stabiliser. Default ``1e-6``.
+    """
+
+    def __init__(self, *, alpha: float = 0.5, beta: float = 0.5, epsilon: float = 1e-6):
+        self.alpha = alpha
+        self.beta = beta
+        self.epsilon = epsilon
+        super().__init__(self._attribute_map)
+
+    def _attribute_map(self, _name, module):
+        if not isinstance(module, BilinearMatmul):
+            return None
+        alpha = self.alpha
+        beta = self.beta
+        eps = self.epsilon
+
+        def patched(self, a, b):
+            return _AlphaBetaMatmulFn.apply(a, b, alpha, beta, eps)
+
+        return _bind_forward(module, patched)
+
+    def copy(self):
+        return type(self)(alpha=self.alpha, beta=self.beta, epsilon=self.epsilon)
+
+
+class SoftmaxIdentityCanonizer(AttributeCanonizer):
+    """Apply AttnLRP identity rule (R_in = R_out) to :class:`SoftmaxAlongLastDim`.
+
+    AttnLRP Eq. 9. Forward output is bit-identical to vanilla
+    ``F.softmax``; only backward differs (relevance passes through).
+    """
+
+    def __init__(self):
+        super().__init__(self._attribute_map)
+
+    def _attribute_map(self, _name, module):
+        if not isinstance(module, SoftmaxAlongLastDim):
+            return None
+
+        def patched(self, x):
+            return _SoftmaxIdentityRuleFn.apply(x)
+
+        return _bind_forward(module, patched)
+
+    def copy(self):
+        return type(self)()
+
+
+class ScaleByConstantIdentityCanonizer(AttributeCanonizer):
+    """Apply graph-constant identity rule to :class:`ScaleByConstant`.
+
+    Constant absorbs no relevance, so ``R_in = R_out`` (the scalar gets
+    ``None``). Forward output is bit-identical to vanilla ``x * value``.
+    """
+
+    def __init__(self):
+        super().__init__(self._attribute_map)
+
+    def _attribute_map(self, _name, module):
+        if not isinstance(module, ScaleByConstant):
+            return None
+
+        def patched(self, x):
+            return _ScaleIdentityRuleFn.apply(x, self.value)
+
+        return _bind_forward(module, patched)
+
+    def copy(self):
+        return type(self)()
+
+
+class ResidualRatioCanonizer(AttributeCanonizer):
+    """Apply Otsuki ratio split (``R ∝ |x| / |branch|``) to :class:`ResidualAdd`.
+
+    Conservation:
+    ``R_x + R_branch = R_y · (|x| + |branch|) / (|x| + |branch| + ε) ≈ R_y``.
+
+    Parameters
+    ----------
+    epsilon : float
+        Stabiliser. Default ``1e-6``.
+    """
+
+    def __init__(self, *, epsilon: float = 1e-6):
+        self.epsilon = epsilon
+        super().__init__(self._attribute_map)
+
+    def _attribute_map(self, _name, module):
+        if not isinstance(module, ResidualAdd):
+            return None
+        from crp.transformer_patches import _ResidualRatioFn
+        eps = self.epsilon
+
+        def patched(self, x, branch):
+            return _ResidualRatioFn.apply(x, branch, eps)
+
+        return _bind_forward(module, patched)
+
+    def copy(self):
+        return type(self)(epsilon=self.epsilon)
+
+
+class LayerScaleUniformCanonizer(AttributeCanonizer):
+    """Apply uniform allocation rule (AttnLRP Eq. 7) to :class:`LayerScaleMul`.
+
+    Backward divides the upstream gradient by 2: γ absorbs half the
+    relevance, the branch gets the other half. Important for LayerScale's
+    small initial γ (1e-4..1e-5) where bare autograd would near-zero the
+    branch's relevance.
+    """
+
+    def __init__(self):
+        super().__init__(self._attribute_map)
+
+    def _attribute_map(self, _name, module):
+        if not isinstance(module, LayerScaleMul):
+            return None
+        from crp.transformer_patches import _DivideGradientFn
+
+        def patched(self, x):
+            out = self.gamma * x
+            return _DivideGradientFn.apply(out, 2)
+
+        return _bind_forward(module, patched)
+
+    def copy(self):
+        return type(self)()
+
+
+# ─── 6. Internal helpers ────────────────────────────────────────────────────
+
+
+def _bind_forward(module: nn.Module, fn: Callable, attr: str = "forward") -> dict:
+    """Bind ``fn`` as ``attr`` on ``module``'s class — return dict for
+    AttributeCanonizer."""
+    return {attr: fn.__get__(module, type(module))}
+
+
 __all__ = [
-    # autograd Function kernels new to this module
-    "_SoftmaxIdentityRuleFn",
-    "_ScaleIdentityRuleFn",
-    # 2-input kernels
+    # Vanilla atomic modules
     "BilinearMatmul",
     "AddBias",
     "ResidualAdd",
-    # single-input kernels
     "SoftmaxAlongLastDim",
     "RotaryEmbedding",
     "ScaleByConstant",
     "ChunkAlongLastDim",
     "ReshapeMergeHeads",
     "LayerScaleMul",
-    # container + canonizer
+    # Container + substitution canonizer
     "EvaAttentionUnfolded",
     "EvaAttentionSubstitutionCanonizer",
+    # Per-rule canonizers
+    "BilinearMatmulFactor2Canonizer",
+    "BilinearMatmulAlphaBetaCanonizer",
+    "SoftmaxIdentityCanonizer",
+    "ScaleByConstantIdentityCanonizer",
+    "ResidualRatioCanonizer",
+    "LayerScaleUniformCanonizer",
+    # Autograd Function kernels (used internally by canonizers)
+    "_SoftmaxIdentityRuleFn",
+    "_ScaleIdentityRuleFn",
+    "_AlphaBetaMatmulFn",
 ]

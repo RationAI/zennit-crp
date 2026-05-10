@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Type
 
 from .bases import Base, ViTBase, DinoV3
-from .heads import Head, LinearHead, AttentiveHead
+from .heads import Head, LinearHead, AttentiveHead, BlockHead
 from .probe import Probe
 
 
@@ -32,6 +32,7 @@ BASES: Dict[str, Type[Base]] = {
 HEADS: Dict[str, Type[Head]] = {
     "linear":    LinearHead,
     "attentive": AttentiveHead,
+    "block":     BlockHead,
 }
 
 
@@ -78,7 +79,7 @@ def build_probe(
 __all__ = [
     "BASES", "HEADS",
     "Base", "ViTBase", "DinoV3",
-    "Head", "LinearHead", "AttentiveHead",
+    "Head", "LinearHead", "AttentiveHead", "BlockHead",
     "Probe",
     "build_base", "build_head", "build_probe",
 ]

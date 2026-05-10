@@ -1,7 +1,15 @@
-"""Train a frozen-backbone probe (linear or attentive) with Lightning.
+"""Train a frozen-backbone probe (linear / attentive / block) with Lightning.
 
 Two-step CLI: cache features once, then train any number of heads on
 the cache without re-running the backbone.
+
+Heads are pure-PyTorch ``nn.Module``s with vanilla forwards — no LRP
+behaviour leaks into training. The walkthrough notebook applies the
+AttnLRP composite at attribution time, which rebinds the head's
+``BilinearMatmul`` / ``SoftmaxAlongLastDim`` / ``ScaleByConstant``
+forwards to LRP-rule-aware variants and restores them on exit. So this
+CLI has no ``--matmul-rule`` / ``--alpha`` / ``--beta`` flags — those
+belong on the composite, not on the head.
 
 Examples
 --------
@@ -10,7 +18,7 @@ Cache cls features (cheap; needed for ``linear`` head)::
 
     uv run python experiments/train_probe.py cache vit_dinov3 funny_birds --kind cls
 
-Cache full token features (~20 GB; needed for ``attentive`` head)::
+Cache full token features (~20 GB; needed for ``attentive`` and ``block`` heads)::
 
     uv run python experiments/train_probe.py cache vit_dinov3 funny_birds --kind tokens
 
@@ -18,6 +26,7 @@ Train heads on the cached features::
 
     uv run python experiments/train_probe.py train vit_dinov3 linear    funny_birds
     uv run python experiments/train_probe.py train vit_dinov3 attentive funny_birds --num-heads 8
+    uv run python experiments/train_probe.py train vit_dinov3 block     funny_birds --num-heads 16 --mlp-ratio 4.0
 
 The ``train`` command auto-loads the right cache for the head's
 :attr:`~models.heads.base.Head.input_kind`. If the cache is missing it
@@ -28,10 +37,10 @@ Output ``.pt`` (after best-epoch selection by ``ModelCheckpoint``):
 .. code-block:: text
 
     {
-      "base": "vit_dinov3",            # registry name; build_probe(...)
-      "head": "linear" | "attentive",  # registry name
-      "head_kwargs": {...},            # e.g. {"num_heads": 8}
-      "head_state_dict": {...},        # head weights only — backbone is frozen
+      "base": "vit_dinov3",                    # registry name; build_probe(...)
+      "head": "linear" | "attentive" | "block",  # registry name
+      "head_kwargs": {...},                    # architecture only, e.g. {"num_heads": 8}
+      "head_state_dict": {...},                # head weights only — backbone is frozen
       "num_classes": int,
       "dataset": str,
       "val_acc": float, "val_acc5": float, "val_loss": float,
@@ -63,6 +72,14 @@ from experiments.models import BASES, HEADS, build_base, build_head
 # File-system sharing → DataLoader workers don't need /dev/shm
 # (containers cap it at 64 MB).
 _torch_mp.set_sharing_strategy("file_system")
+
+# Cache extraction (frozen ViT-L forward) and head training (B×T×D matmuls)
+# both bottleneck on fp32 matmul on the A100. TF32 keeps fp32 calling
+# convention but uses Tensor Cores → ~3-5× faster. Cached features are
+# stored at fixed precision (fp32 cls / fp16 tokens) regardless, so this
+# does not affect numbers seen at attribution time.
+if torch.cuda.is_available():
+    torch.set_float32_matmul_precision("high")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -165,13 +182,30 @@ def cache_cmd(
     extract = base_obj.extract_cls if kind == "cls" else base_obj.extract_tokens
     out_dtype = torch.float32 if kind == "cls" else torch.float16
 
-    print(f"\nextracting features ({kind}, dtype={out_dtype})")
-    loader = DataLoader(
-        ds, batch_size=batch_size, num_workers=num_workers,
+    print(f"\nextracting features ({kind}, dtype={out_dtype})", flush=True)
+    loader_kwargs = dict(
+        batch_size=batch_size, num_workers=num_workers,
         shuffle=False, pin_memory=True,
     )
-    feats, labels = [], []
-    seen, t0 = 0, time.time()
+    if num_workers > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
+    loader = DataLoader(ds, **loader_kwargs)
+
+    # Pre-allocate output tensor: avoids the 2× RAM peak from list+torch.cat
+    # at the end (matters for ``tokens`` on funny_birds — ~20 GB output, so
+    # the cat-peak was ~40 GB and got OOM-killed on this 4-core / shared-RAM
+    # box). Discover the per-sample feature shape with one tiny forward.
+    print("  probing feature shape with one forward", flush=True)
+    with torch.no_grad():
+        probe_x, _ = next(iter(loader))
+        probe_f = extract(probe_x[:1].to(device, non_blocking=True))
+    per_sample_shape = tuple(probe_f.shape[1:])
+    n = len(ds)
+    feats = torch.empty((n, *per_sample_shape), dtype=out_dtype)
+    labels = torch.empty((n,), dtype=torch.long)
+    print(f"  pre-allocated feats {tuple(feats.shape)} ({feats.element_size() * feats.numel() / 1e9:.1f} GB)", flush=True)
+
+    cursor, t0 = 0, time.time()
     # Cache extraction is one-shot — no autograd graph needed.
     # (Base.extract_* deliberately *don't* set no_grad themselves so the
     # AttnLRP composite can build its backward graph at attribution time.)
@@ -179,14 +213,23 @@ def cache_cmd(
         for x, y in loader:
             x = x.to(device, non_blocking=True)
             f = extract(x).to(out_dtype).cpu()
-            feats.append(f)
-            labels.append(y if torch.is_tensor(y) else torch.as_tensor(y))
-            seen += x.shape[0]
-            if seen % (50 * batch_size) < batch_size:
-                print(f"  extracted {seen}/{len(ds)}  ({time.time() - t0:.1f}s)")
+            b = f.shape[0]
+            feats[cursor:cursor + b] = f
+            labels[cursor:cursor + b] = (
+                y if torch.is_tensor(y) else torch.as_tensor(y)
+            ).long()
+            cursor += b
+            if cursor % (50 * batch_size) < batch_size:
+                rate = cursor / max(time.time() - t0, 1e-6)
+                eta = (n - cursor) / max(rate, 1e-6)
+                print(
+                    f"  extracted {cursor}/{n}  "
+                    f"({time.time() - t0:.0f}s, {rate:.1f} img/s, "
+                    f"ETA {eta:.0f}s)",
+                    flush=True,
+                )
 
-    feats = torch.cat(feats, 0)
-    labels = torch.cat(labels, 0)
+    print(f"\nsaving cache to {out}", flush=True)
     torch.save(
         {"feats": feats, "labels": labels,
          "base": base, "dataset": dataset, "kind": kind,
@@ -194,7 +237,7 @@ def cache_cmd(
          "embed_dim": int(base_obj.embed_dim)},
         out,
     )
-    print(f"\nsaved {out}  (feats={tuple(feats.shape)} {feats.dtype})")
+    print(f"saved {out}  (feats={tuple(feats.shape)} {feats.dtype})", flush=True)
 
 
 # ── train command ────────────────────────────────────────────────────────────
@@ -271,22 +314,11 @@ def train_cmd(
     ),
     num_heads: int = typer.Option(
         8, "--num-heads",
-        help="(attentive only) heads in the pooling MultiheadAttention.",
+        help="(attentive/block) self-attention heads.",
     ),
-    matmul_rule: str = typer.Option(
-        "alpha_beta", "--matmul-rule",
-        help="(attentive only) bilinear-matmul LRP rule baked into the "
-             "head's q@kᵀ and weights@v ops. {alpha_beta, matmul_factor_2, "
-             "passthrough}. Match the composite the walkthrough uses.",
-    ),
-    alpha: float = typer.Option(
-        0.5, "--alpha",
-        help="(attentive only) AlphaBeta-rule α. Default matches the "
-             "composite's α=β=0.5 working recipe.",
-    ),
-    beta: float = typer.Option(
-        0.5, "--beta",
-        help="(attentive only) AlphaBeta-rule β.",
+    mlp_ratio: float = typer.Option(
+        4.0, "--mlp-ratio",
+        help="(block only) MLP hidden-dim multiplier (ViT default 4.0).",
     ),
     out: Optional[Path] = typer.Option(
         None, "--out",
@@ -297,7 +329,7 @@ def train_cmd(
     """Train a head on cached features.
 
     Auto-loads the cache that matches the head's ``input_kind`` (``cls``
-    for ``linear``, ``tokens`` for ``attentive``).
+    for ``linear``, ``tokens`` for ``attentive``/``block``).
     """
     if base not in BASES:
         raise typer.BadParameter(f"unknown base {base!r}; choose from {sorted(BASES)}")
@@ -323,7 +355,12 @@ def train_cmd(
     out.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"base    : {base}")
-    print(f"head    : {head}" + (f" (num_heads={num_heads})" if head == "attentive" else ""))
+    head_info = ""
+    if head == "attentive":
+        head_info = f" (num_heads={num_heads})"
+    elif head == "block":
+        head_info = f" (num_heads={num_heads}, mlp_ratio={mlp_ratio})"
+    print(f"head    : {head}{head_info}")
     print(f"dataset : {dataset}")
     print(f"cache   : {cache}")
     print(f"out     : {out}")
@@ -335,18 +372,18 @@ def train_cmd(
     num_classes = int(d["num_classes"])
     print(f"  feats={tuple(feats.shape)} {feats.dtype}, labels={tuple(labels.shape)}")
 
-    # Head construction kwargs — declared per head. These are recorded in
-    # the checkpoint and replayed at notebook load time, so the
-    # walkthrough's attribution-time backward stays consistent with how
-    # the head was trained.
+    # Head construction kwargs — architecture only. The checkpoint
+    # records these so the walkthrough notebook can reconstruct the
+    # head with identical layout. LRP rules are NOT a constructor
+    # concern — they're applied at attribution time by the composite's
+    # per-rule canonizers (see :mod:`crp.attention_unfolded`), which
+    # rebind the head's ``BilinearMatmul`` / ``SoftmaxAlongLastDim`` /
+    # ``ScaleByConstant`` forwards inside the composite context.
     head_kwargs: dict = {}
     if head == "attentive":
-        head_kwargs.update(
-            num_heads=num_heads,
-            matmul_rule=matmul_rule,
-            alpha=alpha,
-            beta=beta,
-        )
+        head_kwargs.update(num_heads=num_heads)
+    elif head == "block":
+        head_kwargs.update(num_heads=num_heads, mlp_ratio=mlp_ratio)
     head_obj = build_head(
         head, embed_dim=embed_dim, num_classes=num_classes, head_kwargs=head_kwargs,
     )

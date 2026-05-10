@@ -6,13 +6,20 @@ Canonical 'attentive probe' from the DINOv2 / DINOv3 eval protocols
 important for tasks where classes are defined by combinations of
 spatially-local parts (FunnyBirds, segmentation-like benchmarks).
 
-**AttnLRP-aware unfold.** Attention is implemented from primitives
-(``BilinearMatmul``, ``SoftmaxAlongLastDim``, ``ScaleByConstant`` from
-``crp.attention_unfolded``) so the AttnLRP composite's bilinear /
-softmax-identity / scalar-identity rules apply to the head exactly the
-same way they apply to backbone attention. A vanilla
-``nn.MultiheadAttention`` would be a black box to the composite — its
-backward would run the standard PyTorch chain rule, which is not LRP.
+**Vanilla forward.** All atomic submodules
+(:class:`~crp.attention_unfolded.BilinearMatmul`,
+:class:`~crp.attention_unfolded.SoftmaxAlongLastDim`,
+:class:`~crp.attention_unfolded.ScaleByConstant`) have plain PyTorch
+forwards; autograd's standard backward applies during ``loss.backward()``,
+so this head trains with correct chain-rule gradients.
+
+For attribution, a composite that bundles the per-rule canonizers
+(:class:`~crp.attention_unfolded.BilinearMatmulAlphaBetaCanonizer`,
+:class:`~crp.attention_unfolded.SoftmaxIdentityCanonizer`,
+:class:`~crp.attention_unfolded.ScaleByConstantIdentityCanonizer`)
+will rebind these submodules' forwards inside the composite's context
+manager, applying the AttnLRP rules during the attribution backward
+and restoring vanilla forwards on exit.
 """
 from __future__ import annotations
 
@@ -41,13 +48,6 @@ class AttentiveHead(Head):
         Number of output classes.
     num_heads
         MultiheadAttention heads in the pooling layer.
-    matmul_rule, alpha, beta, epsilon
-        Bilinear-matmul LRP-rule hyperparameters used by both the
-        ``q @ kᵀ`` and ``weights @ v`` ops. The defaults match the
-        AttnLRP-paper recipe + this repo's working composite
-        (``alpha=0.5, beta=0.5``); you only need to touch them if the
-        AttnLRP composite is run with non-default α/β so the head's
-        backward stays consistent with the backbone's.
     """
 
     input_kind = "tokens"
@@ -57,11 +57,6 @@ class AttentiveHead(Head):
         embed_dim: int,
         num_classes: int,
         num_heads: int = 8,
-        *,
-        matmul_rule: str = "alpha_beta",
-        alpha: float = 0.5,
-        beta: float = 0.5,
-        epsilon: float = 1e-6,
     ) -> None:
         super().__init__()
         if embed_dim % num_heads != 0:
@@ -78,26 +73,21 @@ class AttentiveHead(Head):
         nn.init.trunc_normal_(self.query, std=0.02)
 
         # Q/K/V/output projections — plain nn.Linear receive the standard
-        # ε-LRP (or γ-LRP) rule from the composite's layer_map.
+        # ε-LRP (or γ-LRP) rule from the composite's layer_map at attribution.
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-        # Unfolded attention primitives (same module classes the backbone
-        # substitution uses), so the AttnLRP rules they bake in propagate
-        # relevance correctly through this head too.
-        # ``identity`` rule on softmax/scale ↔ AttnLRP identity (Eq. 7).
-        # ``alpha_beta`` rule on the bilinears ↔ Bach-2015 generalised to
-        # bilinear (RESEARCH_NOTES.md Entry 6).
-        self.scale_q = ScaleByConstant(self._scale, rule="identity")
-        self.qk_scores = BilinearMatmul(
-            rule=matmul_rule, epsilon=epsilon, alpha=alpha, beta=beta,
-        )
-        self.softmax = SoftmaxAlongLastDim(rule="identity")
-        self.context = BilinearMatmul(
-            rule=matmul_rule, epsilon=epsilon, alpha=alpha, beta=beta,
-        )
+        # Vanilla unfolded primitives — exposed as named submodules so the
+        # composite's per-rule canonizers can rebind their forwards at
+        # attribution time. At training time their forwards are bare
+        # ``a @ b`` / ``F.softmax`` / ``x * scalar`` and autograd's
+        # standard backward applies.
+        self.scale_q = ScaleByConstant(self._scale)
+        self.qk_scores = BilinearMatmul()
+        self.softmax = SoftmaxAlongLastDim()
+        self.context = BilinearMatmul()
 
         # Final classifier on the pooled, normed feature.
         self.norm = nn.LayerNorm(embed_dim)
@@ -120,15 +110,14 @@ class AttentiveHead(Head):
         k = k.reshape(B, T, H, hd).transpose(1, 2)       # (B, H, T, hd)
         v = v.reshape(B, T, H, hd).transpose(1, 2)       # (B, H, T, hd)
 
-        # Scale Q (separate Module → identity LRP rule).
+        # Scale Q (vanilla; LRP identity rule applied by composite at attr-time).
         q = self.scale_q(q)
 
-        # Bilinear matmul q @ kᵀ → AlphaBeta rule baked into the module.
-        # k.transpose(-2, -1) is a view, autograd-trivial.
+        # Bilinear matmul q @ kᵀ. k.transpose is a view, autograd-trivial.
         scores = self.qk_scores(q, k.transpose(-2, -1))   # (B, H, 1, T)
-        weights = self.softmax(scores)                    # identity rule
+        weights = self.softmax(scores)
 
-        # Bilinear matmul weights @ v → AlphaBeta rule baked in.
+        # Bilinear matmul weights @ v.
         ctx = self.context(weights, v)                    # (B, H, 1, hd)
 
         # Reshape back: (B, H, 1, hd) → (B, 1, D) → (B, D).

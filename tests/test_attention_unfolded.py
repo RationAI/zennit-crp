@@ -1,35 +1,20 @@
 """Unit tests for ``crp.attention_unfolded``.
 
-Phase 1 of the attention-unfolding refactor (see
-``UNFOLDING_ATTENTION_REFACTOR.md``). Tests are weight-loading-free so
-CI can run them without downloading checkpoints.
+After the LRP-cleanup refactor, every module here has a vanilla PyTorch
+forward and autograd's standard backward. LRP behaviour (custom backward
+= relevance flow) is layered in EXCLUSIVELY by per-module canonizers
+(``BilinearMatmulFactor2Canonizer`` etc.) at attribution time.
 
-Coverage matrix:
+So the test matrix is:
 
-* :class:`BilinearMatmul`
-  - forward parity with bare ``a @ b`` (passthrough mode)
-  - autograd backward parity with bare ``a @ b`` (passthrough mode)
-  - matmul rule conservation per AttnLRP Prop. 3.3
-    (``sum(R_a) + sum(R_b) ≈ sum(R_y)``)
-* :class:`SoftmaxAlongLastDim`
-  - forward parity with ``F.softmax(dim=-1)``
-  - identity rule on backward (``R_in == R_out``)
-* :class:`RotaryEmbedding`
-  - forward parity with ``apply_rot_embed_cat`` (with and without
-    ``num_prefix_tokens`` skip, with and without rope_detach)
-  - rope_detach actually severs the rope grad path
-* :class:`ScaleByConstant`, :class:`ChunkAlongLastDim`,
-  :class:`ReshapeMergeHeads`, :class:`AddBias`, :class:`ResidualAdd`,
-  :class:`LayerScaleMul`
-  - forward / backward sanity
-* :class:`EvaAttentionUnfolded`
-  - forward parity with stock ``EvaAttention`` on a synthetic
-    weight-init random model
-  - autograd backward parity with stock ``EvaAttention``
-* :class:`EvaAttentionSubstitutionCanonizer`
-  - apply → forward → remove round-trip restores the original
-    forward exactly
-  - re-apply works after remove
+* Vanilla forward of each module = bare ``torch`` op (bit-identical).
+* Vanilla backward of each module = autograd's standard chain rule.
+* With the corresponding canonizer applied: forward unchanged
+  (bit-identical to vanilla), backward implements the LRP rule
+  (conservation / identity / etc.).
+
+Tests are weight-loading-free so CI can run them without downloading
+checkpoints.
 
 Run with::
 
@@ -39,6 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 timm = pytest.importorskip("timm")
@@ -46,31 +32,50 @@ timm = pytest.importorskip("timm")
 from crp.attention_unfolded import (
     AddBias,
     BilinearMatmul,
+    BilinearMatmulAlphaBetaCanonizer,
+    BilinearMatmulFactor2Canonizer,
     ChunkAlongLastDim,
     EvaAttentionSubstitutionCanonizer,
     EvaAttentionUnfolded,
     LayerScaleMul,
+    LayerScaleUniformCanonizer,
     ReshapeMergeHeads,
     ResidualAdd,
+    ResidualRatioCanonizer,
     RotaryEmbedding,
     ScaleByConstant,
+    ScaleByConstantIdentityCanonizer,
     SoftmaxAlongLastDim,
+    SoftmaxIdentityCanonizer,
 )
 
 
-# ─── 1. BilinearMatmul ───────────────────────────────────────────────────────
+# ─── helpers ────────────────────────────────────────────────────────────────
+
+
+def _apply_canonizer(canonizer, *modules):
+    """Wrap modules in a Sequential and apply the canonizer to it.
+
+    Returns the list of canonizer instances created — call ``.remove()``
+    on each at teardown.
+    """
+    root = nn.Sequential(*modules)
+    return canonizer.apply(root)
+
+
+# ─── 1. BilinearMatmul ──────────────────────────────────────────────────────
 
 
 class TestBilinearMatmul:
-    def test_forward_passthrough_matches_bare_matmul(self):
+    def test_vanilla_forward_matches_bare_matmul(self):
         torch.manual_seed(0)
         a = torch.randn(2, 3, 5, 7)
         b = torch.randn(2, 3, 7, 4)
-        m = BilinearMatmul(rule="passthrough")
-        y = m(a, b)
-        assert torch.equal(y, a @ b)
+        m = BilinearMatmul()
+        assert torch.equal(m(a, b), a @ b)
 
-    def test_backward_passthrough_matches_bare_matmul(self):
+    def test_vanilla_backward_matches_bare_matmul(self):
+        """Critical: head training relies on chain-rule gradients here."""
         torch.manual_seed(1)
         a1 = torch.randn(2, 4, 5, requires_grad=True)
         b1 = torch.randn(2, 5, 6, requires_grad=True)
@@ -78,271 +83,352 @@ class TestBilinearMatmul:
         b2 = b1.detach().clone().requires_grad_(True)
         go = torch.randn(2, 4, 6)
         (a1 @ b1).backward(go)
-        BilinearMatmul(rule="passthrough")(a2, b2).backward(go)
+        BilinearMatmul()(a2, b2).backward(go)
         assert torch.allclose(a1.grad, a2.grad, atol=0)
         assert torch.allclose(b1.grad, b2.grad, atol=0)
 
-    def test_forward_matmul_factor_2_matches_bare_matmul(self):
-        # The Prop. 3.3 rule only changes backward; forward is identical.
+    def test_factor2_canonizer_forward_unchanged(self):
+        """Forward must remain bit-identical to vanilla under the canonizer."""
         torch.manual_seed(2)
         a = torch.randn(2, 3, 5, 7)
         b = torch.randn(2, 3, 7, 4)
-        m = BilinearMatmul(rule="matmul_factor_2", epsilon=1e-6)
-        y = m(a, b)
-        assert torch.allclose(y, a @ b, atol=0)
+        m = BilinearMatmul()
+        instances = _apply_canonizer(BilinearMatmulFactor2Canonizer(epsilon=1e-6), m)
+        try:
+            assert torch.allclose(m(a, b), a @ b, atol=0)
+        finally:
+            for inst in instances:
+                inst.remove()
 
-    def test_matmul_factor_2_conservation(self):
-        """AttnLRP Prop. 3.3: ``sum(R_a) + sum(R_b) ≈ sum(R_y)`` because
-        the ``2y+ε`` denominator splits each upstream relevance evenly
-        across the two bilinear chains and the operand-multiplication
-        recovers the conservation constant."""
+    def test_factor2_canonizer_conservation(self):
+        """AttnLRP Prop. 3.3 ``2y+ε`` rule:
+        ``sum(R_a) + sum(R_b) ≈ sum(R_y)``."""
         torch.manual_seed(3)
-        # Pick well-conditioned operands (mean shifted away from 0) so
-        # ``2y+ε`` is not near zero.
         a = (torch.randn(1, 4, 6) * 2.0 + 1.0).requires_grad_(True)
         b = (torch.randn(1, 6, 5) * 2.0 + 1.0).requires_grad_(True)
-        m = BilinearMatmul(rule="matmul_factor_2", epsilon=1e-6)
-        y = m(a, b)
-        R_y = torch.randn_like(y)
-        y.backward(R_y)
-        R_a = a.grad
-        R_b = b.grad
-        assert torch.isclose(
-            R_a.sum() + R_b.sum(), R_y.sum(), rtol=1e-3, atol=1e-3,
-        ), (
-            f"sum(R_a)+sum(R_b)={R_a.sum().item() + R_b.sum().item():.6f} "
-            f"vs sum(R_y)={R_y.sum().item():.6f}"
+        m = BilinearMatmul()
+        instances = _apply_canonizer(BilinearMatmulFactor2Canonizer(epsilon=1e-6), m)
+        try:
+            y = m(a, b)
+            R_y = torch.randn_like(y)
+            y.backward(R_y)
+            R_a, R_b = a.grad, b.grad
+            assert torch.isclose(
+                R_a.sum() + R_b.sum(), R_y.sum(), rtol=1e-3, atol=1e-3,
+            ), (
+                f"sum(R_a)+sum(R_b)={R_a.sum().item() + R_b.sum().item():.6f} "
+                f"vs sum(R_y)={R_y.sum().item():.6f}"
+            )
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_canonizer_remove_restores_vanilla_backward(self):
+        """After ``remove()`` the module's backward must be vanilla again
+        — critical so heads remain trainable after attribution sessions."""
+        torch.manual_seed(4)
+        m = BilinearMatmul()
+        instances = _apply_canonizer(BilinearMatmulFactor2Canonizer(), m)
+        for inst in instances:
+            inst.remove()
+        # Now retrain-style call: should match bare matmul.
+        a1 = torch.randn(2, 4, 5, requires_grad=True)
+        b1 = torch.randn(2, 5, 6, requires_grad=True)
+        a2 = a1.detach().clone().requires_grad_(True)
+        b2 = b1.detach().clone().requires_grad_(True)
+        go = torch.randn(2, 4, 6)
+        (a1 @ b1).backward(go)
+        m(a2, b2).backward(go)
+        assert torch.allclose(a1.grad, a2.grad, atol=0)
+        assert torch.allclose(b1.grad, b2.grad, atol=0)
+
+    def test_alpha_beta_canonizer_forward_unchanged(self):
+        torch.manual_seed(5)
+        a = torch.randn(2, 4, 6) + 0.5
+        b = torch.randn(2, 6, 3) + 0.5
+        m = BilinearMatmul()
+        instances = _apply_canonizer(
+            BilinearMatmulAlphaBetaCanonizer(alpha=0.5, beta=0.5, epsilon=1e-6), m,
         )
+        try:
+            assert torch.allclose(m(a, b), a @ b, atol=0)
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_alpha_beta_canonizer_conservation(self):
+        """AlphaBeta-on-bilinear: ``sum(R_a) + sum(R_b) = (α+β)·sum(R_y)``;
+        with ``α + β = 1`` we get exact conservation modulo ε.
+
+        Conservation is element-wise modulo ε and only tight when both
+        ``Y^+`` and ``Y^-`` are well away from 0 at every position. With
+        small random operands a single position can have ``Y^- ≈ 0``
+        (structural degeneracy), and that position's β-contribution
+        drops to 0, breaking total conservation. We avoid this by using
+        larger operands (100×50 @ 50×80 = 8000 positions, degeneracy is
+        ε-rare) and mean-zero so neither ``Y^+`` nor ``Y^-`` is dominated.
+        """
+        torch.manual_seed(6)
+        a = (torch.randn(1, 100, 50) * 2.0).requires_grad_(True)
+        b = (torch.randn(1, 50, 80) * 2.0).requires_grad_(True)
+        m = BilinearMatmul()
+        instances = _apply_canonizer(
+            BilinearMatmulAlphaBetaCanonizer(alpha=0.5, beta=0.5, epsilon=1e-6), m,
+        )
+        try:
+            y = m(a, b)
+            R_y = torch.randn_like(y)
+            y.backward(R_y)
+            assert torch.isclose(
+                a.grad.sum() + b.grad.sum(), R_y.sum(),
+                rtol=1e-3, atol=1e-3,
+            ), (
+                f"sum(R_a)+sum(R_b)={a.grad.sum().item() + b.grad.sum().item():.6f} "
+                f"vs sum(R_y)={R_y.sum().item():.6f}"
+            )
+        finally:
+            for inst in instances:
+                inst.remove()
 
 
-# ─── 2. SoftmaxAlongLastDim ──────────────────────────────────────────────────
+# ─── 2. SoftmaxAlongLastDim ─────────────────────────────────────────────────
 
 
 class TestSoftmaxAlongLastDim:
-    def test_forward_matches_F_softmax(self):
+    def test_vanilla_forward_matches_F_softmax(self):
         torch.manual_seed(0)
         x = torch.randn(2, 3, 7)
-        for rule in ("identity", "passthrough"):
-            sm = SoftmaxAlongLastDim(rule=rule)
-            assert torch.equal(sm(x), F.softmax(x, dim=-1))
+        m = SoftmaxAlongLastDim()
+        assert torch.equal(m(x), F.softmax(x, dim=-1))
 
-    def test_identity_rule_passes_relevance_through(self):
-        """``R_in = R_out`` per AttnLRP Eq. 9. The softmax Jacobian
-        coupling between positions is short-circuited."""
+    def test_vanilla_backward_uses_softmax_jacobian(self):
         torch.manual_seed(1)
-        x = torch.randn(2, 3, 7, requires_grad=True)
-        sm = SoftmaxAlongLastDim(rule="identity")
-        y = sm(x)
-        R_y = torch.randn_like(y)
-        y.backward(R_y)
-        assert torch.equal(x.grad, R_y)
+        x1 = torch.randn(2, 5, requires_grad=True)
+        x2 = x1.detach().clone().requires_grad_(True)
+        go = torch.randn(2, 5)
+        F.softmax(x1, dim=-1).backward(go)
+        SoftmaxAlongLastDim()(x2).backward(go)
+        assert torch.allclose(x1.grad, x2.grad, atol=0)
 
-    def test_passthrough_uses_natural_jacobian(self):
-        """Bare softmax: backward is the proper Jacobian, not identity."""
+    def test_identity_canonizer_forward_unchanged(self):
         torch.manual_seed(2)
-        x = torch.randn(2, 3, 7, requires_grad=True)
-        sm = SoftmaxAlongLastDim(rule="passthrough")
-        y = sm(x)
-        R_y = torch.randn_like(y)
-        y.backward(R_y)
-        # The natural Jacobian-vector product should NOT in general
-        # equal the upstream relevance (different formula).
-        assert not torch.allclose(x.grad, R_y, atol=1e-6)
+        x = torch.randn(2, 3, 7)
+        m = SoftmaxAlongLastDim()
+        instances = _apply_canonizer(SoftmaxIdentityCanonizer(), m)
+        try:
+            assert torch.allclose(m(x), F.softmax(x, dim=-1), atol=0)
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_identity_canonizer_passes_relevance_through(self):
+        """AttnLRP Eq. 9: R_in == R_out (identity rule)."""
+        torch.manual_seed(3)
+        x = torch.randn(2, 5, requires_grad=True)
+        m = SoftmaxAlongLastDim()
+        instances = _apply_canonizer(SoftmaxIdentityCanonizer(), m)
+        try:
+            y = m(x)
+            R_y = torch.randn_like(y)
+            y.backward(R_y)
+            assert torch.equal(x.grad, R_y)
+        finally:
+            for inst in instances:
+                inst.remove()
 
 
-# ─── 3. RotaryEmbedding ──────────────────────────────────────────────────────
+# ─── 3. RotaryEmbedding (vanilla, no canonizer needed) ──────────────────────
 
 
 class TestRotaryEmbedding:
-    def _make(self):
+    @pytest.fixture
+    def rope_setup(self):
+        from timm.layers import apply_rot_embed_cat
         torch.manual_seed(0)
-        # Shape mirrors the EvaAttention input (B, num_heads, N, head_dim).
-        q = torch.randn(2, 4, 16, 8)
-        # rope: (N - num_prefix_tokens, head_dim*2) — sin || cos chunks
-        # per timm.layers.apply_rot_embed_cat.
-        rope = torch.randn(12, 16)
-        return q, rope
+        # (B, num_heads, N, head_dim) — RoPE last dim is 2 * head_dim.
+        q = torch.randn(1, 2, 10, 8)
+        rope = torch.randn(10, 16)
+        return q, rope, apply_rot_embed_cat
 
-    def test_forward_parity_no_prefix_no_detach(self):
-        from timm.layers import apply_rot_embed_cat
-        q, rope = self._make()
-        # No prefix → entire sequence is rotated.
-        m = RotaryEmbedding(num_prefix_tokens=4, rotate_half=False, detach_rope=False)
-        y = m(q, rope)
-        # Manual reference: prefix unrotated, suffix rotated.
-        prefix = q[:, :, :4, :]
-        rotated = apply_rot_embed_cat(q[:, :, 4:, :], rope, half=False)
-        ref = torch.cat([prefix, rotated], dim=2)
-        assert torch.equal(y, ref)
+    def test_forward_parity_no_prefix_no_detach(self, rope_setup):
+        q, rope, apply_rot_embed_cat = rope_setup
+        m = RotaryEmbedding(num_prefix_tokens=0, rotate_half=False, detach_rope=False)
+        with torch.no_grad():
+            y = m(q, rope)
+            y_ref = apply_rot_embed_cat(q, rope, half=False)
+        assert torch.equal(y, y_ref)
 
-    def test_forward_parity_with_rotate_half(self):
-        from timm.layers import apply_rot_embed_cat
-        q, rope = self._make()
-        m = RotaryEmbedding(num_prefix_tokens=4, rotate_half=True)
-        y = m(q, rope)
-        prefix = q[:, :, :4, :]
-        rotated = apply_rot_embed_cat(q[:, :, 4:, :], rope, half=True)
-        ref = torch.cat([prefix, rotated], dim=2)
-        assert torch.equal(y, ref)
+    def test_forward_parity_with_rotate_half(self, rope_setup):
+        q, rope, apply_rot_embed_cat = rope_setup
+        m = RotaryEmbedding(num_prefix_tokens=0, rotate_half=True, detach_rope=False)
+        with torch.no_grad():
+            y = m(q, rope)
+            y_ref = apply_rot_embed_cat(q, rope, half=True)
+        assert torch.equal(y, y_ref)
 
-    def test_rope_none_is_identity(self):
-        q, _ = self._make()
-        m = RotaryEmbedding(num_prefix_tokens=4)
-        y = m(q, None)
-        assert torch.equal(y, q)
+    def test_rope_none_is_identity(self, rope_setup):
+        q, _, _ = rope_setup
+        m = RotaryEmbedding(num_prefix_tokens=0)
+        assert torch.equal(m(q, None), q)
 
-    def test_detach_rope_severs_rope_grad(self):
-        q, rope = self._make()
-        rope.requires_grad_(True)
-        q.requires_grad_(True)
-
-        m_attached = RotaryEmbedding(num_prefix_tokens=4, detach_rope=False)
-        y = m_attached(q, rope)
-        y.sum().backward()
-        assert rope.grad is not None
-        assert rope.grad.abs().max() > 0
-        rope.grad = None
-        q.grad = None
-
-        m_detached = RotaryEmbedding(num_prefix_tokens=4, detach_rope=True)
-        y2 = m_detached(q, rope)
-        y2.sum().backward()
-        assert rope.grad is None or rope.grad.abs().max() == 0
+    def test_detach_rope_severs_rope_grad(self, rope_setup):
+        q, rope, _ = rope_setup
+        rope = rope.clone().requires_grad_(True)
+        q = q.clone().requires_grad_(True)
+        m = RotaryEmbedding(num_prefix_tokens=0, detach_rope=True)
+        m(q, rope).sum().backward()
+        assert rope.grad is None  # detach severed it
+        assert q.grad is not None
 
 
-# ─── 4. ScaleByConstant ──────────────────────────────────────────────────────
+# ─── 4. ScaleByConstant ─────────────────────────────────────────────────────
 
 
 class TestScaleByConstant:
-    def test_forward_matches_multiplication(self):
-        torch.manual_seed(0)
-        x = torch.randn(2, 3)
-        for rule in ("identity", "passthrough"):
-            assert torch.equal(ScaleByConstant(2.5, rule=rule)(x), x * 2.5)
+    def test_vanilla_forward_matches_multiplication(self):
+        x = torch.randn(2, 5)
+        m = ScaleByConstant(0.5)
+        assert torch.equal(m(x), x * 0.5)
 
-    def test_passthrough_backward_uses_chain_rule(self):
-        torch.manual_seed(1)
-        x = torch.randn(2, 3, requires_grad=True)
-        ScaleByConstant(2.5, rule="passthrough")(x).sum().backward()
-        assert torch.allclose(x.grad, torch.full_like(x, 2.5))
+    def test_vanilla_backward_uses_chain_rule(self):
+        x = torch.randn(2, 5, requires_grad=True)
+        m = ScaleByConstant(0.5)
+        m(x).sum().backward()
+        assert torch.allclose(x.grad, torch.full_like(x, 0.5))
 
-    def test_identity_backward_passes_relevance_through(self):
-        torch.manual_seed(2)
-        x = torch.randn(2, 3, requires_grad=True)
-        sc = ScaleByConstant(2.5, rule="identity")
-        y = sc(x)
-        R_y = torch.randn_like(y)
-        y.backward(R_y)
-        assert torch.equal(x.grad, R_y)
+    def test_identity_canonizer_forward_unchanged(self):
+        x = torch.randn(2, 5)
+        m = ScaleByConstant(0.5)
+        instances = _apply_canonizer(ScaleByConstantIdentityCanonizer(), m)
+        try:
+            assert torch.equal(m(x), x * 0.5)
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_identity_canonizer_passes_relevance_through(self):
+        """Constant absorbs no relevance: R_in == R_out."""
+        x = torch.randn(2, 5, requires_grad=True)
+        m = ScaleByConstant(0.5)
+        instances = _apply_canonizer(ScaleByConstantIdentityCanonizer(), m)
+        try:
+            y = m(x)
+            R_y = torch.randn_like(y)
+            y.backward(R_y)
+            assert torch.equal(x.grad, R_y)
+        finally:
+            for inst in instances:
+                inst.remove()
 
 
-# ─── 5. ChunkAlongLastDim, ReshapeMergeHeads, AddBias ────────────────────────
+# ─── 5. Simple kernels (no rules — tested for shape / parity only) ─────────
 
 
 class TestSimpleKernels:
     def test_chunk_split_and_concat_round_trip(self):
-        torch.manual_seed(0)
-        x = torch.randn(2, 3, 12, requires_grad=True)
-        chunks = ChunkAlongLastDim(3)(x)
+        x = torch.randn(2, 3, 12)
+        m = ChunkAlongLastDim(3)
+        chunks = m(x)
         assert len(chunks) == 3
-        assert all(c.shape == (2, 3, 4) for c in chunks)
-        # Backward of split is concat — sum of grad is preserved.
-        y = sum(c.sum() for c in chunks)
-        y.backward()
-        assert torch.allclose(x.grad, torch.ones_like(x))
+        assert chunks[0].shape == (2, 3, 4)
+        assert torch.equal(torch.cat(chunks, dim=-1), x)
 
     def test_reshape_merge_heads(self):
-        # x: (B, num_heads, N, head_dim) → (B, N, num_heads*head_dim).
-        torch.manual_seed(0)
-        x = torch.randn(2, 4, 5, 6, requires_grad=True)
-        y = ReshapeMergeHeads()(x)
-        assert y.shape == (2, 5, 24)
-        # Manual reference.
-        ref = x.transpose(1, 2).reshape(2, 5, 24)
+        # (B=2, H=4, N=10, hd=6) → (2, 10, 24)
+        x = torch.randn(2, 4, 10, 6)
+        m = ReshapeMergeHeads()
+        y = m(x)
+        assert y.shape == (2, 10, 24)
+        # Equivalent manual op:
+        ref = x.transpose(1, 2).reshape(2, 10, 24)
         assert torch.equal(y, ref)
-        # Backward: identity on R.
-        go = torch.randn_like(y)
-        y.backward(go)
-        ref_grad = go.reshape(2, 5, 4, 6).transpose(1, 2)
-        assert torch.allclose(x.grad, ref_grad, atol=0)
 
     def test_add_bias_with_none(self):
-        torch.manual_seed(0)
-        x = torch.randn(2, 3)
-        assert torch.equal(AddBias()(x, None), x)
+        x = torch.randn(2, 5)
+        m = AddBias()
+        assert torch.equal(m(x, None), x)
 
     def test_add_bias_with_tensor(self):
-        torch.manual_seed(0)
-        x = torch.randn(2, 3, requires_grad=True)
-        b = torch.randn(2, 3)
-        y = AddBias()(x, b)
-        assert torch.equal(y, x + b)
-        y.sum().backward()
-        assert torch.allclose(x.grad, torch.ones_like(x))
+        x = torch.randn(2, 5)
+        b = torch.randn(2, 5)
+        m = AddBias()
+        assert torch.equal(m(x, b), x + b)
 
 
-# ─── 6. ResidualAdd ──────────────────────────────────────────────────────────
+# ─── 6. ResidualAdd ─────────────────────────────────────────────────────────
 
 
 class TestResidualAdd:
-    def test_ratio_rule_conservation(self):
+    def test_vanilla_forward_matches_addition(self):
+        x = torch.randn(2, 5)
+        b = torch.randn(2, 5)
+        m = ResidualAdd()
+        assert torch.equal(m(x, b), x + b)
+
+    def test_vanilla_backward_routes_grad_to_both(self):
+        x = torch.randn(2, 5, requires_grad=True)
+        b = torch.randn(2, 5, requires_grad=True)
+        m = ResidualAdd()
+        y = m(x, b)
+        R_y = torch.randn_like(y)
+        y.backward(R_y)
+        assert torch.equal(x.grad, R_y)
+        assert torch.equal(b.grad, R_y)
+
+    def test_ratio_canonizer_conservation(self):
         torch.manual_seed(0)
         x = (torch.randn(2, 5) + 0.5).requires_grad_(True)
         b = (torch.randn(2, 5) + 0.5).requires_grad_(True)
-        m = ResidualAdd(rule="ratio")
-        y = m(x, b)
-        R_y = torch.randn_like(y)
-        y.backward(R_y)
-        # |x| + |b| ratio split should approximately conserve R_y.
-        total = x.grad.sum() + b.grad.sum()
-        assert torch.isclose(total, R_y.sum(), rtol=1e-3, atol=1e-3)
-
-    def test_symmetric_rule_halves_gradient(self):
-        torch.manual_seed(0)
-        x = torch.randn(2, 5, requires_grad=True)
-        b = torch.randn(2, 5, requires_grad=True)
-        m = ResidualAdd(rule="symmetric")
-        y = m(x, b)
-        R_y = torch.randn_like(y)
-        y.backward(R_y)
-        assert torch.allclose(x.grad, R_y / 2)
-        assert torch.allclose(b.grad, R_y / 2)
+        m = ResidualAdd()
+        instances = _apply_canonizer(ResidualRatioCanonizer(epsilon=1e-6), m)
+        try:
+            y = m(x, b)
+            R_y = torch.randn_like(y)
+            y.backward(R_y)
+            total = x.grad.sum() + b.grad.sum()
+            assert torch.isclose(total, R_y.sum(), rtol=1e-3, atol=1e-3)
+        finally:
+            for inst in instances:
+                inst.remove()
 
 
-# ─── 7. LayerScaleMul ────────────────────────────────────────────────────────
+# ─── 7. LayerScaleMul ───────────────────────────────────────────────────────
 
 
 class TestLayerScaleMul:
-    def test_forward_multiplies_by_gamma(self):
-        gamma = torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
+    def test_vanilla_forward_multiplies_by_gamma(self):
+        gamma = nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
         x = torch.randn(2, 4, 3)
-        m = LayerScaleMul(gamma, layerscale_uniform=True)
+        m = LayerScaleMul(gamma)
         assert torch.equal(m(x), gamma * x)
 
-    def test_uniform_rule_halves_relevance(self):
-        gamma = torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
+    def test_vanilla_backward_full_grad(self):
+        gamma = nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
         x = torch.randn(2, 4, 3, requires_grad=True)
-        m = LayerScaleMul(gamma, layerscale_uniform=True)
-        y = m(x)
-        R_y = torch.randn_like(y)
-        y.backward(R_y)
-        # Without the uniform rule the gradient would be R_y * gamma;
-        # with the rule it's halved AFTER autograd does R_y * gamma.
-        # But _DivideGradientFn divides R_y BEFORE bare-grad propagation,
-        # so x.grad = (R_y / 2) * gamma.
-        assert torch.allclose(x.grad, (R_y / 2) * gamma)
-
-    def test_no_uniform_rule_full_grad(self):
-        gamma = torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
-        x = torch.randn(2, 4, 3, requires_grad=True)
-        m = LayerScaleMul(gamma, layerscale_uniform=False)
+        m = LayerScaleMul(gamma)
         y = m(x)
         R_y = torch.randn_like(y)
         y.backward(R_y)
         assert torch.allclose(x.grad, R_y * gamma)
 
+    def test_uniform_canonizer_halves_relevance(self):
+        gamma = nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
+        x = torch.randn(2, 4, 3, requires_grad=True)
+        m = LayerScaleMul(gamma)
+        instances = _apply_canonizer(LayerScaleUniformCanonizer(), m)
+        try:
+            y = m(x)
+            R_y = torch.randn_like(y)
+            y.backward(R_y)
+            # Uniform rule: divide upstream R by 2 BEFORE bare-grad
+            # propagation, so x.grad = (R_y / 2) * gamma.
+            assert torch.allclose(x.grad, (R_y / 2) * gamma)
+        finally:
+            for inst in instances:
+                inst.remove()
 
-# ─── 8. EvaAttentionUnfolded — end-to-end on synthetic random model ─────────
+
+# ─── 8. EvaAttentionUnfolded ────────────────────────────────────────────────
 
 
 @pytest.fixture(scope="module")
@@ -352,11 +438,6 @@ def synthetic_eva_attention():
     tests since we compare against the same instance's stock forward."""
     pytest.importorskip("timm.models.eva")
     from timm.models.eva import EvaAttention
-    # Match DINOv3 ViT-L attention shape: dim=1024, num_heads=16,
-    # num_prefix_tokens=5 (1 cls + 4 reg), rotate_half=True (DINOv3
-    # default). qk_norm=False / scale_norm=False to skip the
-    # post-norm path (matches the DINOv3-imagenette probe topology
-    # we're targeting in Phase 1).
     attn = EvaAttention(
         dim=1024,
         num_heads=16,
@@ -369,7 +450,6 @@ def synthetic_eva_attention():
         rotate_half=True,
     )
     attn.eval()
-    # Force the explicit op path (the Phase 1 unfolded compares against this).
     attn.fused_attn = False
     return attn
 
@@ -377,72 +457,68 @@ def synthetic_eva_attention():
 @pytest.fixture
 def attn_input():
     torch.manual_seed(0)
-    # Match a 224x224 input: 14×14 patches + 5 prefix = 201 tokens.
-    # rope last dim is 2 * head_dim = 2 * (1024/16) = 128.
     x = torch.randn(1, 201, 1024)
     rope = torch.randn(196, 128)
     return x, rope
 
 
 class TestEvaAttentionUnfolded:
-    def test_forward_parity_passthrough(self, synthetic_eva_attention, attn_input):
+    def test_vanilla_forward_parity_with_stock(self, synthetic_eva_attention, attn_input):
+        """Vanilla unfolded must bit-match the stock attention forward."""
         x, rope = attn_input
         attn = synthetic_eva_attention
-
         with torch.no_grad():
             y_orig = attn(x, rope=rope)
-
-        unfolded = EvaAttentionUnfolded(attn, matmul_rule="passthrough")
+        unfolded = EvaAttentionUnfolded(attn)
         with torch.no_grad():
             y_new = unfolded(x, rope=rope)
-
-        # Bit-identical: the unfolded computes exactly the same ops in
-        # the same order as the stock forward when matmul_rule is
-        # passthrough.
         assert torch.equal(y_orig, y_new)
 
-    def test_backward_parity_passthrough(self, synthetic_eva_attention, attn_input):
+    def test_vanilla_backward_parity_with_stock(self, synthetic_eva_attention, attn_input):
+        """Critical for training: same chain-rule gradients as stock."""
         x_orig = attn_input[0].clone().requires_grad_(True)
         rope = attn_input[1]
         attn = synthetic_eva_attention
-
         y_orig = attn(x_orig, rope=rope)
         go = torch.randn_like(y_orig)
         y_orig.backward(go)
         g_orig = x_orig.grad.clone()
 
         x_new = attn_input[0].clone().requires_grad_(True)
-        unfolded = EvaAttentionUnfolded(attn, matmul_rule="passthrough")
+        unfolded = EvaAttentionUnfolded(attn)
         y_new = unfolded(x_new, rope=rope)
         y_new.backward(go)
         g_new = x_new.grad.clone()
 
-        # Within fp32 noise.
         assert torch.allclose(g_orig, g_new, atol=1e-5, rtol=1e-4), (
             f"max grad diff = {(g_orig - g_new).abs().max().item():.6e}"
         )
 
-    def test_forward_parity_under_lrp_rule(self, synthetic_eva_attention, attn_input):
-        # The matmul-factor-2 rule changes ONLY backward; forward must
-        # still bit-match the stock attention.
+    def test_forward_unchanged_when_factor2_canonizer_applied(
+        self, synthetic_eva_attention, attn_input,
+    ):
+        """The matmul-factor-2 rule changes ONLY backward; forward must
+        still bit-match the stock attention."""
         x, rope = attn_input
         attn = synthetic_eva_attention
         with torch.no_grad():
             y_orig = attn(x, rope=rope)
-        unfolded = EvaAttentionUnfolded(
-            attn, matmul_rule="matmul_factor_2", epsilon=1e-6,
-        )
-        with torch.no_grad():
-            y_new = unfolded(x, rope=rope)
-        assert torch.allclose(y_orig, y_new, atol=1e-6, rtol=1e-5)
+        unfolded = EvaAttentionUnfolded(attn)
+        instances = BilinearMatmulFactor2Canonizer(epsilon=1e-6).apply(unfolded)
+        try:
+            with torch.no_grad():
+                y_new = unfolded(x, rope=rope)
+            assert torch.allclose(y_orig, y_new, atol=1e-6, rtol=1e-5)
+        finally:
+            for inst in instances:
+                inst.remove()
 
     def test_no_rope_is_identity_in_rotation(self, synthetic_eva_attention, attn_input):
         x = attn_input[0]
         attn = synthetic_eva_attention
-        unfolded = EvaAttentionUnfolded(attn, matmul_rule="passthrough")
+        unfolded = EvaAttentionUnfolded(attn)
         with torch.no_grad():
             y_no_rope = unfolded(x, rope=None)
-        # Sanity: forward runs end-to-end without rope.
         assert y_no_rope.shape == x.shape
 
 
@@ -462,14 +538,11 @@ class TestEvaAttentionSubstitutionCanonizer:
     def test_apply_substitutes_one_block(self):
         m = self._make_model()
         from timm.models.eva import EvaAttention
-        can = EvaAttentionSubstitutionCanonizer(
-            block_indices=(0,), matmul_rule="passthrough",
-        )
+        can = EvaAttentionSubstitutionCanonizer(block_indices=(0,))
         instances = can.apply(m)
         try:
             assert len(instances) == 1
             assert isinstance(m.blocks[0].attn, EvaAttentionUnfolded)
-            # Other blocks unchanged.
             assert isinstance(m.blocks[1].attn, EvaAttention)
         finally:
             for inst in instances:
@@ -479,9 +552,7 @@ class TestEvaAttentionSubstitutionCanonizer:
         m = self._make_model()
         from timm.models.eva import EvaAttention
         original = m.blocks[0].attn
-        can = EvaAttentionSubstitutionCanonizer(
-            block_indices=(0,), matmul_rule="passthrough",
-        )
+        can = EvaAttentionSubstitutionCanonizer(block_indices=(0,))
         instances = can.apply(m)
         for inst in instances:
             inst.remove()
@@ -496,9 +567,7 @@ class TestEvaAttentionSubstitutionCanonizer:
         with torch.no_grad():
             y0 = m(img)
 
-        can = EvaAttentionSubstitutionCanonizer(
-            block_indices=(0,), matmul_rule="passthrough",
-        )
+        can = EvaAttentionSubstitutionCanonizer(block_indices=(0,))
         instances = can.apply(m)
         with torch.no_grad():
             y1 = m(img)
@@ -512,16 +581,13 @@ class TestEvaAttentionSubstitutionCanonizer:
         for inst in instances2:
             inst.remove()
 
-        # All forwards must produce the same output (passthrough mode).
         assert torch.equal(y0, y1)
         assert torch.equal(y0, y2)
         assert torch.equal(y0, y3)
 
     def test_block_indices_filter_targets_correct_block(self):
         m = self._make_model()
-        can = EvaAttentionSubstitutionCanonizer(
-            block_indices=(3, 7), matmul_rule="passthrough",
-        )
+        can = EvaAttentionSubstitutionCanonizer(block_indices=(3, 7))
         instances = can.apply(m)
         try:
             assert len(instances) == 2

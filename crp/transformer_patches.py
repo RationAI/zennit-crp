@@ -1035,23 +1035,32 @@ class AttnLRPCombinedComposite(LayerMapComposite):
         if use_unfolded_attention:
             # Lazy import to avoid the cycle:
             # transformer_patches → attention_unfolded → transformer_patches.
-            from crp.attention_unfolded import EvaAttentionSubstitutionCanonizer
-            # When matmul_factor_2 is True, use the AlphaBeta variant of the
-            # bilinear rule (with the user's α/β); otherwise fall back to
-            # the AttnLRP Prop 3.3 ``2y+ε`` rule.
+            from crp.attention_unfolded import (
+                EvaAttentionSubstitutionCanonizer,
+                BilinearMatmulFactor2Canonizer,
+                BilinearMatmulAlphaBetaCanonizer,
+                SoftmaxIdentityCanonizer,
+                ScaleByConstantIdentityCanonizer,
+            )
+            # 1) Substitute Eva attention with the unfolded variant. The
+            #    substitution canonizer is LRP-rule-agnostic — it just
+            #    swaps in vanilla atomic submodules so other canonizers
+            #    can bind LRP rules to them.
+            canonizers.append(EvaAttentionSubstitutionCanonizer(block_indices=None))
+            # 2) Bilinear rule on q@kᵀ and weights@v. AlphaBeta when
+            #    the user asked for ``matmul_factor_2`` (the new default
+            #    winning bilinear rule, parameterised by α/β); otherwise
+            #    the AttnLRP Prop. 3.3 ``2y+ε`` rule.
             if matmul_factor_2:
-                # AlphaBeta is the new default winning bilinear rule.
-                substitution = EvaAttentionSubstitutionCanonizer(
-                    block_indices=None,  # all blocks
-                    matmul_rule="alpha_beta", alpha=alpha, beta=beta,
-                    epsilon=epsilon,
-                )
+                canonizers.append(BilinearMatmulAlphaBetaCanonizer(
+                    alpha=alpha, beta=beta, epsilon=epsilon,
+                ))
             else:
-                substitution = EvaAttentionSubstitutionCanonizer(
-                    block_indices=None,
-                    matmul_rule="matmul_factor_2", epsilon=epsilon,
-                )
-            canonizers.append(substitution)
+                canonizers.append(BilinearMatmulFactor2Canonizer(epsilon=epsilon))
+            # 3) Identity rule on softmax (AttnLRP Eq. 9) and on
+            #    scale-by-constant (graph constants absorb no relevance).
+            canonizers.append(SoftmaxIdentityCanonizer())
+            canonizers.append(ScaleByConstantIdentityCanonizer())
         if linear_gamma is not None:
             layer_map = _gamma_layer_map(linear_gamma, epsilon)
         else:
