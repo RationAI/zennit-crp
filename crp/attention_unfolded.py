@@ -3,7 +3,7 @@
 Every module here is a plain PyTorch op with autograd's standard backward.
 LRP behaviour (custom backward = relevance flow, not Jacobian-vector
 product) is injected EXCLUSIVELY at attribution time by the per-module
-canonizers in this file (e.g. :class:`BilinearMatmulFactor2Canonizer`),
+canonizers in this file (e.g. :class:`BilinearMatmulAlphaBetaCanonizer`),
 which rebind the module's ``forward`` to route through an autograd
 ``Function`` whose backward implements the LRP rule. The canonizers are
 applied by an outer composite (``composite.context(model) → enter`` →
@@ -36,20 +36,24 @@ Single-input modules:
 * :class:`LayerScaleMul` — ``γ * x`` (γ is a learnable per-channel
   parameter from the parent ``EvaBlock``).
 
-Container module:
+Container modules:
 
 * :class:`EvaAttentionUnfolded` — composes the vanilla atomics into a
   forward-parity replacement for ``timm.models.eva.EvaAttention``.
+* :class:`TimmAttentionUnfolded` — same idea for the standard
+  ``timm.models.vision_transformer.Attention`` (no RoPE, no LayerScale,
+  ``num_prefix_tokens=1``).
 
-Substitution canonizer:
+Substitution canonizers:
 
 * :class:`EvaAttentionSubstitutionCanonizer` — swaps ``EvaAttention`` for
   :class:`EvaAttentionUnfolded` on ``apply()``, restores on ``remove()``.
+* :class:`TimmAttentionSubstitutionCanonizer` — same for standard timm
+  ``Attention``. Both canonizers coexist cleanly; each one's
+  ``isinstance`` filter skips the other's target class.
 
 LRP-rule canonizers (one per rule, registered at attribution time):
 
-* :class:`BilinearMatmulFactor2Canonizer` — AttnLRP Prop. 3.3 (Achtibat
-  et al. 2024, arXiv:2402.05602) ``2y+ε`` rule on :class:`BilinearMatmul`.
 * :class:`BilinearMatmulAlphaBetaCanonizer` — Bach 2015 generalised to
   bilinear (RESEARCH_NOTES.md Entry 6) on :class:`BilinearMatmul`.
 * :class:`SoftmaxIdentityCanonizer` — AttnLRP Eq. 9 identity rule on
@@ -64,7 +68,7 @@ LRP-rule canonizers (one per rule, registered at attribution time):
 The autograd ``Function`` kernels (``_AlphaBetaMatmulFn``,
 ``_SoftmaxIdentityRuleFn``, ``_ScaleIdentityRuleFn``) live near the
 canonizers that use them. Kernels reused from
-:mod:`crp.transformer_patches` (``_MatmulFactor2Fn``, ``_DivideGradientFn``,
+:mod:`crp.transformer_patches` (``_DivideGradientFn``,
 ``_ResidualRatioFn``) are imported on demand by the canonizers.
 """
 from __future__ import annotations
@@ -85,11 +89,10 @@ from zennit.canonizers import AttributeCanonizer, Canonizer
 class BilinearMatmul(nn.Module):
     """``y = a @ b``. Vanilla bilinear matmul; autograd's standard backward.
 
-    Used inside :class:`EvaAttentionUnfolded` for ``q @ kᵀ`` and
-    ``weights @ v``, and inside classification heads that want these
-    matmuls exposed as named submodules. To enable an AttnLRP rule on
-    backward at attribution time, register
-    :class:`BilinearMatmulFactor2Canonizer` or
+    Used inside :class:`EvaAttentionUnfolded` and :class:`TimmAttentionUnfolded`
+    for ``q @ kᵀ`` and ``weights @ v``, and inside classification heads
+    that want these matmuls exposed as named submodules. To enable the
+    AttnLRP AlphaBeta rule on backward at attribution time, register
     :class:`BilinearMatmulAlphaBetaCanonizer` via the composite.
     """
 
@@ -542,6 +545,226 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         )
 
 
+# ─── 3b. Timm-standard unfolded attention + substitution canonizer ──────────
+
+
+class TimmAttentionUnfolded(nn.Module):
+    """Unfolded ``timm.models.vision_transformer.Attention`` analogue.
+
+    Same role as :class:`EvaAttentionUnfolded` but for the standard timm
+    ViT attention (no RoPE, no LayerScale, ``num_prefix_tokens=1``: cls
+    only). Constructor takes a real ``Attention`` instance, references
+    its parameter-bearing submodules (``qkv``, ``q_norm``, ``k_norm``,
+    ``proj``, ``attn_drop``, ``proj_drop``, optional ``norm``) by
+    attribute, and exposes hookable atomic ops so the AttnLRP composite
+    can canonize them and the concept classes can target ``q_id`` /
+    ``k_id`` / ``v_id`` / ``context`` / ``proj_drop``.
+
+    Forward signature: ``(x, attn_mask=None, is_causal=False)`` — matches
+    the stock timm `Attention.forward` exactly. Numerical output is
+    bit-identical to stock when the source instance has
+    ``fused_attn=False`` (the explicit-math path); when ``fused_attn=True``
+    on the source, stock uses ``F.scaled_dot_product_attention`` which
+    can differ at fp32 noise level, but the substituted unfolded
+    instance takes the explicit path either way.
+
+    Parameters
+    ----------
+    orig : timm.models.vision_transformer.Attention
+        Source module to wrap.
+    """
+
+    def __init__(self, orig) -> None:
+        super().__init__()
+        if not (
+            hasattr(orig, "qkv")
+            and isinstance(orig.qkv, nn.Linear)
+            and hasattr(orig, "num_heads")
+            and hasattr(orig, "proj")
+        ):
+            raise TypeError(
+                "TimmAttentionUnfolded expects a timm vision_transformer.Attention-like instance"
+            )
+
+        # Cache shape constants from the original module.
+        self.num_heads = int(orig.num_heads)
+        # Stock timm sets head_dim. Older variants compute it from dim/num_heads.
+        if hasattr(orig, "head_dim"):
+            self.head_dim = int(orig.head_dim)
+        else:
+            self.head_dim = int(orig.qkv.weight.shape[0] // 3 // self.num_heads)
+        # Standard timm ViT has 1 cls token, no register tokens.
+        self.num_prefix_tokens = 1
+        # Scale: stock timm sets self.scale = head_dim ** -0.5
+        self.scale = float(getattr(orig, "scale", self.head_dim ** -0.5))
+
+        # Reference (do not copy) the parameter-bearing / stateful submodules.
+        self.qkv = orig.qkv
+        # q_norm / k_norm may be nn.LayerNorm or nn.Identity depending on
+        # the qk_norm flag at construction time.
+        self.q_norm = getattr(orig, "q_norm", nn.Identity())
+        self.k_norm = getattr(orig, "k_norm", nn.Identity())
+        self.attn_drop = orig.attn_drop
+        # Newer timm variants add a post-attention norm; older variants don't.
+        self.norm = getattr(orig, "norm", nn.Identity())
+        self.proj = orig.proj
+        self.proj_drop = orig.proj_drop
+
+        # Atomic vanilla submodules. LRP rules are layered in by the
+        # per-module canonizers at composite-context-entry time.
+        self.split = ChunkAlongLastDim(3)
+        self.scale_q = ScaleByConstant(self.scale)
+        self.qk_scores = BilinearMatmul()
+        self.add_mask = AddBias()
+        self.softmax = SoftmaxAlongLastDim()
+        self.context = BilinearMatmul()
+        self.reshape = ReshapeMergeHeads()
+        # Identity hook points for Q / K / V concepts. q_id is placed
+        # AFTER q_norm so the recorded tensor reflects all per-tensor
+        # transformations the concept "should see"; symmetric for k_id.
+        # v_id has no norm in stock timm, so it sits right after the
+        # per-head reshape (same as in EvaAttentionUnfolded).
+        self.q_id = nn.Identity()
+        self.k_id = nn.Identity()
+        self.v_id = nn.Identity()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        B, N, C = x.shape
+
+        qkv_flat = self.qkv(x)
+        q_flat, k_flat, v_flat = self.split(qkv_flat)
+
+        def _to_heads(t: torch.Tensor) -> torch.Tensor:
+            return t.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = _to_heads(q_flat)
+        k = _to_heads(k_flat)
+        v = _to_heads(v_flat)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q = self.q_id(q)
+        k = self.k_id(k)
+        v = self.v_id(v)
+
+        q = self.scale_q(q)
+        scores = self.qk_scores(q, k.transpose(-2, -1))
+        scores = self._resolve_and_add_mask(scores, attn_mask, is_causal, N)
+
+        weights = self.softmax(scores)
+        weights = self.attn_drop(weights)
+
+        ctx = self.context(weights, v)
+        out = self.reshape(ctx)
+        out = self.norm(out)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+    def _resolve_and_add_mask(self, scores, attn_mask, is_causal, N):
+        # Standard timm Attention's explicit-math path does
+        #   if attn_mask is not None: attn = attn + attn_mask
+        # and ignores is_causal on this path (it only applies to the
+        # F.scaled_dot_product_attention dispatch). We still honour
+        # is_causal=True by building a triangular mask for consistency
+        # with the Eva unfolded variant.
+        attn_bias = attn_mask
+        if is_causal:
+            causal = torch.triu(
+                torch.full(
+                    (N, N), float("-inf"), device=scores.device, dtype=scores.dtype,
+                ),
+                diagonal=1,
+            )
+            attn_bias = causal if attn_bias is None else attn_bias + causal
+        return self.add_mask(scores, attn_bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_heads={self.num_heads}, head_dim={self.head_dim}, "
+            f"num_prefix_tokens={self.num_prefix_tokens}, scale={self.scale}"
+        )
+
+
+class TimmAttentionSubstitutionCanonizer(Canonizer):
+    """Replace standard timm ``Attention`` instances with :class:`TimmAttentionUnfolded`.
+
+    Mirror of :class:`EvaAttentionSubstitutionCanonizer` for the
+    standard timm `vision_transformer.Attention` class. Both canonizers
+    are typically bundled into the same composite — each one's
+    ``isinstance`` filter skips the other's target so there's no
+    coupling.
+
+    Parameters
+    ----------
+    block_indices : tuple[int, ...] | None
+        Indices of blocks to substitute. ``None`` (default) means
+        substitute all attention blocks.
+    """
+
+    def __init__(
+        self,
+        *,
+        block_indices: Optional[Sequence[int]] = None,
+    ):
+        self.block_indices = (
+            None if block_indices is None else tuple(int(i) for i in block_indices)
+        )
+
+        # State filled by ``register``.
+        self.parent: Optional[nn.Module] = None
+        self.attr_name: Optional[str] = None
+        self.original_module: Optional[nn.Module] = None
+        self.unfolded_module: Optional[TimmAttentionUnfolded] = None
+
+    def apply(self, root_module: nn.Module) -> List["TimmAttentionSubstitutionCanonizer"]:
+        try:
+            from timm.models.vision_transformer import Attention as TimmAttention
+        except ImportError:
+            return []
+
+        instances: List[TimmAttentionSubstitutionCanonizer] = []
+        for parent_name, parent in root_module.named_modules():
+            for attr_name, child in parent.named_children():
+                if not isinstance(child, TimmAttention):
+                    continue
+                if self.block_indices is not None:
+                    block_idx = _extract_block_index(parent_name)
+                    if block_idx is None or block_idx not in self.block_indices:
+                        continue
+                inst = self.copy()
+                inst.register(parent, attr_name, child)
+                instances.append(inst)
+        return instances
+
+    def register(
+        self,
+        parent: nn.Module,
+        attr_name: str,
+        original: nn.Module,
+    ) -> None:
+        self.parent = parent
+        self.attr_name = attr_name
+        self.original_module = original
+        unfolded = TimmAttentionUnfolded(original)
+        setattr(parent, attr_name, unfolded)
+        self.unfolded_module = unfolded
+
+    def remove(self) -> None:
+        if self.parent is None or self.attr_name is None or self.original_module is None:
+            return
+        setattr(self.parent, self.attr_name, self.original_module)
+        self.unfolded_module = None
+
+    def copy(self) -> "TimmAttentionSubstitutionCanonizer":
+        return type(self)(block_indices=self.block_indices)
+
+
 def _extract_block_index(parent_name: str) -> Optional[int]:
     """Return ``i`` if ``parent_name`` ends in ``...blocks.i`` else None."""
     parts = parent_name.split(".")
@@ -675,41 +898,6 @@ class _AlphaBetaMatmulFn(Function):
 # ``remove()`` the original ``forward`` is restored. Forward output is
 # numerically identical to vanilla in every case (Functions do
 # ``a @ b`` / ``F.softmax`` / ``x * scalar`` etc. — only backward differs).
-
-
-class BilinearMatmulFactor2Canonizer(AttributeCanonizer):
-    """Apply AttnLRP Prop. 3.3 ``2y+ε`` rule to :class:`BilinearMatmul`.
-
-    Achtibat et al. 2024, arXiv:2402.05602. Conservation:
-    ``sum(R_a) + sum(R_b) ≈ sum(R_y)``.
-
-    Parameters
-    ----------
-    epsilon : float
-        ε for the ``2y+ε`` denominator. Default ``1e-6``.
-    signed : bool
-        Sign-aware ε (AttnLRP Eq. 16). Default False.
-    """
-
-    def __init__(self, *, epsilon: float = 1e-6, signed: bool = False):
-        self.epsilon = epsilon
-        self.signed = signed
-        super().__init__(self._attribute_map)
-
-    def _attribute_map(self, _name, module):
-        if not isinstance(module, BilinearMatmul):
-            return None
-        from crp.transformer_patches import _MatmulFactor2Fn
-        eps = self.epsilon
-        signed = self.signed
-
-        def patched(self, a, b):
-            return _MatmulFactor2Fn.apply(a, b, eps, signed)
-
-        return _bind_forward(module, patched)
-
-    def copy(self):
-        return type(self)(epsilon=self.epsilon, signed=self.signed)
 
 
 class BilinearMatmulAlphaBetaCanonizer(AttributeCanonizer):
@@ -876,11 +1064,12 @@ __all__ = [
     "ChunkAlongLastDim",
     "ReshapeMergeHeads",
     "LayerScaleMul",
-    # Container + substitution canonizer
+    # Containers + substitution canonizers
     "EvaAttentionUnfolded",
     "EvaAttentionSubstitutionCanonizer",
+    "TimmAttentionUnfolded",
+    "TimmAttentionSubstitutionCanonizer",
     # Per-rule canonizers
-    "BilinearMatmulFactor2Canonizer",
     "BilinearMatmulAlphaBetaCanonizer",
     "SoftmaxIdentityCanonizer",
     "ScaleByConstantIdentityCanonizer",

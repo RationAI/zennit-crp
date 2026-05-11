@@ -4,18 +4,18 @@ The module exposes the building blocks of AttnLRP (Achtibat et al., ICML 2024,
 arXiv:2402.05602) as small, single-responsibility classes that compose:
 
 * **Rule kernels** — `_IdentityRuleFn`, `_DivideGradientFn`,
-  `_ResidualRatioFn`, `_MatmulFactor2Fn`. Each is one autograd
-  ``Function`` implementing one LRP backward semantic. Inlined into the
-  forward pass via canonizer-installed forward methods.
+  `_ResidualRatioFn`. Each is one autograd ``Function`` implementing one
+  LRP backward semantic. Inlined into the forward pass via canonizer-
+  installed forward methods.
 
 * **Canonizers** — one class per *kind of model graph mutation*:
-  :class:`AttentionTapsCanonizer`, :class:`LayerNormForwardCanonizer`,
-  :class:`GELUIdentityRuleCanonizer`, :class:`DropoutPassthroughCanonizer`,
-  :class:`TimmAttentionForwardCanonizer`,
-  :class:`EvaAttentionForwardCanonizer`,
+  :class:`LayerNormForwardCanonizer`, :class:`GELUIdentityRuleCanonizer`,
+  :class:`DropoutPassthroughCanonizer`,
   :class:`TimmBlockResidualCanonizer`, :class:`EvaBlockResidualCanonizer`,
-  :class:`VitPosEmbedPALRPCanonizer`. Each touches one module type and
-  reverts on ``composite.context()`` exit.
+  :class:`VitPosEmbedPALRPCanonizer`. Attention modules (timm + Eva) are
+  substituted with unfolded variants by canonizers in
+  :mod:`crp.attention_unfolded`. Each touches one module type and reverts
+  on ``composite.context()`` exit.
   The aggregator :class:`TimmViTCanonizer` bundles them into one
   config-driven object.
 
@@ -134,9 +134,9 @@ class _DivideGradientFn(Function):
     ``factor``.
 
     Used after bilinear ops (matmul, ⊙) to allocate relevance equally among
-    operands. ``factor=2`` per bilinear; in attention without
-    :class:`_MatmulFactor2Fn`, Q×4, K×4 (each enters two bilinears via
-    softmax(QKᵀ)) and V×2 (one bilinear via attn·V).
+    operands. ``factor=2`` per bilinear. (Historically also used to split
+    Q/K/V evenly in the in-place timm attention forward; that path is
+    superseded by the unfolded substitution + AlphaBeta bilinear rule.)
     """
 
     @staticmethod
@@ -172,60 +172,6 @@ class _ResidualRatioFn(Function):
         return grad_output * (abs_x / denom), grad_output * (abs_b / denom), None
 
 
-class _MatmulFactor2Fn(Function):
-    """AttnLRP bilinear matmul rule (Achtibat et al. 2024, Prop. 3.3,
-    Eq. 14, arXiv:2402.05602).
-
-    For ``Y = A @ B`` the rule returns relevance attributed to each
-    operand in **pure R form** (no further stabilisation needed
-    upstream)::
-
-        scaled = R_Y / (2 · Y + ε[·sign(Y)])
-        R_A    = A · (scaled @ B^T)
-        R_B    = B · (A^T @ scaled)
-
-    Conservation: ``sum(R_A) + sum(R_B) ≈ sum(R_Y)`` (the ``2·Y``
-    denominator splits each upstream relevance evenly across the two
-    bilinear chains).
-
-    The ``A ·`` / ``B ·`` operand multiplication is **mandatory** for
-    the chain to compose correctly: the upstream of these matmul
-    operands is softmax (Pass) or a non-Linear chain that does not own
-    an operand-multiplication step. Including it here makes the rule
-    self-contained — the result is the bilinear's R contribution to
-    each operand, ready to flow back through the rest of the LRP graph.
-
-    Earlier (buggy) version returned only ``scaled @ B^T`` etc. without
-    operand multiplication, which the diagnostic showed over-divides
-    on the broken downstream chain (no Linear hook upstream of softmax
-    to re-introduce the operand factor).
-
-    When this rule is used, drop the operand-side
-    ``_DivideGradientFn`` factor-2/4 calls — this rule's ``2·Y``
-    denominator already enforces the conservation factor.
-    """
-
-    @staticmethod
-    def forward(ctx, a, b, epsilon=1e-6, signed=False):
-        out = a @ b
-        ctx.save_for_backward(a, b, out)
-        ctx.epsilon = epsilon
-        ctx.signed = signed
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        a, b, out = ctx.saved_tensors
-        if ctx.signed:
-            denom = _signed_eps_add(2 * out, ctx.epsilon)
-        else:
-            denom = 2 * out + ctx.epsilon
-        scaled = grad_out / denom
-        grad_a = a * (scaled @ b.transpose(-1, -2))
-        grad_b = b * (a.transpose(-1, -2) @ scaled)
-        return grad_a, grad_b, None, None
-
-
 # Convenience callables (used inside the forward replacements below).
 
 
@@ -249,11 +195,6 @@ def residual_ratio(x, branch, epsilon: float = 1e-6):
     distributes upstream relevance ∝ ``|x|`` vs ``|branch|`` (Otsuki).
     """
     return _ResidualRatioFn.apply(x, branch, epsilon)
-
-
-def matmul_factor_2(a, b, *, epsilon: float = 1e-6, signed: bool = False):
-    """Apply :class:`_MatmulFactor2Fn` to ``a @ b`` (AttnLRP Prop. 3.3)."""
-    return _MatmulFactor2Fn.apply(a, b, epsilon, signed)
 
 
 # ─── 3. Forward-method replacements (installed per-instance by Canonizers) ──
@@ -288,84 +229,11 @@ def dropout_passthrough_forward(self, x):
 # ``RESEARCH_NOTES.md`` Entries 4-6.
 
 
-def _timm_attention_forward(
-    self, x, attn_mask=None, is_causal=False,
-    *, matmul_factor_2_rule: bool = False, epsilon: float = 1e-6,
-):
-    """timm ``Attention.forward`` replacement for AttnLRP on standard timm
-    ViTs (vit_base, vit_small, etc.).
-
-    Tracks the upstream timm signature ``(self, x, attn_mask=None,
-    is_causal=False)`` so it remains a drop-in across timm ≥ 1.0.
-
-    Differences from the upstream forward:
-
-    * Q, K, V each pass through :func:`divide_gradient` (factors 4, 4, 2) —
-      AttnLRP uniform rule on the ``QKᵀ`` and ``attn·V`` bilinears
-      (Eq. 14–15 of arXiv:2402.05602). Skipped when
-      ``matmul_factor_2_rule`` is enabled (the rule's ``2y+ε`` denominator
-      handles the bilinear conservation directly).
-    * Bypasses the fused ``F.scaled_dot_product_attention`` path so the
-      autograd graph contains the explicit softmax + matmul ops where the
-      rules apply.
-
-    Concept-conditioning on standard timm ViTs is not supported by this
-    forward — the unfolded path (``EvaAttentionUnfolded`` +
-    substitution canonizer) is the supported route for concept work.
-    Use this forward when running plain attribution on a standard timm
-    ViT without per-head conditioning.
-    """
-    B, N, _ = x.shape
-    qkv_flat = self.qkv(x)
-    qkv = qkv_flat.reshape(B, N, 3, self.num_heads, self.head_dim).permute(
-        2, 0, 3, 1, 4
-    )
-    q, k, v = qkv.unbind(0)
-    q, k = self.q_norm(q), self.k_norm(k)
-
-    if not matmul_factor_2_rule:
-        q = divide_gradient(q, 4)
-        k = divide_gradient(k, 4)
-        v = divide_gradient(v, 2)
-
-    q = q * self.scale
-    if matmul_factor_2_rule:
-        attn = matmul_factor_2(q, k.transpose(-2, -1), epsilon=epsilon)
-    else:
-        attn = q @ k.transpose(-2, -1)
-
-    try:
-        from timm.models.vision_transformer import (
-            resolve_self_attn_mask, maybe_add_mask,
-        )
-        attn_bias = resolve_self_attn_mask(N, attn, attn_mask, is_causal)
-        attn = maybe_add_mask(attn, attn_bias)
-    except ImportError:
-        if attn_mask is not None:
-            attn = attn + attn_mask
-        if is_causal:
-            mask = torch.triu(
-                torch.full(
-                    (N, N), float("-inf"), device=attn.device, dtype=attn.dtype
-                ),
-                diagonal=1,
-            )
-            attn = attn + mask
-
-    attn = attn.softmax(dim=-1)
-    attn = self.attn_drop(attn)
-    if matmul_factor_2_rule:
-        x = matmul_factor_2(attn, v, epsilon=epsilon)
-    else:
-        x = attn @ v
-
-    out_dim = getattr(self, "attn_dim", self.num_heads * self.head_dim)
-    x = x.transpose(1, 2).reshape(B, N, out_dim)
-    if hasattr(self, "norm"):
-        x = self.norm(x)
-    x = self.proj(x)
-    x = self.proj_drop(x)
-    return x
+# NOTE: ``_timm_attention_forward`` was removed in the always-unfold cleanup.
+# Standard timm ``Attention`` is now substituted with
+# :class:`crp.attention_unfolded.TimmAttentionUnfolded` (analogous to the
+# Eva path). Both attention paths are unified under the unfolded form,
+# so concept attribution works on every supported backbone.
 
 
 def _apply_layerscale(scale, branch, *, layerscale_uniform: bool):
@@ -588,55 +456,14 @@ class DropoutPassthroughCanonizer(AttributeCanonizer):
         return type(self)()
 
 
-class TimmAttentionForwardCanonizer(AttributeCanonizer):
-    """Canonizer that swaps ``forward`` on timm ``vision_transformer.Attention``
-    for the AttnLRP-compatible :func:`_timm_attention_forward`.
-
-    Parameters
-    ----------
-    matmul_factor_2_rule : bool
-        When True, use :class:`_MatmulFactor2Fn` on the ``QKᵀ`` and
-        ``attn·V`` bilinears (AttnLRP Prop. 3.3) and skip the
-        operand-side ``divide_gradient(q,4)/(k,4)/(v,2)`` calls.
-    epsilon : float
-        ε magnitude when ``matmul_factor_2_rule`` is enabled.
-    """
-
-    def __init__(
-        self, *, matmul_factor_2_rule: bool = False, epsilon: float = 1e-6,
-    ):
-        self.matmul_factor_2_rule = matmul_factor_2_rule
-        self.epsilon = epsilon
-        super().__init__(self._attribute_map)
-
-    def _attribute_map(self, _name, module):
-        try:
-            from timm.models.vision_transformer import Attention as TimmAttention
-        except ImportError:
-            return None
-        if not isinstance(module, TimmAttention):
-            return None
-        m2 = self.matmul_factor_2_rule
-        eps = self.epsilon
-
-        def fwd(self, x, attn_mask=None, is_causal=False):
-            return _timm_attention_forward(
-                self, x, attn_mask=attn_mask, is_causal=is_causal,
-                matmul_factor_2_rule=m2, epsilon=eps,
-            )
-
-        return _bind_forward(module, fwd)
-
-    def copy(self):
-        return type(self)(
-            matmul_factor_2_rule=self.matmul_factor_2_rule,
-            epsilon=self.epsilon,
-        )
-
-
-# NOTE: ``EvaAttentionForwardCanonizer`` was removed in the unfolding
-# refactor. Eva attention is now handled by
-# :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`.
+# NOTE: ``TimmAttentionForwardCanonizer`` and ``EvaAttentionForwardCanonizer``
+# were removed in the always-unfold cleanup. All attention (standard timm
+# AND Eva) is now substituted with unfolded variants
+# (:class:`crp.attention_unfolded.TimmAttentionUnfolded`,
+# :class:`crp.attention_unfolded.EvaAttentionUnfolded`) by their respective
+# substitution canonizers. AttnLRP rules apply uniformly to both via the
+# per-rule canonizers (:class:`BilinearMatmulAlphaBetaCanonizer`,
+# :class:`SoftmaxIdentityCanonizer`, :class:`ScaleByConstantIdentityCanonizer`).
 
 
 class TimmBlockResidualCanonizer(AttributeCanonizer):
@@ -772,21 +599,17 @@ class TimmViTCanonizer(CompositeCanonizer):
     * :class:`LayerNormForwardCanonizer` — LayerNorm with stop-gradient(std).
     * :class:`GELUIdentityRuleCanonizer` — AttnLRP identity rule on GELU.
     * :class:`DropoutPassthroughCanonizer` — disable Dropout for backward.
-    * :class:`TimmAttentionForwardCanonizer` — standard timm Attention
-      forward replacement (vit_base / vit_small / vit_tiny).
     * :class:`VitPosEmbedPALRPCanonizer` (when ``palrp=True``) — PA-LRP on
       the ``x + pos_embed`` step (Bakish et al. 2025).
     * :class:`TimmBlockResidualCanonizer` and
       :class:`EvaBlockResidualCanonizer` (when ``residual_lrp`` is set) —
       ratio or symmetric residual rule.
 
-    Eva attention itself (the bilinear path inside ``EvaAttention``) is NOT
-    handled here. Use
-    :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`
-    alongside this aggregator to substitute Eva attention modules with the
-    unfolded variant. The composites below
-    (:class:`AttnLRPCombinedComposite` etc.) install the substitution
-    canonizer automatically when needed.
+    Attention itself is NOT handled here. It is substituted to its
+    unfolded form (:class:`TimmAttentionUnfolded` /
+    :class:`EvaAttentionUnfolded`) by their respective substitution
+    canonizers, applied automatically by
+    :class:`AttnLRPCombinedComposite`.
 
     All mutations are instance-level and reversible (revert on
     ``composite.context()`` exit).
@@ -801,11 +624,6 @@ class TimmViTCanonizer(CompositeCanonizer):
         Block-level residual rule. ``'ratio'`` is the recommended
         default for transformers; ``'symmetric'`` matches the ResNet
         AttnLRP paper baseline.
-    matmul_factor_2_rule : bool
-        Pass-through to the standard-timm attention forward (turns on
-        the AttnLRP Prop 3.3 ``2y+ε`` denominator on the QKᵀ and attn·V
-        bilinears). Eva attention's bilinear rule is set on the
-        substitution canonizer instead.
     layerscale_uniform : bool
         Apply the uniform allocation rule to LayerScale γ
         multiplications (CaiT / Eva blocks only).
@@ -818,7 +636,6 @@ class TimmViTCanonizer(CompositeCanonizer):
         *,
         palrp: bool = False,
         residual_lrp: Optional[str] = None,
-        matmul_factor_2_rule: bool = False,
         layerscale_uniform: bool = False,
         epsilon: float = 1e-6,
     ):
@@ -826,10 +643,6 @@ class TimmViTCanonizer(CompositeCanonizer):
             LayerNormForwardCanonizer(),
             GELUIdentityRuleCanonizer(epsilon=epsilon),
             DropoutPassthroughCanonizer(),
-            TimmAttentionForwardCanonizer(
-                matmul_factor_2_rule=matmul_factor_2_rule,
-                epsilon=epsilon,
-            ),
         ]
         if palrp:
             canonizers.append(VitPosEmbedPALRPCanonizer())
@@ -958,39 +771,25 @@ class AttnLRPGammaComposite(LayerMapComposite):
 class AttnLRPCombinedComposite(LayerMapComposite):
     """Combination composite — the canonical recipe-builder for AttnLRP.
 
-    Combines individually-validated rules into one composite. The choice
-    of which rules to enable is the user's, made via constructor flags.
-    For Eva-stack models (DINOv3 etc.), the unfolded attention path is
-    installed automatically when ``use_unfolded_attention`` is True
-    (the default), giving access to the AlphaBeta-on-bilinear rule.
+    Always substitutes the model's attention blocks with their unfolded
+    forms (both Eva and standard timm Attention are covered — the
+    substitution canonizers each filter on their own target class). The
+    AlphaBeta-on-bilinear rule is applied unconditionally on the
+    unfolded ``BilinearMatmul`` modules; ``SoftmaxAlongLastDim`` gets
+    the AttnLRP identity rule; ``ScaleByConstant`` gets the
+    graph-constant identity rule.
 
     Parameters
     ----------
-    matmul_factor_2 : bool
-        Enable :class:`_MatmulFactor2Fn` (AttnLRP Prop 3.3 ``2y+ε``
-        bilinear rule). When ``use_unfolded_attention`` is True, this
-        applies to the unfolded ``BilinearMatmul`` modules; otherwise to
-        the in-place ``_timm_attention_forward`` for standard timm ViTs.
-    use_unfolded_attention : bool
-        Install :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`
-        to substitute Eva attention modules with the unfolded variant.
-        Required for AlphaBeta-on-bilinear, concept conditioning, and the
-        per-rule conservation probes. Default True. Set False to fall
-        back to the legacy in-place forward (no concept support).
     alpha, beta : float
         AlphaBeta-on-bilinear hyperparameters (Bach 2015 generalised to
-        bilinear; see ``RESEARCH_NOTES.md`` Entry 6). Used only when
-        ``use_unfolded_attention`` is True. ``α + β = 1`` for exact
-        conservation. Common choices:
+        bilinear; see ``RESEARCH_NOTES.md`` Entry 6). ``α + β = 1`` for
+        exact conservation. Common choices:
 
-        * ``α=0.5, β=0.5`` — balanced; tightest magnitude control.
+        * ``α=0.5, β=0.5`` — balanced; tightest magnitude control (default).
         * ``α=1, β=0`` — z+ rule (positive only); slightly looser.
         * ``α=2, β=-1`` — Bach's classical "alpha2beta1"; amplifies
           positive evidence, suppresses negative.
-
-        When the matmul rule is set to AlphaBeta (the default for
-        unfolded), these select the variant. Defaults below match the
-        recommended ``α=0.5, β=0.5``.
     layerscale_uniform : bool
         Uniform allocation rule on the LayerScale γ multiplication
         (CaiT / Eva blocks).
@@ -1009,8 +808,6 @@ class AttnLRPCombinedComposite(LayerMapComposite):
 
     def __init__(
         self, *,
-        matmul_factor_2: bool = False,
-        use_unfolded_attention: bool = True,
         alpha: float = 0.5,
         beta: float = 0.5,
         layerscale_uniform: bool = False,
@@ -1022,45 +819,35 @@ class AttnLRPCombinedComposite(LayerMapComposite):
     ):
         if layerscale_uniform and residual_lrp is None:
             residual_lrp = "ratio"
+        # Lazy import to avoid the cycle:
+        # transformer_patches → attention_unfolded → transformer_patches.
+        from crp.attention_unfolded import (
+            EvaAttentionSubstitutionCanonizer,
+            TimmAttentionSubstitutionCanonizer,
+            BilinearMatmulAlphaBetaCanonizer,
+            SoftmaxIdentityCanonizer,
+            ScaleByConstantIdentityCanonizer,
+        )
         canonizers = list(canonizers or []) + [
             TimmViTCanonizer(
                 palrp=palrp, residual_lrp=residual_lrp,
-                # The standard-timm forward path uses matmul_factor_2 only
-                # via this flag — Eva forward (when unfolded) is set below.
-                matmul_factor_2_rule=matmul_factor_2 and not use_unfolded_attention,
                 layerscale_uniform=layerscale_uniform,
                 epsilon=epsilon,
             ),
-        ]
-        if use_unfolded_attention:
-            # Lazy import to avoid the cycle:
-            # transformer_patches → attention_unfolded → transformer_patches.
-            from crp.attention_unfolded import (
-                EvaAttentionSubstitutionCanonizer,
-                BilinearMatmulFactor2Canonizer,
-                BilinearMatmulAlphaBetaCanonizer,
-                SoftmaxIdentityCanonizer,
-                ScaleByConstantIdentityCanonizer,
-            )
-            # 1) Substitute Eva attention with the unfolded variant. The
-            #    substitution canonizer is LRP-rule-agnostic — it just
-            #    swaps in vanilla atomic submodules so other canonizers
-            #    can bind LRP rules to them.
-            canonizers.append(EvaAttentionSubstitutionCanonizer(block_indices=None))
-            # 2) Bilinear rule on q@kᵀ and weights@v. AlphaBeta when
-            #    the user asked for ``matmul_factor_2`` (the new default
-            #    winning bilinear rule, parameterised by α/β); otherwise
-            #    the AttnLRP Prop. 3.3 ``2y+ε`` rule.
-            if matmul_factor_2:
-                canonizers.append(BilinearMatmulAlphaBetaCanonizer(
-                    alpha=alpha, beta=beta, epsilon=epsilon,
-                ))
-            else:
-                canonizers.append(BilinearMatmulFactor2Canonizer(epsilon=epsilon))
+            # 1) Substitute attention to its unfolded form. Both
+            #    canonizers are always registered — each one's isinstance
+            #    filter no-ops on the other's target class.
+            EvaAttentionSubstitutionCanonizer(block_indices=None),
+            TimmAttentionSubstitutionCanonizer(block_indices=None),
+            # 2) AlphaBeta bilinear rule on q@kᵀ and weights@v.
+            BilinearMatmulAlphaBetaCanonizer(
+                alpha=alpha, beta=beta, epsilon=epsilon,
+            ),
             # 3) Identity rule on softmax (AttnLRP Eq. 9) and on
             #    scale-by-constant (graph constants absorb no relevance).
-            canonizers.append(SoftmaxIdentityCanonizer())
-            canonizers.append(ScaleByConstantIdentityCanonizer())
+            SoftmaxIdentityCanonizer(),
+            ScaleByConstantIdentityCanonizer(),
+        ]
         if linear_gamma is not None:
             layer_map = _gamma_layer_map(linear_gamma, epsilon)
         else:
@@ -1073,12 +860,10 @@ __all__ = [
     "_IdentityRuleFn",
     "_DivideGradientFn",
     "_ResidualRatioFn",
-    "_MatmulFactor2Fn",
     # rule convenience callables
     "identity_rule_implicit",
     "divide_gradient",
     "residual_ratio",
-    "matmul_factor_2",
     "stop_gradient",
     # forward replacements (advanced; canonizers install them automatically)
     "layer_norm_forward",
@@ -1088,7 +873,6 @@ __all__ = [
     "LayerNormForwardCanonizer",
     "GELUIdentityRuleCanonizer",
     "DropoutPassthroughCanonizer",
-    "TimmAttentionForwardCanonizer",
     "TimmBlockResidualCanonizer",
     "EvaBlockResidualCanonizer",
     "VitPosEmbedPALRPCanonizer",

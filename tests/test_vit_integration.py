@@ -4,13 +4,13 @@ Covers:
 
 * Standard timm ViT path (vit_tiny) under
   :class:`AttnLRPEpsilonComposite`, :class:`AttnLRPGammaComposite`,
-  :class:`AttnLRPCombinedComposite` (with `use_unfolded_attention=False`
-  since standard timm has no unfolded variant).
+  :class:`AttnLRPCombinedComposite` — attention is always unfolded
+  (:class:`TimmAttentionUnfolded` swaps in via the substitution
+  canonizer).
 * Eva-stack path (untrained, fast) under
-  :class:`AttnLRPCombinedComposite(use_unfolded_attention=True)` —
-  substitutes EvaAttention with EvaAttentionUnfolded and runs concept-
-  conditioned attribution via :class:`HeadConcept`,
-  :class:`QConcept`, :class:`AttnOutputDimConcept`.
+  :class:`AttnLRPCombinedComposite` — substitutes EvaAttention with
+  EvaAttentionUnfolded and runs concept-conditioned attribution via
+  :class:`HeadConcept`, :class:`QConcept`, :class:`AttnOutputDimConcept`.
 
 Run::
 
@@ -101,22 +101,24 @@ def img_batch():
 
 class TestTimmViTCanonizer:
     def test_forward_swap_is_reversible(self, vit_tiny):
-        """The canonizer installs parameter-bound forward closures on
-        Attention / Block / LayerNorm / GELU / Dropout. After context
-        exit, all original forwards must be restored."""
-        attn = vit_tiny.blocks[0].attn
-        original_class_forward = type(attn).forward
-        assert "forward" not in attn.__dict__, "test pre-condition: clean state"
+        """TimmViTCanonizer installs forward closures on LayerNorm /
+        GELU / Dropout (attention is now handled by the separate
+        substitution canonizer). After context exit, the original
+        forwards must be restored.
+        """
+        ln = vit_tiny.blocks[0].norm1
+        original_class_forward = type(ln).forward
+        assert "forward" not in ln.__dict__, "test pre-condition: clean state"
         canonizer = TimmViTCanonizer()
         instances = canonizer.apply(vit_tiny)
         try:
-            assert "forward" in attn.__dict__, "canonizer did not swap forward"
-            assert attn.forward.__func__ is not original_class_forward
+            assert "forward" in ln.__dict__, "canonizer did not swap LayerNorm forward"
+            assert ln.forward.__func__ is not original_class_forward
         finally:
             for inst in instances:
                 inst.remove()
-        assert "forward" not in attn.__dict__
-        assert type(attn).forward is original_class_forward
+        assert "forward" not in ln.__dict__
+        assert type(ln).forward is original_class_forward
 
 
 # ── Standard timm path: composites instantiate + run ────────────────────────
@@ -143,13 +145,12 @@ def test_gamma_composite_attribution_end_to_end(vit_tiny, img_batch):
     assert res.heatmap.shape == (1, 224, 224)
 
 
-def test_combined_composite_no_unfolded_runs_on_standard_timm(vit_tiny, img_batch):
-    """Combined composite with use_unfolded_attention=False should attribute
-    standard timm ViTs without crashing (substitution canonizer is no-op,
-    timm forward replacement does the work)."""
+def test_combined_composite_runs_on_standard_timm(vit_tiny, img_batch):
+    """Combined composite must attribute standard timm ViTs without
+    crashing — attention is substituted to TimmAttentionUnfolded; the
+    Eva substitution canonizer no-ops on stock timm Attention."""
     composite = AttnLRPCombinedComposite(
-        matmul_factor_2=True,
-        use_unfolded_attention=False,
+        alpha=0.5, beta=0.5,
         residual_lrp="ratio",
     )
     attribution = CondAttribution(vit_tiny)
@@ -171,7 +172,7 @@ def test_conservation_combined_recipe(vit_tiny):
     with torch.no_grad():
         logit_val = vit_tiny(data)[0, target].item()
     composite = AttnLRPCombinedComposite(
-        matmul_factor_2=True, use_unfolded_attention=False, residual_lrp="ratio",
+        alpha=0.5, beta=0.5, residual_lrp="ratio",
     )
     attribution = CondAttribution(vit_tiny)
     attribution(data, [{"y": [target]}], composite)
@@ -217,8 +218,6 @@ class TestEvaUnfoldedIntegration:
 
     def test_combined_composite_with_unfolded_runs_on_eva(self, eva_tiny, img224):
         composite = AttnLRPCombinedComposite(
-            matmul_factor_2=True,
-            use_unfolded_attention=True,
             alpha=0.5, beta=0.5,
             layerscale_uniform=True,
             residual_lrp="ratio",
@@ -233,7 +232,6 @@ class TestEvaUnfoldedIntegration:
 
     def test_head_concept_attribution_on_eva(self, eva_tiny, img224):
         composite = AttnLRPCombinedComposite(
-            matmul_factor_2=True, use_unfolded_attention=True,
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
         # Concept just stores a model reference; dims are read live from
@@ -254,7 +252,6 @@ class TestEvaUnfoldedIntegration:
 
     def test_q_concept_attribution_on_eva(self, eva_tiny, img224):
         composite = AttnLRPCombinedComposite(
-            matmul_factor_2=True, use_unfolded_attention=True,
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
         concept = QConcept(eva_tiny)
@@ -272,7 +269,6 @@ class TestEvaUnfoldedIntegration:
 
     def test_attn_output_concept_attribution_on_eva(self, eva_tiny, img224):
         composite = AttnLRPCombinedComposite(
-            matmul_factor_2=True, use_unfolded_attention=True,
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
         concept = AttnOutputDimConcept(eva_tiny)
@@ -297,7 +293,6 @@ class TestEvaUnfoldedIntegration:
         tokens); skip those — RegisterTokenConcept is meaningful only when
         prefix tokens exist."""
         composite = AttnLRPCombinedComposite(
-            matmul_factor_2=True, use_unfolded_attention=True,
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
         concept = RegisterTokenConcept(eva_tiny)

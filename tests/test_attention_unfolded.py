@@ -3,7 +3,7 @@
 After the LRP-cleanup refactor, every module here has a vanilla PyTorch
 forward and autograd's standard backward. LRP behaviour (custom backward
 = relevance flow) is layered in EXCLUSIVELY by per-module canonizers
-(``BilinearMatmulFactor2Canonizer`` etc.) at attribution time.
+(``BilinearMatmulAlphaBetaCanonizer`` etc.) at attribution time.
 
 So the test matrix is:
 
@@ -33,7 +33,6 @@ from crp.attention_unfolded import (
     AddBias,
     BilinearMatmul,
     BilinearMatmulAlphaBetaCanonizer,
-    BilinearMatmulFactor2Canonizer,
     ChunkAlongLastDim,
     EvaAttentionSubstitutionCanonizer,
     EvaAttentionUnfolded,
@@ -87,48 +86,12 @@ class TestBilinearMatmul:
         assert torch.allclose(a1.grad, a2.grad, atol=0)
         assert torch.allclose(b1.grad, b2.grad, atol=0)
 
-    def test_factor2_canonizer_forward_unchanged(self):
-        """Forward must remain bit-identical to vanilla under the canonizer."""
-        torch.manual_seed(2)
-        a = torch.randn(2, 3, 5, 7)
-        b = torch.randn(2, 3, 7, 4)
-        m = BilinearMatmul()
-        instances = _apply_canonizer(BilinearMatmulFactor2Canonizer(epsilon=1e-6), m)
-        try:
-            assert torch.allclose(m(a, b), a @ b, atol=0)
-        finally:
-            for inst in instances:
-                inst.remove()
-
-    def test_factor2_canonizer_conservation(self):
-        """AttnLRP Prop. 3.3 ``2y+ε`` rule:
-        ``sum(R_a) + sum(R_b) ≈ sum(R_y)``."""
-        torch.manual_seed(3)
-        a = (torch.randn(1, 4, 6) * 2.0 + 1.0).requires_grad_(True)
-        b = (torch.randn(1, 6, 5) * 2.0 + 1.0).requires_grad_(True)
-        m = BilinearMatmul()
-        instances = _apply_canonizer(BilinearMatmulFactor2Canonizer(epsilon=1e-6), m)
-        try:
-            y = m(a, b)
-            R_y = torch.randn_like(y)
-            y.backward(R_y)
-            R_a, R_b = a.grad, b.grad
-            assert torch.isclose(
-                R_a.sum() + R_b.sum(), R_y.sum(), rtol=1e-3, atol=1e-3,
-            ), (
-                f"sum(R_a)+sum(R_b)={R_a.sum().item() + R_b.sum().item():.6f} "
-                f"vs sum(R_y)={R_y.sum().item():.6f}"
-            )
-        finally:
-            for inst in instances:
-                inst.remove()
-
     def test_canonizer_remove_restores_vanilla_backward(self):
         """After ``remove()`` the module's backward must be vanilla again
         — critical so heads remain trainable after attribution sessions."""
         torch.manual_seed(4)
         m = BilinearMatmul()
-        instances = _apply_canonizer(BilinearMatmulFactor2Canonizer(), m)
+        instances = _apply_canonizer(BilinearMatmulAlphaBetaCanonizer(), m)
         for inst in instances:
             inst.remove()
         # Now retrain-style call: should match bare matmul.
@@ -497,14 +460,16 @@ class TestEvaAttentionUnfolded:
     def test_forward_unchanged_when_factor2_canonizer_applied(
         self, synthetic_eva_attention, attn_input,
     ):
-        """The matmul-factor-2 rule changes ONLY backward; forward must
+        """The AlphaBeta bilinear rule changes ONLY backward; forward must
         still bit-match the stock attention."""
         x, rope = attn_input
         attn = synthetic_eva_attention
         with torch.no_grad():
             y_orig = attn(x, rope=rope)
         unfolded = EvaAttentionUnfolded(attn)
-        instances = BilinearMatmulFactor2Canonizer(epsilon=1e-6).apply(unfolded)
+        instances = BilinearMatmulAlphaBetaCanonizer(
+            alpha=0.5, beta=0.5, epsilon=1e-6,
+        ).apply(unfolded)
         try:
             with torch.no_grad():
                 y_new = unfolded(x, rope=rope)
@@ -599,3 +564,192 @@ class TestEvaAttentionSubstitutionCanonizer:
         finally:
             for inst in instances:
                 inst.remove()
+
+
+# ─── 10. TimmAttentionUnfolded — end-to-end on synthetic random model ───────
+
+
+@pytest.fixture(scope="module")
+def synthetic_timm_attention():
+    """Construct a synthetic timm vision_transformer.Attention without
+    downloading any checkpoint — random init is sufficient for forward /
+    backward parity tests against the same instance's stock forward."""
+    pytest.importorskip("timm.models.vision_transformer")
+    from timm.models.vision_transformer import Attention as TimmAttention
+    # vit_base_patch16_224-ish (dim=768, num_heads=12, head_dim=64).
+    attn = TimmAttention(
+        dim=768, num_heads=12, qkv_bias=True,
+        qk_norm=False, attn_drop=0.0, proj_drop=0.0,
+    )
+    attn.eval()
+    # Force the explicit-math path so we can compare against the stock
+    # forward — the unfolded form takes the explicit path either way.
+    attn.fused_attn = False
+    return attn
+
+
+@pytest.fixture
+def timm_attn_input():
+    torch.manual_seed(0)
+    # vit_base_patch16_224 has 1 cls + 14*14 patches = 197 tokens, dim=768.
+    x = torch.randn(1, 197, 768)
+    return x
+
+
+class TestTimmAttentionUnfolded:
+    """Mirrors TestEvaAttentionUnfolded for the standard timm Attention path.
+
+    Note on the ``attn.fused_attn = False`` flag in the fixture: modern timm
+    Attention defaults to ``fused_attn=True`` and dispatches through
+    ``F.scaled_dot_product_attention``. We need the explicit-math path on
+    the source instance for ``torch.equal(stock(x), unfolded(x))`` parity
+    assertions. In production this is irrelevant — after substitution the
+    original instance is swapped out and never called.
+    """
+
+    def test_vanilla_forward_parity_with_stock(self, synthetic_timm_attention, timm_attn_input):
+        x = timm_attn_input
+        attn = synthetic_timm_attention
+        with torch.no_grad():
+            y_orig = attn(x)
+        from crp.attention_unfolded import TimmAttentionUnfolded
+        unfolded = TimmAttentionUnfolded(attn)
+        with torch.no_grad():
+            y_new = unfolded(x)
+        assert torch.equal(y_orig, y_new)
+
+    def test_vanilla_backward_parity_with_stock(self, synthetic_timm_attention, timm_attn_input):
+        """Critical for training: same chain-rule gradients as stock."""
+        x_orig = timm_attn_input.clone().requires_grad_(True)
+        attn = synthetic_timm_attention
+        y_orig = attn(x_orig)
+        go = torch.randn_like(y_orig)
+        y_orig.backward(go)
+        g_orig = x_orig.grad.clone()
+
+        x_new = timm_attn_input.clone().requires_grad_(True)
+        from crp.attention_unfolded import TimmAttentionUnfolded
+        unfolded = TimmAttentionUnfolded(attn)
+        y_new = unfolded(x_new)
+        y_new.backward(go)
+        g_new = x_new.grad.clone()
+
+        assert torch.allclose(g_orig, g_new, atol=1e-5, rtol=1e-4), (
+            f"max grad diff = {(g_orig - g_new).abs().max().item():.6e}"
+        )
+
+    def test_forward_unchanged_when_alpha_beta_canonizer_applied(
+        self, synthetic_timm_attention, timm_attn_input,
+    ):
+        """The AlphaBeta bilinear rule changes ONLY backward; forward must
+        still bit-match the stock attention."""
+        x = timm_attn_input
+        attn = synthetic_timm_attention
+        with torch.no_grad():
+            y_orig = attn(x)
+        from crp.attention_unfolded import TimmAttentionUnfolded
+        unfolded = TimmAttentionUnfolded(attn)
+        instances = BilinearMatmulAlphaBetaCanonizer(
+            alpha=0.5, beta=0.5, epsilon=1e-6,
+        ).apply(unfolded)
+        try:
+            with torch.no_grad():
+                y_new = unfolded(x)
+            assert torch.allclose(y_orig, y_new, atol=1e-6, rtol=1e-5)
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_exposes_concept_hook_submodules(self, synthetic_timm_attention):
+        """The unfolded form must expose the named submodules our concept
+        classes target: context (HeadConcept), q_id/k_id/v_id (Q/K/V),
+        proj_drop (AttnOutputDim / RegisterToken)."""
+        from crp.attention_unfolded import TimmAttentionUnfolded
+        unfolded = TimmAttentionUnfolded(synthetic_timm_attention)
+        for name in ("context", "q_id", "k_id", "v_id", "proj_drop", "qk_scores", "softmax"):
+            assert hasattr(unfolded, name), f"missing hookable submodule: {name}"
+
+
+# ─── 11. TimmAttentionSubstitutionCanonizer ────────────────────────────────
+
+
+class TestTimmAttentionSubstitutionCanonizer:
+    """Mirrors TestEvaAttentionSubstitutionCanonizer for the standard timm
+    Attention substitution canonizer.
+    """
+
+    def _make_model(self):
+        m = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=10)
+        m.eval()
+        for blk in m.blocks:
+            blk.attn.fused_attn = False
+        return m
+
+    def test_apply_substitutes_one_block(self):
+        m = self._make_model()
+        from timm.models.vision_transformer import Attention as TimmAttention
+        from crp.attention_unfolded import (
+            TimmAttentionSubstitutionCanonizer, TimmAttentionUnfolded,
+        )
+        can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
+        instances = can.apply(m)
+        try:
+            assert len(instances) == 1
+            assert isinstance(m.blocks[0].attn, TimmAttentionUnfolded)
+            assert isinstance(m.blocks[1].attn, TimmAttention)
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_remove_restores_original(self):
+        m = self._make_model()
+        from timm.models.vision_transformer import Attention as TimmAttention
+        from crp.attention_unfolded import TimmAttentionSubstitutionCanonizer
+        original = m.blocks[0].attn
+        can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
+        instances = can.apply(m)
+        for inst in instances:
+            inst.remove()
+        assert m.blocks[0].attn is original
+        assert isinstance(m.blocks[0].attn, TimmAttention)
+
+    def test_round_trip_forward_parity(self):
+        """apply → forward → remove → re-apply → forward: outputs match."""
+        from crp.attention_unfolded import TimmAttentionSubstitutionCanonizer
+        m = self._make_model()
+        torch.manual_seed(0)
+        img = torch.randn(1, 3, 224, 224)
+        with torch.no_grad():
+            y0 = m(img)
+
+        can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
+        instances = can.apply(m)
+        with torch.no_grad():
+            y1 = m(img)
+        for inst in instances:
+            inst.remove()
+        with torch.no_grad():
+            y2 = m(img)
+        instances2 = can.apply(m)
+        with torch.no_grad():
+            y3 = m(img)
+        for inst in instances2:
+            inst.remove()
+
+        assert torch.equal(y0, y1)
+        assert torch.equal(y0, y2)
+        assert torch.equal(y0, y3)
+
+    def test_does_not_fire_on_eva_blocks(self):
+        """Each substitution canonizer's isinstance filter must skip the
+        other backbone's attention class — so both can be bundled into
+        one composite without coupling."""
+        from crp.attention_unfolded import TimmAttentionSubstitutionCanonizer
+        m_eva = timm.create_model(
+            "vit_large_patch16_dinov3", pretrained=False, num_classes=10,
+        )
+        m_eva.eval()
+        can = TimmAttentionSubstitutionCanonizer(block_indices=None)
+        instances = can.apply(m_eva)
+        # No standard timm Attention modules → no substitutions.
+        assert len(instances) == 0
