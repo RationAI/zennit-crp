@@ -137,17 +137,24 @@ def per_concept_scores(
 
 def enumerate_ids(concept, layer_name: str) -> List:
     """List all (sample) concept ids for a given concept + layer in
-    row-major order. Used for atlas plotting and FV indexing."""
+    row-major order. Used for atlas plotting and FV indexing.
+
+    Accepts both fully-qualified paths (``backbone.blocks.6.attn.context``)
+    and bare-ViT paths (``blocks.6.attn.context``) — the latter is
+    resolved via :func:`_resolve_dims`'s wrapper-prefix fallback so user
+    code stays portable across wrapped/unwrapped model layouts.
+    """
+    from crp.attention_concepts import _resolve_dims
     if isinstance(concept, _PerHead := (HeadConcept, QConcept, KConcept, VConcept)):
-        num_heads, head_dim, _ = concept._dims[layer_name]
+        num_heads, head_dim, _ = _resolve_dims(layer_name, concept._dims)
         if concept.dim_split:
             return [(h, d) for h in range(num_heads) for d in range(head_dim)]
         return list(range(num_heads))
     if isinstance(concept, AttnOutputDimConcept):
-        embed_dim, _ = concept._dims[layer_name]
+        embed_dim, _ = _resolve_dims(layer_name, concept._dims)
         return list(range(embed_dim))
     if isinstance(concept, RegisterTokenConcept):
-        embed_dim, npt = concept._dims[layer_name]
+        embed_dim, npt = _resolve_dims(layer_name, concept._dims)
         if concept.dim_split:
             return [(t, c) for t in range(npt) for c in range(embed_dim)]
         return list(range(npt))
@@ -319,12 +326,18 @@ def plot_cascade(
     all_ids_cache: Dict[int, List] = {}
 
     for row, layer_idx in enumerate(layer_indices):
-        layer_name = f"blocks.{layer_idx}.attn.{suffix}"
-        if layer_name not in concept._dims:
+        # Derive the full module path from the concept's registered keys.
+        # On a Probe-wrapped model the keys look like
+        # ``backbone.blocks.6.attn.context``; on a bare ViT they look like
+        # ``blocks.6.attn.context``. The needle picks whichever is registered.
+        needle = f"blocks.{layer_idx}.attn.{suffix}"
+        candidates = [k for k in concept._dims if k == needle or k.endswith("." + needle)]
+        if not candidates:
             for ax in axes[row]:
                 ax.text(0.5, 0.5, "no dims", ha="center", va="center", fontsize=8)
                 ax.axis("off")
             continue
+        layer_name = candidates[0]
         all_ids_cache[layer_idx] = enumerate_ids(concept, layer_name)
         # Cumulative conditioning: pass `extra_conditions` (deeper layer ids)
         # so the cascade narrows progressively.

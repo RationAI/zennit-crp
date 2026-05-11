@@ -98,16 +98,39 @@ def _find_unfolded_attentions(model: nn.Module):
 
 
 def _resolve_dims(layer_name: str, dims: Dict[str, tuple]) -> tuple:
-    """Return ``(num_heads, head_dim)`` for ``layer_name``, with a
-    parent-prefix fallback so e.g. ``blocks.6.attn.context.subthing``
-    resolves from a registration on ``blocks.6.attn.context``."""
+    """Return registered dims for ``layer_name``, with two fallbacks:
+
+    1. **Parent-prefix**: if ``blocks.6.attn.context.subthing`` is asked
+       for, fall back to a registration on ``blocks.6.attn.context``.
+    2. **Wrapper-prefix**: if ``blocks.6.attn.context`` is asked for and
+       the registration was made under a wrapped model (e.g. ``Probe``)
+       so the actual key is ``backbone.blocks.6.attn.context``, find the
+       unique key that ends with ``.layer_name`` and return its dims.
+       Raises if multiple keys match (ambiguous).
+
+    The wrapper-prefix fallback is what makes notebook code that
+    constructs paths as ``blocks.{i}.attn.{suffix}`` work even when the
+    model has been wrapped in a ``Probe``-style container that prefixes
+    every module path with ``backbone.``.
+    """
     if layer_name in dims:
         return dims[layer_name]
+    # 1. Parent-prefix
     parts = layer_name.split(".")
     for i in range(len(parts) - 1, 0, -1):
         parent = ".".join(parts[:i])
         if parent in dims:
             return dims[parent]
+    # 2. Wrapper-prefix (suffix match)
+    needle = "." + layer_name
+    matches = [k for k in dims if k.endswith(needle)]
+    if len(matches) == 1:
+        return dims[matches[0]]
+    if len(matches) > 1:
+        raise ValueError(
+            f"Layer name {layer_name!r} is ambiguous — multiple keys end "
+            f"with it: {matches}. Pass the full path."
+        )
     raise ValueError(
         f"No attention dims registered for {layer_name!r}. Pass the model "
         "to the concept constructor, call register_layer(...), or check "
