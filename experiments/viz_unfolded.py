@@ -187,7 +187,7 @@ def plot_concept_atlas(
     attribution, composite, *,
     concept, layer_name: str, target_class: int,
     top_k: Optional[int] = None,
-    cell_size: float = 1.6,
+    cell_size: float = 4.0,
     title_prefix: Optional[str] = None,
 ) -> plt.Figure:
     """Generic atlas: one image+heatmap panel per (top-K-by-relevance)
@@ -244,7 +244,7 @@ def build_layer_map(concept_layer_pairs: Sequence[Tuple[object, str]]) -> Dict[s
 
 def plot_reference_samples(
     fv, *, concept_layer: str, concept, top_concept_ids: Sequence,
-    n_refs: int = 4, cell_size: float = 1.4,
+    n_refs: int = 4, cell_size: float = 4.0,
     title_prefix: Optional[str] = None,
 ) -> plt.Figure:
     """For each id in ``top_concept_ids``, fetch the top-``n_refs`` images
@@ -297,7 +297,7 @@ def plot_cascade(
     image: torch.Tensor, model: torch.nn.Module,
     attribution, composite, *,
     concept, layer_names: Sequence[str], target_class: int,
-    top_k: int = 4, cell_size: float = 1.4,
+    top_k: int = 4, cell_size: float = 4.0,
 ) -> Tuple[plt.Figure, Dict[str, List]]:
     """Incremental conditional cascade: walk ``layer_names`` (a list of
     fully-qualified hookable submodule paths, deep → shallow). At each
