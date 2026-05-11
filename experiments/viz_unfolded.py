@@ -139,24 +139,25 @@ def enumerate_ids(concept, layer_name: str) -> List:
     """List all (sample) concept ids for a given concept + layer in
     row-major order. Used for atlas plotting and FV indexing.
 
-    Accepts both fully-qualified paths (``backbone.blocks.6.attn.context``)
-    and bare-ViT paths (``blocks.6.attn.context``) — the latter is
-    resolved via :func:`_resolve_dims`'s wrapper-prefix fallback so user
-    code stays portable across wrapped/unwrapped model layouts.
+    Reads the dims live from the parent attention module — the layer
+    path's parent is looked up on the concept's stored model and queried
+    for ``num_heads`` / ``head_dim`` / ``num_prefix_tokens``. Works
+    whether the model's attention is stock or unfolded.
     """
-    from crp.attention_concepts import _resolve_dims
+    from crp.attention_concepts import _layer_attn
+    attn = _layer_attn(concept.model, layer_name)
+    num_heads = int(attn.num_heads)
+    head_dim = int(attn.head_dim)
+    npt = int(getattr(attn, "num_prefix_tokens", 0))
     if isinstance(concept, _PerHead := (HeadConcept, QConcept, KConcept, VConcept)):
-        num_heads, head_dim, _ = _resolve_dims(layer_name, concept._dims)
         if concept.dim_split:
             return [(h, d) for h in range(num_heads) for d in range(head_dim)]
         return list(range(num_heads))
     if isinstance(concept, AttnOutputDimConcept):
-        embed_dim, _ = _resolve_dims(layer_name, concept._dims)
-        return list(range(embed_dim))
+        return list(range(num_heads * head_dim))
     if isinstance(concept, RegisterTokenConcept):
-        embed_dim, npt = _resolve_dims(layer_name, concept._dims)
         if concept.dim_split:
-            return [(t, c) for t in range(npt) for c in range(embed_dim)]
+            return [(t, c) for t in range(npt) for c in range(num_heads * head_dim)]
         return list(range(npt))
     raise TypeError(f"Unknown concept type: {type(concept).__name__}")
 
@@ -295,50 +296,37 @@ def plot_reference_samples(
 def plot_cascade(
     image: torch.Tensor, model: torch.nn.Module,
     attribution, composite, *,
-    concept, layer_indices: Sequence[int], target_class: int,
+    concept, layer_names: Sequence[str], target_class: int,
     top_k: int = 4, cell_size: float = 1.4,
-) -> Tuple[plt.Figure, Dict[int, List]]:
-    """Incremental conditional cascade: walk ``layer_indices`` from deep
-    (head-side) to shallow (input-side). At each layer, pick the top-``k``
-    concept ids by per-concept relevance under the *cumulative*
-    conditioning of all already-selected deeper-layer ids; render each
-    of these as a heatmap row; pass the union of selections forward to
-    the next (shallower) layer.
+) -> Tuple[plt.Figure, Dict[str, List]]:
+    """Incremental conditional cascade: walk ``layer_names`` (a list of
+    fully-qualified hookable submodule paths, deep → shallow). At each
+    layer, pick the top-``k`` concept ids by per-concept relevance under
+    the *cumulative* conditioning of all already-selected deeper-layer
+    ids; render each as a heatmap row; pass the union of selections
+    forward to the next (shallower) layer.
 
-    Returns ``(fig, selected)`` where ``selected[layer_idx]`` is the
+    The caller is responsible for picking the right paths — they vary
+    per model (wrapped vs bare ViT) and per concept type (``context``,
+    ``rope_q``, ``proj_drop``, …). Use the discovery cell in the
+    walkthrough notebook to enumerate the available paths.
+
+    Returns ``(fig, selected)`` where ``selected[layer_name]`` is the
     list of concept ids chosen at that depth (in order of relevance).
     """
     image_np = denormalize(image, model)
-    selected: Dict[int, List] = {}
+    selected: Dict[str, List] = {}
     extra_conditions: Dict[str, List] = {}
 
-    # Layer name suffix is the same for every layer (concept's
-    # LAYER_SUFFIX, e.g. 'context' for HeadConcept).
-    suffix = concept.LAYER_SUFFIX
-
-    n_rows = len(layer_indices)
+    n_rows = len(layer_names)
     fig, axes = plt.subplots(
         n_rows, top_k, figsize=(cell_size * top_k * 2, cell_size * n_rows),
     )
     if n_rows == 1:
         axes = axes.reshape(1, -1)
 
-    all_ids_cache: Dict[int, List] = {}
-
-    for row, layer_idx in enumerate(layer_indices):
-        # Derive the full module path from the concept's registered keys.
-        # On a Probe-wrapped model the keys look like
-        # ``backbone.blocks.6.attn.context``; on a bare ViT they look like
-        # ``blocks.6.attn.context``. The needle picks whichever is registered.
-        needle = f"blocks.{layer_idx}.attn.{suffix}"
-        candidates = [k for k in concept._dims if k == needle or k.endswith("." + needle)]
-        if not candidates:
-            for ax in axes[row]:
-                ax.text(0.5, 0.5, "no dims", ha="center", va="center", fontsize=8)
-                ax.axis("off")
-            continue
-        layer_name = candidates[0]
-        all_ids_cache[layer_idx] = enumerate_ids(concept, layer_name)
+    for row, layer_name in enumerate(layer_names):
+        all_ids = enumerate_ids(concept, layer_name)
         # Cumulative conditioning: pass `extra_conditions` (deeper layer ids)
         # so the cascade narrows progressively.
         scores = per_concept_scores(
@@ -348,8 +336,8 @@ def plot_cascade(
         )
         ranked = torch.argsort(scores.abs(), descending=True).cpu().tolist()
         kept_idx = ranked[:top_k]
-        kept_ids = [all_ids_cache[layer_idx][i] for i in kept_idx]
-        selected[layer_idx] = kept_ids
+        kept_ids = [all_ids[i] for i in kept_idx]
+        selected[layer_name] = kept_ids
         # Render this row.
         for ax, cid in zip(axes[row], kept_ids):
             hm = attribute_at_concept(
@@ -357,7 +345,7 @@ def plot_cascade(
                 extra_conditions=extra_conditions, exclude_parallel=False,
             )
             panel(ax, image_np, hm)
-            ax.set_title(f"L{layer_idx} {label_id(concept, cid)}", fontsize=7)
+            ax.set_title(f"{layer_name.split('.')[-2]} {label_id(concept, cid)}", fontsize=7)
         # Add THIS layer's selection to the extra conditioning for the next layer.
         extra_conditions[layer_name] = kept_ids
 

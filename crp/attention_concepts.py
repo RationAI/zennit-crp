@@ -1,81 +1,42 @@
-"""Concept classes for conditional attribution on unfolded ViT attention.
+"""CRP Concept classes for the unfolded Eva attention block.
 
-This module defines the *axes of conditioning* exposed by the unfolded
-attention refactor. Each concept class is a thin wrapper around a CRP
-``ChannelConcept`` that:
+A Concept here is a CRP-style partition of a hidden tensor into named
+"parts" (heads, channels, or prefix-token positions). Each class:
 
-* knows which **named submodule** of :class:`crp.attention_unfolded.EvaAttentionUnfolded`
-  to target (its ``LAYER_SUFFIX``),
-* knows the **shape convention** of that submodule's tensor,
-* implements ``mask`` (zero-out non-selected concepts during attribution
-  backward) and ``attribute`` (per-concept relevance reduction).
+* knows what part-shape it expects on its target tensor
+  (``(B, num_heads, N, head_dim)`` for the per-head ones;
+  ``(B, N, embed_dim)`` for the post-projection ones),
+* takes a ``model`` reference at construction so it can look up the
+  parent :class:`crp.attention_unfolded.EvaAttentionUnfolded` of any
+  hookable submodule path you pass in,
+* exposes ``mask(...)`` / ``attribute(...)`` / ``reference_sampling(...)``
+  with an explicit ``layer_name`` argument every call.
 
-**Strict separation between spatial and prefix (cls + register) tokens.**
-Spatial patch tokens are translation-equivariant: the same channel
-responds similarly to the same feature regardless of position, so
-per-token conditioning of spatial tokens would not generalise across
-reference samples. Register / cls tokens (the first ``num_prefix_tokens``
-positions of the token axis) carry global non-spatial meaning per
-Darcet et al. ICLR 2024 (arXiv:2309.16588) and ARE meaningfully
-addressable by token id. The two are exposed via separate concept
-classes; **no concept class mixes them**.
+**Submodule mapping (read from concept docstrings — not from a class
+attribute).** Each concept is the natural attribution lens at one
+specific submodule of the unfolded Eva attention:
 
-Conditioning points inside one attention block:
+* :class:`HeadConcept`              → ``...attn.context``
+* :class:`QConcept`                 → ``...attn.rope_q``
+* :class:`KConcept`                 → ``...attn.rope_k``
+* :class:`VConcept`                 → ``...attn.v_id``
+* :class:`AttnOutputDimConcept`     → ``...attn.proj_drop`` (spatial tokens only)
+* :class:`RegisterTokenConcept`     → ``...attn.proj_drop`` (prefix tokens only)
 
-1. **Q / K / V inputs to the bilinears (spatial-only)** —
-   :class:`QConcept`, :class:`KConcept`, :class:`VConcept`. Hook the
-   per-head Q (post q_norm + RoPE), K (post k_norm + RoPE), or V (post
-   per-head reshape) tensors of shape ``(B, num_heads, N, head_dim)``.
-   Per-head conditioning by default; per-(head, dim) via
-   ``dim_split=True``. Excludes the first ``num_prefix_tokens`` of the
-   token axis.
+**No auto-discovery, no path-resolution heuristics.** The user passes
+``layer_name`` as a fully qualified path that matches
+``model.named_modules()``. For a wrapped model (e.g.
+``Probe(backbone=ViT, head=...)``), that means including the wrapper
+prefix: ``"backbone.blocks.6.attn.context"``. The walkthrough notebook's
+discovery cell prints the actual paths so the user copies them.
 
-2. **Per-head context output (spatial-only)** — :class:`HeadConcept`.
-   Hooks the ``context`` output (= ``attn @ V``, before the reshape
-   that merges heads back) of shape ``(B, num_heads, N, head_dim)``.
-   "Per-head contribution to the attention output" — natural CRP
-   analogue to a CNN filter. Spatial tokens only.
-
-3. **Post-projection residual contribution, spatial channels** —
-   :class:`AttnOutputDimConcept`. Hooks the ``proj_drop`` output of
-   shape ``(B, N, embed_dim)``. **Per-channel conditioning only** with
-   relevance aggregated over spatial tokens. The
-   "OV-circuit-output" view used by the Anthropic mathematical-framework
-   / induction-heads line of work. Excludes prefix tokens.
-
-4. **Register / cls token contribution** — :class:`RegisterTokenConcept`.
-   Same hook point (``proj_drop``) but addresses **only the first
-   ``num_prefix_tokens``** of the token axis. Per-token conditioning by
-   default; per-(token, channel) via ``dim_split=True``. Each prefix
-   token carries a distinct global signal (cls = classification
-   aggregator; register tokens absorb high-norm artifacts) and is
-   meaningfully retrievable via reference-sample search.
-
-**Removed concept classes** (per design review):
-
-* ``AttnWeightConcept`` (would have hooked ``attn.softmax``) — softmax
-  weights have no fixed semantic per neuron: the same (head, query, key)
-  cell combines different concepts for different inputs. Useful for
-  inspecting K/Q relations directly (via tensor recording) but not for
-  identifying concepts via reference-sample retrieval. Not exposed as a
-  concept; the named submodule remains hookable for inspection.
-
-All concepts auto-discover their target submodules from the model on
-construction (``concept = HeadConcept(model)``), or layers can be
-registered manually with ``concept.register_layer(name, num_heads,
-head_dim)``.
-
-Naming convention for layer paths: a model with attention modules at
-``blocks.0.attn``, …, ``blocks.23.attn`` (substituted by
-:class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`) will
-expose hookable submodules like ``blocks.6.attn.context``,
-``blocks.6.attn.rope_q``, ``blocks.6.attn.proj_drop``, etc. The concept
-classes below build the full path as ``f"{attn_name}.{LAYER_SUFFIX}"``.
+If the parent of the path you pass is not an
+:class:`EvaAttentionUnfolded` (because the substitution canonizer hasn't
+been applied), every method fails loudly with a clear error.
 """
 from __future__ import annotations
 
-import math
-from typing import Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -84,59 +45,29 @@ import torch.nn as nn
 from crp.concepts import ChannelConcept
 
 
-def _find_unfolded_attentions(model: nn.Module):
-    """Yield ``(name, EvaAttentionUnfolded_instance)`` for every unfolded
-    attention submodule in ``model``. Skips modules that haven't been
-    substituted (so concepts are silently no-op on a non-substituted
-    model — call ``register_layer`` explicitly in that case)."""
-    # Lazy import to avoid a hard cycle: attention_concepts → attention_unfolded
-    # → transformer_patches → attention_concepts (via crp/__init__.py).
-    from crp.attention_unfolded import EvaAttentionUnfolded
-    for name, module in model.named_modules():
-        if isinstance(module, EvaAttentionUnfolded):
-            yield name, module
+def _layer_attn(model: nn.Module, layer_name: str) -> nn.Module:
+    """Return the parent attention module of ``layer_name``.
 
+    The hookable submodules (``context``, ``rope_q``, ``rope_k``,
+    ``v_id``, ``proj_drop``) all live one level under the attention
+    block. We trim the last path segment and look up the result via
+    :meth:`torch.nn.Module.get_submodule`.
 
-def _resolve_dims(layer_name: str, dims: Dict[str, tuple]) -> tuple:
-    """Return registered dims for ``layer_name``, with two fallbacks:
+    Returns whichever attention class is currently bound at that path:
+    stock ``timm.models.eva.EvaAttention`` when the composite context
+    is NOT active, or :class:`crp.attention_unfolded.EvaAttentionUnfolded`
+    when it IS active. Both expose ``num_heads``, ``head_dim`` and
+    (for Eva-style) ``num_prefix_tokens`` — and that is all the concept
+    methods need to read.
 
-    1. **Parent-prefix**: if ``blocks.6.attn.context.subthing`` is asked
-       for, fall back to a registration on ``blocks.6.attn.context``.
-    2. **Wrapper-prefix**: if ``blocks.6.attn.context`` is asked for and
-       the registration was made under a wrapped model (e.g. ``Probe``)
-       so the actual key is ``backbone.blocks.6.attn.context``, find the
-       unique key that ends with ``.layer_name`` and return its dims.
-       Raises if multiple keys match (ambiguous).
-
-    The wrapper-prefix fallback is what makes notebook code that
-    constructs paths as ``blocks.{i}.attn.{suffix}`` work even when the
-    model has been wrapped in a ``Probe``-style container that prefixes
-    every module path with ``backbone.``.
+    The leaf submodule itself (``context`` etc.) only exists during the
+    composite context. That is fine: zennit needs the leaf for
+    ``record_layer`` hook registration *during* attribution; the concept
+    methods called *after* attribution work off the recorded relevance
+    tensor and only need the parent's dim attributes.
     """
-    if layer_name in dims:
-        return dims[layer_name]
-    # 1. Parent-prefix
-    parts = layer_name.split(".")
-    for i in range(len(parts) - 1, 0, -1):
-        parent = ".".join(parts[:i])
-        if parent in dims:
-            return dims[parent]
-    # 2. Wrapper-prefix (suffix match)
-    needle = "." + layer_name
-    matches = [k for k in dims if k.endswith(needle)]
-    if len(matches) == 1:
-        return dims[matches[0]]
-    if len(matches) > 1:
-        raise ValueError(
-            f"Layer name {layer_name!r} is ambiguous — multiple keys end "
-            f"with it: {matches}. Pass the full path."
-        )
-    raise ValueError(
-        f"No attention dims registered for {layer_name!r}. Pass the model "
-        "to the concept constructor, call register_layer(...), or check "
-        "that the model's attention modules have been substituted by "
-        "EvaAttentionSubstitutionCanonizer."
-    )
+    parent_path = layer_name.rsplit(".", 1)[0]
+    return model.get_submodule(parent_path)
 
 
 # ─── 1. Per-head concepts (Q, K, V, Head) ────────────────────────────────────
@@ -146,17 +77,10 @@ class _PerHeadAttentionConcept(ChannelConcept):
     """Shared base for concepts on per-head tensors of shape
     ``(B, num_heads, N, head_dim)``.
 
-    **Spatial-only conditioning.** All operations exclude the first
-    ``num_prefix_tokens`` of the token axis (cls + register tokens in
-    DINOv3 etc.) — those carry global non-spatial meaning that must
-    not be mixed with patch-token conditioning. Register / cls tokens
-    are addressable separately via :class:`RegisterTokenConcept`.
-
-    Subclasses set:
-
-    * ``LAYER_SUFFIX`` — the named submodule of
-      :class:`EvaAttentionUnfolded` to target (e.g. ``"context"``,
-      ``"rope_q"``, ``"v_id"``).
+    Spatial-tokens-only by default: the first ``num_prefix_tokens`` of
+    the token axis (cls + register tokens) are zeroed in masks and
+    excluded from the spatial sum in :meth:`attribute`. They are
+    addressable separately via :class:`RegisterTokenConcept`.
 
     Construction-time flag:
 
@@ -171,27 +95,9 @@ class _PerHeadAttentionConcept(ChannelConcept):
       ``attribute()`` returns shape ``(B, num_heads, head_dim)``.
     """
 
-    LAYER_SUFFIX: str = ""  # subclass override
-
-    def __init__(self, model: Optional[nn.Module] = None, *, dim_split: bool = False):
+    def __init__(self, model: nn.Module, *, dim_split: bool = False):
+        self.model = model
         self.dim_split = bool(dim_split)
-        # layer_name -> (num_heads, head_dim, num_prefix_tokens)
-        self._dims: Dict[str, Tuple[int, int, int]] = {}
-        if model is not None:
-            for attn_name, attn in _find_unfolded_attentions(model):
-                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
-                    int(attn.num_heads),
-                    int(attn.head_dim),
-                    int(getattr(attn, "num_prefix_tokens", 0)),
-                )
-
-    def register_layer(
-        self, layer_name: str, num_heads: int, head_dim: int,
-        num_prefix_tokens: int = 0,
-    ) -> None:
-        self._dims[layer_name] = (
-            int(num_heads), int(head_dim), int(num_prefix_tokens),
-        )
 
     # ── concept id decode ───────────────────────────────────────────────────
 
@@ -244,7 +150,8 @@ class _PerHeadAttentionConcept(ChannelConcept):
     # ── mask (zero out non-selected concepts AND prefix tokens) ─────────────
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        num_heads, head_dim, npt = _resolve_dims(layer_name, self._dims)
+        attn = _layer_attn(self.model, layer_name)
+        num_heads, head_dim, npt = attn.num_heads, attn.head_dim, attn.num_prefix_tokens
         decoded = [self._decode(cid, num_heads, head_dim) for cid in concept_ids]
 
         def mask_fct(grad: torch.Tensor) -> torch.Tensor:
@@ -282,7 +189,7 @@ class _PerHeadAttentionConcept(ChannelConcept):
         layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
-        _, _, npt = _resolve_dims(layer_name, self._dims)
+        npt = _layer_attn(self.model, layer_name).num_prefix_tokens
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
         # (B, num_heads, N, head_dim) → keep only spatial tokens [npt:].
@@ -313,7 +220,7 @@ class _PerHeadAttentionConcept(ChannelConcept):
         # is reported relative to the absolute (B, num_heads, N, head_dim)
         # token axis (so the caller can map it back to the original token
         # coordinates), but the argmax search excludes the prefix tokens.
-        _, _, npt = _resolve_dims(layer_name, self._dims)
+        npt = _layer_attn(self.model, layer_name).num_prefix_tokens
         B = relevance.shape[0]
         rel_spatial = relevance[:, :, npt:, :]
         if self.dim_split:
@@ -343,57 +250,50 @@ class _PerHeadAttentionConcept(ChannelConcept):
 
 
 class HeadConcept(_PerHeadAttentionConcept):
-    """One concept per attention head, conditioned at the per-head context
+    """One concept per attention head; conditioned at the per-head context
     output (= ``attn @ V``, before head-merging reshape).
 
-    Targets ``EvaAttentionUnfolded.context``. Tensor shape:
-    ``(B, num_heads, N, head_dim)``.
+    **Pass** ``layer_name`` **=** the path to an
+    :class:`EvaAttentionUnfolded.context` submodule, e.g.
+    ``"blocks.6.attn.context"`` (bare ViT) or
+    ``"backbone.blocks.6.attn.context"`` (Probe-wrapped).
 
+    Tensor at the layer: ``(B, num_heads, N, head_dim)``.
     With ``dim_split=True`` the granularity becomes ``(head, dim)``.
 
-    This is the "per-head contribution to the attention sub-output"
-    view — the natural CRP analogue of a CNN filter. To condition on a
+    This is the "per-head contribution to the attention sub-output" view
+    — the natural CRP analogue of a CNN filter. To condition on a
     specific head's effect on the *residual stream* (post-projection),
-    use :class:`AttnOutputConcept` instead.
+    use :class:`AttnOutputDimConcept` instead.
     """
-
-    LAYER_SUFFIX = "context"
 
 
 class QConcept(_PerHeadAttentionConcept):
     """One concept per attention head's Q vector (post q_norm + RoPE).
 
-    Targets ``EvaAttentionUnfolded.rope_q``. Tensor shape:
-    ``(B, num_heads, N, head_dim)``.
-
-    With ``dim_split=True`` the granularity becomes ``(head, dim)`` —
+    **Pass** ``layer_name`` **=** the path to ``...attn.rope_q``.
+    Tensor: ``(B, num_heads, N, head_dim)``. ``dim_split=True`` selects
     one concept per query feature.
     """
-
-    LAYER_SUFFIX = "rope_q"
 
 
 class KConcept(_PerHeadAttentionConcept):
     """One concept per attention head's K vector (post k_norm + RoPE).
 
-    Targets ``EvaAttentionUnfolded.rope_k``. Tensor shape:
-    ``(B, num_heads, N, head_dim)``. ``dim_split=True`` selects per
-    key feature.
+    **Pass** ``layer_name`` **=** the path to ``...attn.rope_k``.
+    Tensor: ``(B, num_heads, N, head_dim)``. ``dim_split=True`` selects
+    one concept per key feature.
     """
-
-    LAYER_SUFFIX = "rope_k"
 
 
 class VConcept(_PerHeadAttentionConcept):
     """One concept per attention head's V vector (post per-head reshape).
 
-    Targets ``EvaAttentionUnfolded.v_id`` (an ``nn.Identity`` placed
-    after the per-head reshape so V is hookable; V is otherwise
-    reshape-only between the qkv split and the bilinear). Tensor
-    shape: ``(B, num_heads, N, head_dim)``.
+    **Pass** ``layer_name`` **=** the path to ``...attn.v_id`` (an
+    ``nn.Identity`` placed after the per-head reshape so V is hookable;
+    V is otherwise reshape-only between the qkv split and the bilinear).
+    Tensor: ``(B, num_heads, N, head_dim)``.
     """
-
-    LAYER_SUFFIX = "v_id"
 
 
 # NOTE: ``AttnWeightConcept`` (would target ``attn.softmax``) was
@@ -412,60 +312,27 @@ class AttnOutputDimConcept(ChannelConcept):
     projection attention output (= attention block's contribution to the
     residual stream).
 
-    Targets ``EvaAttentionUnfolded.proj_drop``. Tensor shape:
-    ``(B, N, embed_dim)``. Concept id forms:
+    **Pass** ``layer_name`` **=** the path to ``...attn.proj_drop``.
+    Tensor: ``(B, N, embed_dim)``. Concept id forms:
 
     * ``int channel_id`` — one output channel of ``proj``.
     * ``(channel_id,)`` tuple — same.
 
-    This is the "OV-circuit-output" view used in the Anthropic
-    mathematical-framework / induction-heads line of work
-    (Elhage et al., Olsson et al.). Conditioning on a single channel
-    asks: "which feature in the attention block's residual contribution
-    is most relevant to the prediction?". Different from
-    :class:`HeadConcept` (pre-proj per-head) because ``proj`` mixes head
-    outputs into the residual-stream basis — channels here are in the
-    *embed_dim* coordinates, not per-head coordinates.
-
     **Token aggregation (not per-token conditioning).** The mask zeros
     all NON-selected channels but keeps every (token, channel) entry of
-    the selected channels. ``attribute()`` then sums over the token
-    axis. This is intentional: ViT spatial token positions carry no
-    fixed semantic — the same channel responds similarly to the same
-    feature regardless of where it appears in the image. Per-token
-    conditioning would treat the same concept differently based on
-    accidental spatial location and would not generalise across
-    reference samples; channel-only conditioning + spatial aggregation
-    is the meaningful axis.
-
-    *Register / cls tokens (DINOv3's first 5 prefix tokens).* Currently
-    lumped with patch tokens in the spatial sum. They DO carry global
-    non-spatial meaning per Darcet et al. ICLR 2024 (arXiv:2309.16588)
-    and could in principle be conditioned on by token-id, but the right
-    interpretive framing is open research. The channel-only baseline
-    here applies uniformly to all tokens; refining the register-token
-    treatment is tracked as future work.
+    the selected channels for the **spatial** token range
+    ``[num_prefix_tokens:]``. ``attribute()`` then sums over the spatial
+    token axis. Prefix tokens (cls + register) are zeroed; address them
+    via :class:`RegisterTokenConcept`.
     """
 
-    LAYER_SUFFIX = "proj_drop"
-
-    def __init__(self, model: Optional[nn.Module] = None):
-        # layer_name -> (embed_dim, num_prefix_tokens)
-        self._dims: Dict[str, Tuple[int, int]] = {}
-        if model is not None:
-            for attn_name, attn in _find_unfolded_attentions(model):
-                embed_dim = int(attn.num_heads) * int(attn.head_dim)
-                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
-                    embed_dim, int(getattr(attn, "num_prefix_tokens", 0)),
-                )
-
-    def register_layer(
-        self, layer_name: str, embed_dim: int, num_prefix_tokens: int = 0,
-    ) -> None:
-        self._dims[layer_name] = (int(embed_dim), int(num_prefix_tokens))
+    def __init__(self, model: nn.Module):
+        self.model = model
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        embed_dim, npt = _resolve_dims(layer_name, self._dims)
+        attn = _layer_attn(self.model, layer_name)
+        embed_dim = int(attn.num_heads) * int(attn.head_dim)
+        npt = int(attn.num_prefix_tokens)
 
         channels = []
         for cid in concept_ids:
@@ -512,7 +379,7 @@ class AttnOutputDimConcept(ChannelConcept):
         layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
-        _, npt = _resolve_dims(layer_name, self._dims)
+        npt = int(_layer_attn(self.model, layer_name).num_prefix_tokens)
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
         # (B, N, embed_dim) → keep spatial tokens only → sum over tokens → (B, embed_dim).
@@ -530,18 +397,15 @@ class RegisterTokenConcept(ChannelConcept):
     """One concept per prefix (cls + register) token of the post-projection
     attention output.
 
-    Targets ``EvaAttentionUnfolded.proj_drop``. Tensor shape:
-    ``(B, N, embed_dim)``. Concepts live on the first ``num_prefix_tokens``
-    of the token axis.
+    **Pass** ``layer_name`` **=** the path to ``...attn.proj_drop``.
+    Tensor: ``(B, N, embed_dim)``. Concepts live on the first
+    ``num_prefix_tokens`` of the token axis.
 
     DINOv3 ViT-L has ``num_prefix_tokens = 5`` (1 cls + 4 register).
     Each token carries a global, non-spatial signal — register tokens
     absorb high-norm artifacts per Darcet et al. ICLR 2024
     (arXiv:2309.16588), and the cls token is the model's classification
-    aggregator. Per-token addressing makes sense at this granularity:
-    each prefix token can encode different global features and is
-    meaningfully retrievable via reference-sample search (a different
-    contract from spatial patch tokens, which are translation-equivariant).
+    aggregator.
 
     Construction-time flag:
 
@@ -555,37 +419,11 @@ class RegisterTokenConcept(ChannelConcept):
     * ``dim_split=True``: ``(token_id, channel_id)`` tuple or flat
       row-major ``int`` over ``(num_prefix_tokens, embed_dim)``;
       ``attribute()`` returns shape ``(B, num_prefix_tokens, embed_dim)``.
-
-    Use cases:
-
-    * Find images where the cls token (``token_id=0``) carries the most
-      relevance — the natural classification-aggregator-attention view.
-    * Find images that activate a specific register token most — useful
-      for the artifact-storage hypothesis of Darcet et al.
     """
 
-    LAYER_SUFFIX = "proj_drop"
-
-    def __init__(self, model: Optional[nn.Module] = None, *, dim_split: bool = False):
+    def __init__(self, model: nn.Module, *, dim_split: bool = False):
+        self.model = model
         self.dim_split = bool(dim_split)
-        # layer_name -> (embed_dim, num_prefix_tokens)
-        self._dims: Dict[str, Tuple[int, int]] = {}
-        if model is not None:
-            for attn_name, attn in _find_unfolded_attentions(model):
-                embed_dim = int(attn.num_heads) * int(attn.head_dim)
-                self._dims[f"{attn_name}.{self.LAYER_SUFFIX}"] = (
-                    embed_dim, int(getattr(attn, "num_prefix_tokens", 0)),
-                )
-
-    def register_layer(
-        self, layer_name: str, embed_dim: int, num_prefix_tokens: int,
-    ) -> None:
-        if num_prefix_tokens <= 0:
-            raise ValueError(
-                f"RegisterTokenConcept needs num_prefix_tokens > 0; got "
-                f"{num_prefix_tokens}"
-            )
-        self._dims[layer_name] = (int(embed_dim), int(num_prefix_tokens))
 
     def _decode(
         self, concept_id, num_prefix_tokens: int, embed_dim: int,
@@ -630,7 +468,14 @@ class RegisterTokenConcept(ChannelConcept):
         )
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        embed_dim, npt = _resolve_dims(layer_name, self._dims)
+        attn = _layer_attn(self.model, layer_name)
+        embed_dim = int(attn.num_heads) * int(attn.head_dim)
+        npt = int(attn.num_prefix_tokens)
+        if npt <= 0:
+            raise ValueError(
+                f"RegisterTokenConcept needs num_prefix_tokens > 0; the "
+                f"attention at {layer_name!r} has num_prefix_tokens={npt}."
+            )
         decoded = [self._decode(cid, npt, embed_dim) for cid in concept_ids]
 
         def mask_fct(grad: torch.Tensor) -> torch.Tensor:
@@ -666,7 +511,7 @@ class RegisterTokenConcept(ChannelConcept):
         layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
-        _, npt = _resolve_dims(layer_name, self._dims)
+        npt = int(_layer_attn(self.model, layer_name).num_prefix_tokens)
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
         # (B, N, embed_dim) → keep prefix tokens only → (B, num_prefix_tokens, embed_dim).

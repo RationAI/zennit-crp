@@ -236,17 +236,13 @@ class TestEvaUnfoldedIntegration:
             matmul_factor_2=True, use_unfolded_attention=True,
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
-        # Concept must register layer dims AFTER substitution. Easiest:
-        # enter the composite context once just to discover.
-        with composite.context(eva_tiny) as modified:
-            concept = HeadConcept(modified)
-        # mid-stack block, head 1.
+        # Concept just stores a model reference; dims are read live from
+        # the parent attention module at every call. Works inside or
+        # outside the composite context.
+        concept = HeadConcept(eva_tiny)
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
         layer = f"blocks.{target_block}.attn.context"
-        assert layer in concept._dims, (
-            f"HeadConcept did not register {layer}; have: {sorted(concept._dims)[:3]}…"
-        )
         H = eva_tiny.default_cfg.get("input_size", (3, 224, 224))[-1]
         if img224.shape[-1] != H:
             img224 = torch.randn(1, 3, H, H, requires_grad=True)
@@ -261,12 +257,10 @@ class TestEvaUnfoldedIntegration:
             matmul_factor_2=True, use_unfolded_attention=True,
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
-        with composite.context(eva_tiny) as modified:
-            concept = QConcept(modified)
+        concept = QConcept(eva_tiny)
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
         layer = f"blocks.{target_block}.attn.rope_q"
-        assert layer in concept._dims
         H = eva_tiny.default_cfg.get("input_size", (3, 224, 224))[-1]
         if img224.shape[-1] != H:
             img224 = torch.randn(1, 3, H, H, requires_grad=True)
@@ -281,12 +275,10 @@ class TestEvaUnfoldedIntegration:
             matmul_factor_2=True, use_unfolded_attention=True,
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
-        with composite.context(eva_tiny) as modified:
-            concept = AttnOutputDimConcept(modified)
+        concept = AttnOutputDimConcept(eva_tiny)
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
         layer = f"blocks.{target_block}.attn.proj_drop"
-        assert layer in concept._dims
         H = eva_tiny.default_cfg.get("input_size", (3, 224, 224))[-1]
         if img224.shape[-1] != H:
             img224 = torch.randn(1, 3, H, H, requires_grad=True)
@@ -308,13 +300,12 @@ class TestEvaUnfoldedIntegration:
             matmul_factor_2=True, use_unfolded_attention=True,
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
-        with composite.context(eva_tiny) as modified:
-            concept = RegisterTokenConcept(modified)
+        concept = RegisterTokenConcept(eva_tiny)
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
         layer = f"blocks.{target_block}.attn.proj_drop"
-        assert layer in concept._dims
-        embed_dim, npt = concept._dims[layer]
+        # Read num_prefix_tokens from the attention to decide whether to skip.
+        npt = int(getattr(eva_tiny.blocks[target_block].attn, "num_prefix_tokens", 0))
         if npt == 0:
             pytest.skip(
                 f"Eva variant has num_prefix_tokens=0; RegisterTokenConcept "
