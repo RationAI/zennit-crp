@@ -97,6 +97,15 @@ def main(
             "is supposed to be 50-class FunnyBirds on vit_base_patch16_224 (768)."
         )
 
+    # The visinf training pipeline (train.py + models/model_wrapper.py)
+    # feeds the ViT raw [0, 1] tensors via `transforms.ToTensor()` (NO
+    # ImageNet/JFT normalize) and resizes 256x256 → 224x224 with
+    # F.interpolate's default `mode='nearest'` inside ViTModel.forward.
+    # Loaders MUST replicate this preprocessing or accuracy crashes from
+    # ~99% to ~85% (with timm's (0.5,0.5,0.5)-normalize + crop_pct=0.9
+    # default). The notebook reads `transform_spec` and dispatches to
+    # the matching preprocessing recipe.
+    advertised_acc = float(ckpt.get("best_acc1", 0.0)) / 100.0 or None
     payload = {
         "base": "vit_base",
         "head": "linear",
@@ -106,10 +115,8 @@ def main(
         "dataset": "funny_birds",
         "backbone_state_dict": backbone_sd,
         "head_state_dict": head_sd,
-        # The visinf README doesn't report ViT FunnyBirds accuracy
-        # (only ResNet-50: 0.998). Leave None; the notebook's sanity-eval
-        # cell will measure it on a configurable subset.
-        "val_acc": None,
+        "transform_spec": "visinf_funnybirds_vit_base",
+        "val_acc": advertised_acc,
         "val_acc5": None,
         "val_loss": None,
         "finetuned_from": (
