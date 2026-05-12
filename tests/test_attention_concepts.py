@@ -38,15 +38,16 @@ EMBED_DIM = NUM_HEADS * HEAD_DIM
 class _StubAttn(nn.Module):
     """Bare attention stub: exposes the dim attributes the concepts read.
 
-    Standing in for either timm's stock ``EvaAttention`` or
-    :class:`crp.attention_unfolded.EvaAttentionUnfolded` — both expose
-    these attributes; the concept methods don't care which class is bound.
+    Standing in for either Eva/timm stock attention or the unfolded
+    substitution — both expose ``num_heads`` and ``head_dim``; the
+    concept methods don't care which class is bound. ``num_prefix_tokens``
+    is read from the top-level model, not from the attention (only Eva
+    mirrors it on the attention; stock timm Attention does not).
     """
-    def __init__(self, num_heads: int, head_dim: int, num_prefix_tokens: int):
+    def __init__(self, num_heads: int, head_dim: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.num_prefix_tokens = num_prefix_tokens
 
 
 class _StubBlock(nn.Module):
@@ -58,11 +59,14 @@ class _StubBlock(nn.Module):
 class _StubModel(nn.Module):
     """One-block ``Probe``-shaped stub so layer paths like
     ``blocks.0.attn.context`` resolve via ``get_submodule('blocks.0.attn')``.
+    ``num_prefix_tokens`` lives on the top-level model, matching how
+    timm's VisionTransformer (and Eva) exposes it in production.
     """
     def __init__(self, num_prefix_tokens: int = 0):
         super().__init__()
+        self.num_prefix_tokens = num_prefix_tokens
         self.blocks = nn.ModuleList([
-            _StubBlock(_StubAttn(NUM_HEADS, HEAD_DIM, num_prefix_tokens)),
+            _StubBlock(_StubAttn(NUM_HEADS, HEAD_DIM)),
         ])
 
 
