@@ -170,6 +170,17 @@ class FunnyBirdsDataset(Dataset):
         Deterministic given ``seed``.
     seed : int
         PRNG seed for ``n_per_class`` sampling.
+    clean_only : bool
+        If True, drop every sample whose params include a ``'placeholder'``
+        value for any body-part field (``beak_model``, ``beak_color``,
+        ``eye_model``, ``foot_model``, ``tail_model``, ``tail_color``,
+        ``wing_model``, ``wing_color``). The official train split mixes
+        ~41% part-ablation samples with intact birds — those exist to
+        train robustness to missing parts but are inherently harder to
+        classify (some look ambiguous between classes). The test split
+        contains zero such ablations. Set ``clean_only=True`` whenever
+        you want a distribution that matches the test split — e.g. for
+        FV concept-reference indexing or for accuracy reporting.
     log : callable
         Where to send progress lines. Default ``print``.
     """
@@ -182,6 +193,7 @@ class FunnyBirdsDataset(Dataset):
     download_url: str = FUNNY_BIRDS_URL
     n_per_class: Optional[int] = None
     seed: int = 0
+    clean_only: bool = False
     log: Callable[[str], None] = field(default=print, repr=False)
 
     # Set in __post_init__:
@@ -224,12 +236,27 @@ class FunnyBirdsDataset(Dataset):
         with open(self.data_dir / "parts.json") as f:
             self.parts = json.load(f)
 
-        # Build (image_path, class_idx) item list.
+        # Build (image_path, class_idx) item list. The 6-digit filename is
+        # the sample index in the manifest, so we keep the original index
+        # even after filtering out ablated samples below — that way the
+        # part_map sister files still resolve correctly.
+        _PART_KEYS = (
+            "beak_model", "beak_color", "eye_model", "foot_model",
+            "tail_model", "tail_color", "wing_model", "wing_color",
+        )
         items: List[Tuple[Path, int]] = []
         for idx, p in enumerate(params):
+            if self.clean_only and any(p.get(k) == "placeholder" for k in _PART_KEYS):
+                continue
             cls = int(p["class_idx"])
             img_rel = f"{self.split}/{cls}/{idx:06d}.png"
             items.append((self.data_dir / img_rel, cls))
+        if self.clean_only:
+            self.log(
+                f"  FunnyBirds {self.split}: clean_only filter kept "
+                f"{len(items)}/{len(params)} samples "
+                f"({100*len(items)/len(params):.1f}%); ablated samples dropped."
+            )
 
         # Optional per-class subsampling.
         if self.n_per_class is not None:
