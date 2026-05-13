@@ -187,20 +187,57 @@ def enumerate_ids(concept, layer_name: str) -> List:
 
 
 def label_id(concept, cid) -> str:
-    """Short human-readable label for a concept id, used in plot titles."""
-    if isinstance(concept, (HeadConcept, QConcept, KConcept, VConcept)):
-        prefix = type(concept).__name__.replace("Concept", "")[0].lower()
+    """Short concept-specific identifier for plot titles / row labels.
+
+    Format conventions:
+
+    * ``HeadConcept``        : ``H{h}``      (``H{h},D{d}`` if dim_split)
+    * ``QConcept``           : ``H{h},Q``    (``H{h},Q,D{d}`` if dim_split)
+    * ``KConcept``           : ``H{h},K``    (``H{h},K,D{d}`` if dim_split)
+    * ``VConcept``           : ``H{h},V``    (``H{h},V,D{d}`` if dim_split)
+    * ``AttnOutputDimConcept``: ``D{d}``
+    * ``RegisterTokenConcept``: ``cls`` / ``reg{i}``  (``,D{d}`` if dim_split)
+
+    Use :func:`row_label` to pair this with a trimmed layer path for the
+    two-line row labels used in reference-sample grids.
+    """
+    if isinstance(concept, HeadConcept):
         if concept.dim_split:
-            return f"{prefix}h{cid[0]}/d{cid[1]}"
-        return f"{prefix}h{cid}" if isinstance(cid, int) else f"{prefix}h{cid[0]}"
+            return f"H{int(cid[0])},D{int(cid[1])}"
+        return f"H{int(cid) if isinstance(cid, int) else int(cid[0])}"
+    if isinstance(concept, (QConcept, KConcept, VConcept)):
+        letter = type(concept).__name__[0]  # 'Q' / 'K' / 'V'
+        if concept.dim_split:
+            return f"H{int(cid[0])},{letter},D{int(cid[1])}"
+        return f"H{int(cid) if isinstance(cid, int) else int(cid[0])},{letter}"
     if isinstance(concept, AttnOutputDimConcept):
-        return f"ch{cid}" if isinstance(cid, int) else f"ch{cid[0]}"
+        return f"D{int(cid) if isinstance(cid, int) else int(cid[0])}"
     if isinstance(concept, RegisterTokenConcept):
         if concept.dim_split:
-            return f"t{cid[0]}/c{cid[1]}"
-        tid = cid if isinstance(cid, int) else cid[0]
+            tid, dim = int(cid[0]), int(cid[1])
+            base = "cls" if tid == 0 else f"reg{tid - 1}"
+            return f"{base},D{dim}"
+        tid = int(cid) if isinstance(cid, int) else int(cid[0])
         return "cls" if tid == 0 else f"reg{tid - 1}"
     raise TypeError(f"Unknown concept: {type(concept).__name__}")
+
+
+def row_label(concept, cid, layer_name: str) -> str:
+    """Two-line row label: trimmed layer path on line 1, concept id on
+    line 2. Used by reference-sample grids and the cascade row headers.
+
+    Example outputs::
+
+        blocks.22.attn.context
+        H1,D15
+
+        blocks.5.attn.q_id
+        H0,Q
+    """
+    # Strip the ``backbone.`` prefix and any leading module wrapping —
+    # produces ``blocks.{i}.attn.{leaf}`` from ``backbone.blocks.{i}.attn.{leaf}``
+    short = layer_name.split("backbone.", 1)[-1]
+    return f"{short}\n{label_id(concept, cid)}"
 
 
 # ─── atlases (one image, all/top-K concepts at one layer) ────────────────────
@@ -252,7 +289,10 @@ def plot_concept_atlas(
             preprocess_fn=preprocess_fn,
         )
         panel(ax, image_np, hm)
-        ax.set_title(f"{label_id(concept, cid)}\nscore={sc:.2e}", fontsize=8)
+        ax.set_title(
+            f"{label_id(concept, cid)}\nscore={sc:.2e}",
+            fontsize=8, family="monospace",
+        )
     title = f"{type(concept).__name__} @ {layer_name}"
     if title_prefix:
         title = f"{title_prefix} — {title}"
@@ -310,8 +350,11 @@ def plot_reference_samples(
                 img_np = np.asarray(img)
             ax.imshow(np.clip(img_np, 0, 1))
             ax.axis("off")
-        axes[row, 0].set_ylabel(label_id(concept, cid), fontsize=9, rotation=0,
-                                ha="right", va="center")
+        axes[row, 0].set_ylabel(
+            row_label(concept, cid, concept_layer),
+            fontsize=7, rotation=0, ha="right", va="center",
+            family="monospace",
+        )
     title = f"{type(concept).__name__} top-{n_refs} reference samples @ {concept_layer}"
     if title_prefix:
         title = f"{title_prefix} — {title}"
@@ -393,7 +436,7 @@ def plot_cascade(
 __all__ = [
     "to_display", "panel",
     "attribute_at_concept", "per_concept_scores",
-    "enumerate_ids", "label_id",
+    "enumerate_ids", "label_id", "row_label",
     "plot_concept_atlas",
     "build_layer_map", "plot_reference_samples",
     "plot_cascade",
