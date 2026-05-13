@@ -151,11 +151,11 @@ class TestHeadConcept:
         with pytest.raises(IndexError):
             c.mask(batch_id=0, concept_ids=[NUM_HEADS], layer_name=self.LAYER)
 
-    def test_bad_parent_path_raises(self, model_no_prefix):
-        """layer_name pointing at a non-existent submodule must fail loudly."""
-        c = HeadConcept(model_no_prefix)
-        with pytest.raises((AttributeError, KeyError)):
-            c.mask(batch_id=0, concept_ids=[0], layer_name="nope.attn.context")
+    # Note: post-refactor (concepts capture dims at __init__), an invalid
+    # `layer_name` no longer triggers a model-graph traversal in concept
+    # methods — zennit's hook-registration path validates the layer path
+    # when the composite is applied. So there's nothing for the concept
+    # to assert about `layer_name` itself.
 
 
 # ── Q / K / V concepts ───────────────────────────────────────────────────────

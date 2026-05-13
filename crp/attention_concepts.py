@@ -45,45 +45,29 @@ import torch.nn as nn
 from crp.concepts import ChannelConcept
 
 
-def _layer_attn(model: nn.Module, layer_name: str) -> nn.Module:
-    """Return the parent attention module of ``layer_name``.
+def _capture_dims(model: nn.Module) -> Tuple[int, int, int]:
+    """Read model-wide dims once: ``(num_heads, head_dim, num_prefix_tokens)``.
 
-    The hookable submodules (``context``, ``rope_q``, ``rope_k``,
-    ``v_id``, ``proj_drop``) all live one level under the attention
-    block. We trim the last path segment and look up the result via
-    :meth:`torch.nn.Module.get_submodule`.
+    All three are invariants of the ViT (uniform across blocks for every
+    architecture the project supports). Concepts capture them at
+    ``__init__`` and use ``self.X`` thereafter, so concept methods never
+    have to traverse the model graph at call time — meaning they work
+    identically inside and outside the composite context, regardless of
+    whether the attention has been substituted.
 
-    Returns whichever attention class is currently bound at that path:
-    stock ``timm.models.eva.EvaAttention`` / ``vision_transformer.Attention``
-    when the composite context is NOT active, or the corresponding
-    ``*Unfolded`` substitution when it IS active. All four expose
-    ``num_heads`` and ``head_dim``.
-
-    The leaf submodule itself (``context`` etc.) only exists during the
-    composite context. That is fine: zennit needs the leaf for
-    ``record_layer`` hook registration *during* attribution; the concept
-    methods called *after* attribution work off the recorded relevance
-    tensor and only need the parent's dim attributes.
+    ``num_heads`` / ``head_dim`` come from ``model.blocks[0].attn`` (both
+    stock and unfolded attention classes expose them).
+    ``num_prefix_tokens`` comes from the top-level ``VisionTransformer``
+    (the only place stock timm sets it; Eva also sets it there).
+    ``Probe.__getattr__`` falls through to the backbone, so a bare ViT or
+    a wrapped Probe both work.
     """
-    parent_path = layer_name.rsplit(".", 1)[0]
-    return model.get_submodule(parent_path)
-
-
-def _num_prefix_tokens(model: nn.Module) -> int:
-    """Read the model's prefix-token count (cls + register tokens).
-
-    Always set on the top-level VisionTransformer for both timm
-    (``vision_transformer.VisionTransformer``) and Eva
-    (``eva.Eva``). Reading it from there — rather than from the
-    attention submodule — keeps the value reachable AFTER the composite
-    context exits and the substitution canonizer has reverted the
-    attention back to its stock class. Eva mirrors it on
-    ``EvaAttention`` natively; standard timm ``Attention`` does not.
-
-    ``model`` may be a ``Probe`` (then ``__getattr__`` falls through to
-    the backbone) or the bare ViT itself; both resolve.
-    """
-    return int(model.num_prefix_tokens)
+    attn0 = model.blocks[0].attn
+    return (
+        int(attn0.num_heads),
+        int(attn0.head_dim),
+        int(model.num_prefix_tokens),
+    )
 
 
 # ─── 1. Per-head concepts (Q, K, V, Head) ────────────────────────────────────
@@ -114,6 +98,7 @@ class _PerHeadAttentionConcept(ChannelConcept):
     def __init__(self, model: nn.Module, *, dim_split: bool = False):
         self.model = model
         self.dim_split = bool(dim_split)
+        self.num_heads, self.head_dim, self.num_prefix_tokens = _capture_dims(model)
 
     # ── concept id decode ───────────────────────────────────────────────────
 
@@ -166,9 +151,7 @@ class _PerHeadAttentionConcept(ChannelConcept):
     # ── mask (zero out non-selected concepts AND prefix tokens) ─────────────
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        attn = _layer_attn(self.model, layer_name)
-        num_heads, head_dim = attn.num_heads, attn.head_dim
-        npt = _num_prefix_tokens(self.model)
+        num_heads, head_dim, npt = self.num_heads, self.head_dim, self.num_prefix_tokens
         decoded = [self._decode(cid, num_heads, head_dim) for cid in concept_ids]
 
         def mask_fct(grad: torch.Tensor) -> torch.Tensor:
@@ -206,7 +189,7 @@ class _PerHeadAttentionConcept(ChannelConcept):
         layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
-        npt = _num_prefix_tokens(self.model)
+        npt = self.num_prefix_tokens
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
         # (B, num_heads, N, head_dim) → keep only spatial tokens [npt:].
@@ -237,7 +220,7 @@ class _PerHeadAttentionConcept(ChannelConcept):
         # is reported relative to the absolute (B, num_heads, N, head_dim)
         # token axis (so the caller can map it back to the original token
         # coordinates), but the argmax search excludes the prefix tokens.
-        npt = _num_prefix_tokens(self.model)
+        npt = self.num_prefix_tokens
         B = relevance.shape[0]
         rel_spatial = relevance[:, :, npt:, :]
         if self.dim_split:
@@ -345,11 +328,11 @@ class AttnOutputDimConcept(ChannelConcept):
 
     def __init__(self, model: nn.Module):
         self.model = model
+        self.num_heads, self.head_dim, self.num_prefix_tokens = _capture_dims(model)
+        self.embed_dim = self.num_heads * self.head_dim
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        attn = _layer_attn(self.model, layer_name)
-        embed_dim = int(attn.num_heads) * int(attn.head_dim)
-        npt = _num_prefix_tokens(self.model)
+        embed_dim, npt = self.embed_dim, self.num_prefix_tokens
 
         channels = []
         for cid in concept_ids:
@@ -396,7 +379,7 @@ class AttnOutputDimConcept(ChannelConcept):
         layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
-        npt = _num_prefix_tokens(self.model)
+        npt = self.num_prefix_tokens
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
         # (B, N, embed_dim) → keep spatial tokens only → sum over tokens → (B, embed_dim).
@@ -441,6 +424,8 @@ class RegisterTokenConcept(ChannelConcept):
     def __init__(self, model: nn.Module, *, dim_split: bool = False):
         self.model = model
         self.dim_split = bool(dim_split)
+        self.num_heads, self.head_dim, self.num_prefix_tokens = _capture_dims(model)
+        self.embed_dim = self.num_heads * self.head_dim
 
     def _decode(
         self, concept_id, num_prefix_tokens: int, embed_dim: int,
@@ -485,13 +470,11 @@ class RegisterTokenConcept(ChannelConcept):
         )
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
-        attn = _layer_attn(self.model, layer_name)
-        embed_dim = int(attn.num_heads) * int(attn.head_dim)
-        npt = _num_prefix_tokens(self.model)
+        embed_dim, npt = self.embed_dim, self.num_prefix_tokens
         if npt <= 0:
             raise ValueError(
                 f"RegisterTokenConcept needs num_prefix_tokens > 0; the "
-                f"attention at {layer_name!r} has num_prefix_tokens={npt}."
+                f"model has num_prefix_tokens={npt}."
             )
         decoded = [self._decode(cid, npt, embed_dim) for cid in concept_ids]
 
@@ -528,7 +511,7 @@ class RegisterTokenConcept(ChannelConcept):
         layer_name: Optional[str] = None,
         abs_norm: bool = True,
     ) -> torch.Tensor:
-        npt = _num_prefix_tokens(self.model)
+        npt = self.num_prefix_tokens
         if isinstance(mask, torch.Tensor):
             relevance = relevance * mask
         # (B, N, embed_dim) → keep prefix tokens only → (B, num_prefix_tokens, embed_dim).

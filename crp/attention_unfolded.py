@@ -572,9 +572,17 @@ class TimmAttentionUnfolded(nn.Module):
     ----------
     orig : timm.models.vision_transformer.Attention
         Source module to wrap.
+    num_prefix_tokens : int
+        Number of leading (non-spatial) tokens in the model's sequence —
+        ``1`` for the standard ``cls``-only setup, more if the model was
+        built with ``reg_tokens > 0``. Stock timm ``Attention`` does not
+        carry this attribute (only the top-level ``VisionTransformer``
+        does), so the substitution canonizer is responsible for passing
+        it in at construction time. Default ``1`` matches the most common
+        case but the canonizer always overrides it.
     """
 
-    def __init__(self, orig) -> None:
+    def __init__(self, orig, *, num_prefix_tokens: int = 1) -> None:
         super().__init__()
         if not (
             hasattr(orig, "qkv")
@@ -593,8 +601,7 @@ class TimmAttentionUnfolded(nn.Module):
             self.head_dim = int(orig.head_dim)
         else:
             self.head_dim = int(orig.qkv.weight.shape[0] // 3 // self.num_heads)
-        # Standard timm ViT has 1 cls token, no register tokens.
-        self.num_prefix_tokens = 1
+        self.num_prefix_tokens = int(num_prefix_tokens)
         # Scale: stock timm sets self.scale = head_dim ** -0.5
         self.scale = float(getattr(orig, "scale", self.head_dim ** -0.5))
 
@@ -728,6 +735,13 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
         except ImportError:
             return []
 
+        # Stock timm `Attention` does not carry `num_prefix_tokens`. The
+        # value lives on the top-level `VisionTransformer` instance and the
+        # canonizer is the right place to read it once and mediate it down
+        # to each unfolded replacement. ``getattr`` with a fallback to 1
+        # handles bare attentions used in tests.
+        num_prefix_tokens = int(getattr(root_module, "num_prefix_tokens", 1))
+
         instances: List[TimmAttentionSubstitutionCanonizer] = []
         for parent_name, parent in root_module.named_modules():
             for attr_name, child in parent.named_children():
@@ -738,7 +752,7 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
                     if block_idx is None or block_idx not in self.block_indices:
                         continue
                 inst = self.copy()
-                inst.register(parent, attr_name, child)
+                inst.register(parent, attr_name, child, num_prefix_tokens=num_prefix_tokens)
                 instances.append(inst)
         return instances
 
@@ -747,11 +761,13 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
         parent: nn.Module,
         attr_name: str,
         original: nn.Module,
+        *,
+        num_prefix_tokens: int = 1,
     ) -> None:
         self.parent = parent
         self.attr_name = attr_name
         self.original_module = original
-        unfolded = TimmAttentionUnfolded(original)
+        unfolded = TimmAttentionUnfolded(original, num_prefix_tokens=num_prefix_tokens)
         setattr(parent, attr_name, unfolded)
         self.unfolded_module = unfolded
 
