@@ -171,6 +171,7 @@ def cache_cmd(
     print("\nbuilding base (frozen)")
     base_obj = build_base(base).to(device)
     transform = base_obj.get_transform()
+    normalize = base_obj.get_normalize()
     print(f"  embed_dim={base_obj.embed_dim}")
 
     print("\nloading dataset")
@@ -179,7 +180,11 @@ def cache_cmd(
     )
     print(f"  {dataset}: {len(ds)} images, {ds.num_classes} classes")
 
-    extract = base_obj.extract_cls if kind == "cls" else base_obj.extract_tokens
+    # Dataset yields unnormalized [0,1] tensors. Normalize at the forward
+    # boundary so the model sees its expected input distribution while
+    # the dataset stays display-ready and reusable.
+    _extract = base_obj.extract_cls if kind == "cls" else base_obj.extract_tokens
+    extract = lambda x: _extract(normalize(x))
     out_dtype = torch.float32 if kind == "cls" else torch.float16
 
     print(f"\nextracting features ({kind}, dtype={out_dtype})", flush=True)
@@ -505,10 +510,15 @@ class _FinetuneLM(L.LightningModule):
     def __init__(
         self, model, num_classes: int,
         backbone_lr: float, head_lr: float, weight_decay: float,
+        normalize=None,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(ignore=["model"])
+        self.save_hyperparameters(ignore=["model", "normalize"])
         self.model = model
+        # Datasets emit unnormalized [0,1] tensors. Apply the per-batch
+        # normalize at the forward boundary (canonical Lightning pattern).
+        # Defaults to identity if not provided.
+        self.normalize = normalize if normalize is not None else (lambda t: t)
         kw = dict(num_classes=num_classes)
         self.train_acc = MulticlassAccuracy(**kw)
         self.val_acc = MulticlassAccuracy(**kw)
@@ -516,7 +526,7 @@ class _FinetuneLM(L.LightningModule):
 
     def _step(self, batch, stage, acc, acc5=None):
         x, y = batch
-        logits = self.model(x)
+        logits = self.model(self.normalize(x))
         loss = F.cross_entropy(logits, y)
         acc(logits, y)
         self.log(f"{stage}_loss", loss, prog_bar=True, on_epoch=True, on_step=False)
@@ -543,8 +553,11 @@ class _FinetuneLM(L.LightningModule):
 
 
 def _make_train_transform(base_obj):
-    """Augmented training transform: random crop + flip + rotation, then
-    the backbone's standard normalize.
+    """Augmented training transform: random crop + flip + rotation +
+    ``ToTensor`` only. No normalize — Lightning's `_FinetuneLM` applies
+    normalize at the forward boundary so the dataset stays uniform with
+    the eval transform (which is also unnormalized) and stays
+    display-ready.
 
     Crop scale leaves at least 70% of the image visible (FunnyBirds birds
     fill most of the frame); rotation is small (±15°) since the synthetic
@@ -553,19 +566,16 @@ def _make_train_transform(base_obj):
     """
     from torchvision.transforms import (
         Compose, RandomResizedCrop, RandomHorizontalFlip, RandomRotation,
-        ToTensor, Normalize,
+        ToTensor,
     )
     from timm.data import resolve_data_config
     cfg = resolve_data_config({}, model=base_obj.backbone)
     size = cfg["input_size"][-1]
-    mean = cfg["mean"]
-    std = cfg["std"]
     return Compose([
         RandomResizedCrop(size, scale=(0.7, 1.0), interpolation=3),
         RandomHorizontalFlip(p=0.5),
         RandomRotation(degrees=15),
         ToTensor(),
-        Normalize(mean=mean, std=std),
     ])
 
 
@@ -702,6 +712,7 @@ def finetune_cmd(
     lm = _FinetuneLM(
         model, num_classes=num_classes,
         backbone_lr=backbone_lr, head_lr=head_lr, weight_decay=weight_decay,
+        normalize=base_obj.get_normalize(),
     )
 
     ckpt_dir = out.parent / "_lightning_ckpts" / out.stem

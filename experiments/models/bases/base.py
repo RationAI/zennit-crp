@@ -56,7 +56,40 @@ class Base(nn.Module):
         return self.backbone.forward_features(x)
 
     def get_transform(self):
-        """Return the timm input transform (resize + normalize) the
-        backbone was trained with."""
+        """Return the dataset-side input transform: resize + ``ToTensor``
+        only, NO normalize. Output is plain ``[0, 1]`` tensors —
+        display-ready, and uniform across all consumers (DataLoader,
+        FeatureVisualization, Lightning, raw ``model(x)``).
+
+        Normalize is the model's responsibility, applied at the forward
+        boundary via :meth:`get_normalize`. This split keeps the dataset
+        decoupled from the backbone's training stats: a dataset built
+        once can feed both an ImageNet-normalized timm ViT and a
+        no-normalize visinf checkpoint.
+        """
         cfg = resolve_data_config({}, model=self.backbone)
+        # Override mean/std to identity so the timm transform builder
+        # produces a normalize step that's a no-op. crop_pct, interp,
+        # input_size still come from cfg.
+        cfg = {**cfg, "mean": (0.0, 0.0, 0.0), "std": (1.0, 1.0, 1.0)}
         return create_transform(**cfg, is_training=False)
+
+    def get_normalize(self):
+        """Return the per-batch normalize callable ``(x - mean) / std``
+        with the backbone's canonical mean/std from ``pretrained_cfg``.
+
+        Apply this to a batch immediately before any backbone forward.
+        For models trained without normalize (e.g. the visinf vit_base
+        checkpoint, where the notebook's TRANSFORM_SPEC dispatcher sets
+        mean/std to identity), this is a no-op closure.
+        """
+        cfg = resolve_data_config({}, model=self.backbone)
+        mean = torch.tensor(cfg["mean"]).view(1, -1, 1, 1)
+        std = torch.tensor(cfg["std"]).view(1, -1, 1, 1)
+
+        def normalize(x: torch.Tensor) -> torch.Tensor:
+            m = mean.to(device=x.device, dtype=x.dtype)
+            s = std.to(device=x.device, dtype=x.dtype)
+            return (x - m) / s
+
+        return normalize

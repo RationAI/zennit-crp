@@ -21,12 +21,11 @@ All paths assume the model has been substituted with
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from timm.data import resolve_data_config
 
 from crp.attention_concepts import (
     HeadConcept,
@@ -41,13 +40,15 @@ from crp.attention_concepts import (
 # ─── image / heatmap helpers (lifted from experiments/viz.py) ────────────────
 
 
-def denormalize(image: torch.Tensor, model: torch.nn.Module) -> np.ndarray:
-    """Reverse the timm preprocessing. Returns ``(H, W, 3)`` in ``[0, 1]``."""
-    cfg = resolve_data_config({}, model=model)
-    mean = torch.tensor(cfg["mean"]).view(1, -1, 1, 1)
-    std = torch.tensor(cfg["std"]).view(1, -1, 1, 1)
+def to_display(image: torch.Tensor) -> np.ndarray:
+    """Convert a model-input tensor to a display-ready ``(H, W, 3)``
+    ndarray in ``[0, 1]``. No model dependency, no denormalize step —
+    dataset transforms emit unnormalized tensors, so display is just
+    clamp + permute. Accepts shape ``(1, 3, H, W)`` or ``(3, H, W)``.
+    """
     img = image.detach().cpu()
-    img = img * std + mean
+    if img.dim() == 3:
+        img = img.unsqueeze(0)
     return img.clamp(0, 1)[0].permute(1, 2, 0).numpy()
 
 
@@ -91,19 +92,26 @@ def attribute_at_concept(
     concept, concept_id, target_class: int,
     extra_conditions: Optional[dict] = None,
     exclude_parallel: bool = True,
+    preprocess_fn: Optional[Callable] = None,
 ) -> np.ndarray:
     """One conditional attribution → 2D input-space heatmap.
 
     ``cond = {layer_name: [concept_id], "y": [target_class]}``. The
     ``mask_map`` is the concept's ``mask`` method, which zeros out
     non-selected dimensions per the concept class's semantics.
+
+    ``preprocess_fn`` is the per-batch normalize step ``(x - mean) / std``;
+    applied to ``image`` before the forward pass. ``None`` means inputs
+    are already in the model's expected distribution (e.g. visinf
+    vit_base trained on raw ``[0, 1]``).
     """
     image.grad = None
+    x = image if preprocess_fn is None else preprocess_fn(image)
     cond = {layer_name: [concept_id], "y": [target_class]}
     if extra_conditions:
         cond.update(extra_conditions)
     res = attribution(
-        image, [cond], composite, mask_map=concept.mask,
+        x, [cond], composite, mask_map=concept.mask,
         exclude_parallel=exclude_parallel,
     )
     return _heatmap_2d(res.heatmap[0])
@@ -114,16 +122,21 @@ def per_concept_scores(
     concept, target_class: int,
     extra_conditions: Optional[dict] = None,
     exclude_parallel: bool = True,
+    preprocess_fn: Optional[Callable] = None,
 ) -> torch.Tensor:
     """Attribute toward target class, record at the concept's tap, reduce
     via ``concept.attribute``. Returns a flattened 1D tensor of per-id
-    scores in the concept's row-major id order."""
+    scores in the concept's row-major id order.
+
+    See :func:`attribute_at_concept` for the ``preprocess_fn`` contract.
+    """
     image.grad = None
+    x = image if preprocess_fn is None else preprocess_fn(image)
     cond = {"y": [target_class]}
     if extra_conditions:
         cond.update(extra_conditions)
     res = attribution(
-        image, [cond], composite,
+        x, [cond], composite,
         mask_map=concept.mask, record_layer=[layer_name],
         exclude_parallel=exclude_parallel,
     )
@@ -136,20 +149,17 @@ def per_concept_scores(
 
 
 def enumerate_ids(concept, layer_name: str) -> List:
-    """List all (sample) concept ids for a given concept + layer in
-    row-major order. Used for atlas plotting and FV indexing.
+    """List all concept ids for a given concept in row-major order.
 
-    Reads the dims live from the parent attention module — the layer
-    path's parent is looked up on the concept's stored model and queried
-    for ``num_heads`` / ``head_dim`` / ``num_prefix_tokens``. Works
-    whether the model's attention is stock or unfolded.
+    Reads dims from the concept's captured attributes (``num_heads``,
+    ``head_dim``, ``num_prefix_tokens``) — set at concept construction;
+    the ``layer_name`` argument is accepted for API symmetry but
+    unused (dims are model-wide invariants).
     """
-    from crp.attention_concepts import _layer_attn
-    attn = _layer_attn(concept.model, layer_name)
-    num_heads = int(attn.num_heads)
-    head_dim = int(attn.head_dim)
-    npt = int(getattr(attn, "num_prefix_tokens", 0))
-    if isinstance(concept, _PerHead := (HeadConcept, QConcept, KConcept, VConcept)):
+    num_heads = int(concept.num_heads)
+    head_dim = int(concept.head_dim)
+    npt = int(concept.num_prefix_tokens)
+    if isinstance(concept, (HeadConcept, QConcept, KConcept, VConcept)):
         if concept.dim_split:
             return [(h, d) for h in range(num_heads) for d in range(head_dim)]
         return list(range(num_heads))
@@ -189,21 +199,26 @@ def plot_concept_atlas(
     top_k: Optional[int] = None,
     cell_size: float = 4.0,
     title_prefix: Optional[str] = None,
+    preprocess_fn: Optional[Callable] = None,
 ) -> plt.Figure:
     """Generic atlas: one image+heatmap panel per (top-K-by-relevance)
     concept id, in concept-id order. Works for any of the 6 concept
-    classes, dispatched by their ``LAYER_SUFFIX``.
+    classes.
 
     ``top_k=None`` shows every concept id (atlas may get wide); pass an
     int to keep only the top-K by absolute per-concept relevance.
+
+    ``preprocess_fn`` is the normalize step applied to ``image`` before
+    each forward pass. See :func:`attribute_at_concept`.
     """
-    image_np = denormalize(image, model)
+    image_np = to_display(image)
     all_ids = enumerate_ids(concept, layer_name)
 
     # Per-concept relevance scores under no concept conditioning — used
     # to rank ids for the top-K selection.
     scores = per_concept_scores(
         attribution, composite, image, layer_name, concept, target_class,
+        preprocess_fn=preprocess_fn,
     )
     ranked_idx = torch.argsort(scores.abs(), descending=True).cpu().tolist()
     if top_k is not None:
@@ -220,6 +235,7 @@ def plot_concept_atlas(
     for ax, cid, sc in zip(axes, ids, scores_kept):
         hm = attribute_at_concept(
             attribution, composite, image, layer_name, concept, cid, target_class,
+            preprocess_fn=preprocess_fn,
         )
         panel(ax, image_np, hm)
         ax.set_title(f"{label_id(concept, cid)}\nscore={sc:.2e}", fontsize=8)
@@ -275,7 +291,7 @@ def plot_reference_samples(
         imgs = ref[cid] if isinstance(ref, dict) else ref
         for ax, img in zip(axes[row], imgs[:n_refs]):
             if hasattr(img, "detach"):
-                img_np = denormalize(img.unsqueeze(0) if img.dim() == 3 else img, fv.attribution.model)
+                img_np = to_display(img)
             else:
                 img_np = np.asarray(img)
             ax.imshow(np.clip(img_np, 0, 1))
@@ -298,6 +314,7 @@ def plot_cascade(
     attribution, composite, *,
     concept, layer_names: Sequence[str], target_class: int,
     top_k: int = 4, cell_size: float = 4.0,
+    preprocess_fn: Optional[Callable] = None,
 ) -> Tuple[plt.Figure, Dict[str, List]]:
     """Incremental conditional cascade: walk ``layer_names`` (a list of
     fully-qualified hookable submodule paths, deep → shallow). At each
@@ -314,7 +331,7 @@ def plot_cascade(
     Returns ``(fig, selected)`` where ``selected[layer_name]`` is the
     list of concept ids chosen at that depth (in order of relevance).
     """
-    image_np = denormalize(image, model)
+    image_np = to_display(image)
     selected: Dict[str, List] = {}
     extra_conditions: Dict[str, List] = {}
 
@@ -333,6 +350,7 @@ def plot_cascade(
             attribution, composite, image, layer_name, concept, target_class,
             extra_conditions=extra_conditions,
             exclude_parallel=False,  # cascade needs unified backward
+            preprocess_fn=preprocess_fn,
         )
         ranked = torch.argsort(scores.abs(), descending=True).cpu().tolist()
         kept_idx = ranked[:top_k]
@@ -343,6 +361,7 @@ def plot_cascade(
             hm = attribute_at_concept(
                 attribution, composite, image, layer_name, concept, cid, target_class,
                 extra_conditions=extra_conditions, exclude_parallel=False,
+                preprocess_fn=preprocess_fn,
             )
             panel(ax, image_np, hm)
             ax.set_title(f"{layer_name.split('.')[-2]} {label_id(concept, cid)}", fontsize=7)
@@ -358,7 +377,7 @@ def plot_cascade(
 
 
 __all__ = [
-    "denormalize", "panel",
+    "to_display", "panel",
     "attribute_at_concept", "per_concept_scores",
     "enumerate_ids", "label_id",
     "plot_concept_atlas",
