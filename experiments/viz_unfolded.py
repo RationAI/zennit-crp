@@ -104,12 +104,23 @@ def attribute_at_concept(
     applied to ``image`` before the forward pass. ``None`` means inputs
     are already in the model's expected distribution (e.g. visinf
     vit_base trained on raw ``[0, 1]``).
+
+    When ``preprocess_fn`` is supplied, we make the **normalized** tensor
+    a fresh leaf (``detach().requires_grad_(True)``) so that
+    ``CondAttribution`` can populate ``.grad`` on it during backward.
+    The heatmap lands in normalize-output space, which is spatially
+    equivalent to input space for any per-channel affine normalize
+    (the operation is just a per-channel rescale + shift; channels are
+    summed in the heatmap reduction).
     """
-    image.grad = None
-    x = image if preprocess_fn is None else preprocess_fn(image)
     cond = {layer_name: [concept_id], "y": [target_class]}
     if extra_conditions:
         cond.update(extra_conditions)
+    if preprocess_fn is None:
+        image.grad = None
+        x = image
+    else:
+        x = preprocess_fn(image).detach().requires_grad_(True)
     res = attribution(
         x, [cond], composite, mask_map=concept.mask,
         exclude_parallel=exclude_parallel,
@@ -130,11 +141,14 @@ def per_concept_scores(
 
     See :func:`attribute_at_concept` for the ``preprocess_fn`` contract.
     """
-    image.grad = None
-    x = image if preprocess_fn is None else preprocess_fn(image)
     cond = {"y": [target_class]}
     if extra_conditions:
         cond.update(extra_conditions)
+    if preprocess_fn is None:
+        image.grad = None
+        x = image
+    else:
+        x = preprocess_fn(image).detach().requires_grad_(True)
     res = attribution(
         x, [cond], composite,
         mask_map=concept.mask, record_layer=[layer_name],
