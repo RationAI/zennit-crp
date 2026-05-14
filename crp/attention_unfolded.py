@@ -291,6 +291,21 @@ class LayerScaleMul(nn.Module):
         return self.gamma * x
 
 
+class LRPInspectionLayer(nn.Identity):
+    """Identity placeholder marking a hookable site for LRP relevance
+    inspection.
+
+    Mathematically a no-op (just :class:`nn.Identity`). The reason it has
+    its own class name is so graphviz / torchview renders ``LRPInspectionLayer``
+    instead of an anonymous ``Identity`` node, and so
+    ``get_layer_names(model, [LRPInspectionLayer])`` can enumerate the
+    sites that concept classes are designed to hook (the ``q_lrp_probe``,
+    ``k_lrp_probe``, ``v_lrp_probe`` attributes on the unfolded attention
+    containers).
+    """
+    pass
+
+
 # ─── 2. Shared reshape helper ───────────────────────────────────────────────
 
 
@@ -392,12 +407,15 @@ class EvaAttentionUnfolded(nn.Module):
         self.softmax = SoftmaxAlongLastDim()
         self.context = BilinearMatmul()
         self.reshape = ReshapeMergeHeads()
-        # Identity hook points so concept-conditioning can target Q, K, V
-        # individually (post per-head reshape, before they enter the
-        # bilinear). q_norm / k_norm already exist as nn.Modules (LayerNorm
-        # or Identity) so they're hookable directly; V has no analog
-        # transformation, so we add an explicit Identity for symmetry.
-        self.v_relevance_inspection_point = nn.Identity()
+        # LRP inspection sites for HeadConcept / EmbeddingDimConcept hooking.
+        # Placed AFTER ``split``, BEFORE ``_to_heads`` — tensor shape is
+        # ``(B, N, embed_dim)``, identical to ``proj_drop`` output. One
+        # shape contract everywhere: HeadConcept slices embed_dim per-head
+        # internally; the per-head reshape is downstream and irrelevant
+        # to attribution.
+        self.q_lrp_probe = LRPInspectionLayer()
+        self.k_lrp_probe = LRPInspectionLayer()
+        self.v_lrp_probe = LRPInspectionLayer()
 
     def forward(
         self,
@@ -410,11 +428,13 @@ class EvaAttentionUnfolded(nn.Module):
 
         qkv_flat = self.qkv(x)
         q_flat, k_flat, v_flat = self.split(qkv_flat)
+        q_flat = self.q_lrp_probe(q_flat)
+        k_flat = self.k_lrp_probe(k_flat)
+        v_flat = self.v_lrp_probe(v_flat)
 
         q = _to_heads(q_flat, self.num_heads, self.head_dim)
         k = _to_heads(k_flat, self.num_heads, self.head_dim)
         v = _to_heads(v_flat, self.num_heads, self.head_dim)
-        v = self.v_relevance_inspection_point(v)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -569,8 +589,10 @@ class TimmAttentionUnfolded(nn.Module):
     its parameter-bearing submodules (``qkv``, ``q_norm``, ``k_norm``,
     ``proj``, ``attn_drop``, ``proj_drop``, optional ``norm``) by
     attribute, and exposes hookable atomic ops so the AttnLRP composite
-    can canonize them and the concept classes can target ``q_relevance_inspection_point`` /
-    ``k_relevance_inspection_point`` / ``v_relevance_inspection_point`` / ``context`` / ``proj_drop``.
+    can canonize them and the concept classes can target
+    ``q_lrp_probe`` / ``k_lrp_probe`` / ``v_lrp_probe`` / ``proj_drop``
+    (all 3D ``(B, N, embed_dim)``) and ``context`` (4D, attention output
+    pre-merge).
 
     Forward signature: ``(x, attn_mask=None, is_causal=False)``. Mirrors
     stock ``timm.models.vision_transformer.Attention.forward`` so the
@@ -644,14 +666,14 @@ class TimmAttentionUnfolded(nn.Module):
         self.softmax = SoftmaxAlongLastDim()
         self.context = BilinearMatmul()
         self.reshape = ReshapeMergeHeads()
-        # Identity hook points for Q / K / V concepts. q_relevance_inspection_point is placed
-        # AFTER q_norm so the recorded tensor reflects all per-tensor
-        # transformations the concept "should see"; symmetric for k_relevance_inspection_point.
-        # v_relevance_inspection_point has no norm in stock timm, so it sits right after the
-        # per-head reshape (same as in EvaAttentionUnfolded).
-        self.q_relevance_inspection_point = nn.Identity()
-        self.k_relevance_inspection_point = nn.Identity()
-        self.v_relevance_inspection_point = nn.Identity()
+        # LRP inspection sites. Placed AFTER ``split``, BEFORE
+        # ``_to_heads`` — tensor shape is ``(B, N, embed_dim)``, identical
+        # to ``proj_drop`` output. HeadConcept slices embed_dim per-head
+        # internally; q_norm / k_norm and the per-head reshape are
+        # downstream and not inspected through these probes.
+        self.q_lrp_probe = LRPInspectionLayer()
+        self.k_lrp_probe = LRPInspectionLayer()
+        self.v_lrp_probe = LRPInspectionLayer()
 
     def forward(
         self,
@@ -663,6 +685,9 @@ class TimmAttentionUnfolded(nn.Module):
 
         qkv_flat = self.qkv(x)
         q_flat, k_flat, v_flat = self.split(qkv_flat)
+        q_flat = self.q_lrp_probe(q_flat)
+        k_flat = self.k_lrp_probe(k_flat)
+        v_flat = self.v_lrp_probe(v_flat)
 
         q = _to_heads(q_flat, self.num_heads, self.head_dim)
         k = _to_heads(k_flat, self.num_heads, self.head_dim)
@@ -670,9 +695,6 @@ class TimmAttentionUnfolded(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q = self.q_relevance_inspection_point(q)
-        k = self.k_relevance_inspection_point(k)
-        v = self.v_relevance_inspection_point(v)
 
         q = self.scale_q(q)
         scores = self.qk_scores(q, k.transpose(-2, -1))
@@ -1096,6 +1118,7 @@ __all__ = [
     "ChunkAlongLastDim",
     "ReshapeMergeHeads",
     "LayerScaleMul",
+    "LRPInspectionLayer",
     # Containers + substitution canonizers
     "EvaAttentionUnfolded",
     "EvaAttentionSubstitutionCanonizer",

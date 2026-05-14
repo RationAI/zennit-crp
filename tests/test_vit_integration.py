@@ -26,9 +26,8 @@ zennit = pytest.importorskip("zennit")
 
 from crp.attention_concepts import (
     HeadConcept,
-    QConcept,
-    AttnOutputDimConcept,
-    RegisterTokenConcept,
+    EmbeddingDimConcept,
+    TokenConcept,
 )
 from crp.attention_unfolded import (
     EvaAttentionUnfolded,
@@ -234,13 +233,16 @@ class TestEvaUnfoldedIntegration:
         composite = AttnLRPCombinedComposite(
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
-        # Concept just stores a model reference; dims are read live from
-        # the parent attention module at every call. Works inside or
-        # outside the composite context.
-        concept = HeadConcept(eva_tiny)
+        # HeadConcept now operates on 3D `(B, N, embed_dim)` tensors
+        # at any LRP inspection site. Hookable at q_lrp_probe / k_lrp_probe
+        # / v_lrp_probe (post-qkv-split, pre-reshape) or at proj_drop
+        # (attention output). Construction is model-free; num_heads passed
+        # explicitly.
+        num_heads = int(eva_tiny.blocks[0].attn.num_heads)
+        concept = HeadConcept(num_heads=num_heads)
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
-        layer = f"blocks.{target_block}.attn.context"
+        layer = f"blocks.{target_block}.attn.proj_drop"
         H = eva_tiny.default_cfg.get("input_size", (3, 224, 224))[-1]
         if img224.shape[-1] != H:
             img224 = torch.randn(1, 3, H, H, requires_grad=True)
@@ -250,14 +252,18 @@ class TestEvaUnfoldedIntegration:
         )
         assert res.heatmap.shape[-1] == H
 
-    def test_q_concept_attribution_on_eva(self, eva_tiny, img224):
+    def test_head_concept_at_q_lrp_probe(self, eva_tiny, img224):
+        """HeadConcept at the q_lrp_probe site — same shape contract as
+        proj_drop, different semantic interpretation (which heads' query
+        subspace was populated by which input pixels)."""
         composite = AttnLRPCombinedComposite(
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
-        concept = QConcept(eva_tiny)
+        num_heads = int(eva_tiny.blocks[0].attn.num_heads)
+        concept = HeadConcept(num_heads=num_heads)
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
-        layer = f"blocks.{target_block}.attn.rope_q"
+        layer = f"blocks.{target_block}.attn.q_lrp_probe"
         H = eva_tiny.default_cfg.get("input_size", (3, 224, 224))[-1]
         if img224.shape[-1] != H:
             img224 = torch.randn(1, 3, H, H, requires_grad=True)
@@ -267,11 +273,12 @@ class TestEvaUnfoldedIntegration:
         )
         assert res.heatmap.shape[-1] == H
 
-    def test_attn_output_concept_attribution_on_eva(self, eva_tiny, img224):
+    def test_embedding_dim_concept_at_proj_drop(self, eva_tiny, img224):
         composite = AttnLRPCombinedComposite(
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
-        concept = AttnOutputDimConcept(eva_tiny)
+        num_heads = int(eva_tiny.blocks[0].attn.num_heads)
+        concept = EmbeddingDimConcept(num_heads=num_heads)
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
         layer = f"blocks.{target_block}.attn.proj_drop"
@@ -285,32 +292,22 @@ class TestEvaUnfoldedIntegration:
         )
         assert res.heatmap.shape[-1] == H
 
-    def test_register_token_concept_attribution_on_eva(self, eva_tiny, img224):
-        """RegisterTokenConcept addresses the prefix (cls + register)
-        tokens at the attention block's residual contribution. Auto-
-        registration must pick up num_prefix_tokens from the unfolded
-        attention. Some Eva variants have num_prefix_tokens=0 (no register
-        tokens); skip those — RegisterTokenConcept is meaningful only when
-        prefix tokens exist."""
+    def test_token_concept_at_proj_drop(self, eva_tiny, img224):
+        """TokenConcept addresses individual token positions at proj_drop.
+        Model-free constructor; concept ids index positions in the
+        post-filter universe (default = all tokens)."""
         composite = AttnLRPCombinedComposite(
             alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
         )
-        concept = RegisterTokenConcept(eva_tiny)
+        concept = TokenConcept()
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2
         layer = f"blocks.{target_block}.attn.proj_drop"
-        # Read num_prefix_tokens from the attention to decide whether to skip.
-        npt = int(getattr(eva_tiny.blocks[target_block].attn, "num_prefix_tokens", 0))
-        if npt == 0:
-            pytest.skip(
-                f"Eva variant has num_prefix_tokens=0; RegisterTokenConcept "
-                f"requires npt > 0"
-            )
         H = eva_tiny.default_cfg.get("input_size", (3, 224, 224))[-1]
         if img224.shape[-1] != H:
             img224 = torch.randn(1, 3, H, H, requires_grad=True)
         attribution = CondAttribution(eva_tiny)
-        # Condition on the cls token (always token_id=0 by convention).
+        # Condition on token position 0 (cls token by convention).
         res = attribution(
             img224, [{layer: [0], "y": [42]}], composite,
             mask_map=concept.mask,

@@ -661,13 +661,22 @@ class TestTimmAttentionUnfolded:
                 inst.remove()
 
     def test_exposes_concept_hook_submodules(self, synthetic_timm_attention):
-        """The unfolded form must expose the named submodules our concept
-        classes target: context (HeadConcept), q_relevance_inspection_point/k_relevance_inspection_point/v_relevance_inspection_point (Q/K/V),
-        proj_drop (AttnOutputDim / RegisterToken)."""
-        from crp.attention_unfolded import TimmAttentionUnfolded
+        """The unfolded form must expose the named LRP-inspection submodules
+        the concept classes target: q_lrp_probe / k_lrp_probe / v_lrp_probe
+        (3D, post qkv split), proj_drop (3D, attention output), context
+        (4D, pre-merge), plus qk_scores / softmax for diagnostics."""
+        from crp.attention_unfolded import (
+            TimmAttentionUnfolded,
+            LRPInspectionLayer,
+        )
         unfolded = TimmAttentionUnfolded(synthetic_timm_attention)
-        for name in ("context", "q_relevance_inspection_point", "k_relevance_inspection_point", "v_relevance_inspection_point", "proj_drop", "qk_scores", "softmax"):
+        for name in (
+            "context", "q_lrp_probe", "k_lrp_probe", "v_lrp_probe",
+            "proj_drop", "qk_scores", "softmax",
+        ):
             assert hasattr(unfolded, name), f"missing hookable submodule: {name}"
+        for probe_name in ("q_lrp_probe", "k_lrp_probe", "v_lrp_probe"):
+            assert isinstance(getattr(unfolded, probe_name), LRPInspectionLayer)
 
 
 # ─── 11. TimmAttentionSubstitutionCanonizer ────────────────────────────────
