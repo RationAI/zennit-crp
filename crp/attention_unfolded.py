@@ -384,7 +384,7 @@ class EvaAttentionUnfolded(nn.Module):
         # bilinear). q_norm / k_norm already exist as nn.Modules (LayerNorm
         # or Identity) so they're hookable directly; V has no analog
         # transformation, so we add an explicit Identity for symmetry.
-        self.v_id = nn.Identity()
+        self.v_relevance_inspection_point = nn.Identity()
 
     def forward(
         self,
@@ -404,7 +404,7 @@ class EvaAttentionUnfolded(nn.Module):
         q = _to_heads(q_flat)
         k = _to_heads(k_flat)
         v = _to_heads(v_flat)
-        v = self.v_id(v)
+        v = self.v_relevance_inspection_point(v)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -559,8 +559,8 @@ class TimmAttentionUnfolded(nn.Module):
     its parameter-bearing submodules (``qkv``, ``q_norm``, ``k_norm``,
     ``proj``, ``attn_drop``, ``proj_drop``, optional ``norm``) by
     attribute, and exposes hookable atomic ops so the AttnLRP composite
-    can canonize them and the concept classes can target ``q_id`` /
-    ``k_id`` / ``v_id`` / ``context`` / ``proj_drop``.
+    can canonize them and the concept classes can target ``q_relevance_inspection_point`` /
+    ``k_relevance_inspection_point`` / ``v_relevance_inspection_point`` / ``context`` / ``proj_drop``.
 
     Forward signature: ``(x, attn_mask=None, is_causal=False)`` — matches
     the stock timm `Attention.forward` exactly. Numerical output is
@@ -628,14 +628,14 @@ class TimmAttentionUnfolded(nn.Module):
         self.softmax = SoftmaxAlongLastDim()
         self.context = BilinearMatmul()
         self.reshape = ReshapeMergeHeads()
-        # Identity hook points for Q / K / V concepts. q_id is placed
+        # Identity hook points for Q / K / V concepts. q_relevance_inspection_point is placed
         # AFTER q_norm so the recorded tensor reflects all per-tensor
-        # transformations the concept "should see"; symmetric for k_id.
-        # v_id has no norm in stock timm, so it sits right after the
+        # transformations the concept "should see"; symmetric for k_relevance_inspection_point.
+        # v_relevance_inspection_point has no norm in stock timm, so it sits right after the
         # per-head reshape (same as in EvaAttentionUnfolded).
-        self.q_id = nn.Identity()
-        self.k_id = nn.Identity()
-        self.v_id = nn.Identity()
+        self.q_relevance_inspection_point = nn.Identity()
+        self.k_relevance_inspection_point = nn.Identity()
+        self.v_relevance_inspection_point = nn.Identity()
 
     def forward(
         self,
@@ -657,9 +657,9 @@ class TimmAttentionUnfolded(nn.Module):
 
         q = self.q_norm(q)
         k = self.k_norm(k)
-        q = self.q_id(q)
-        k = self.k_id(k)
-        v = self.v_id(v)
+        q = self.q_relevance_inspection_point(q)
+        k = self.k_relevance_inspection_point(k)
+        v = self.v_relevance_inspection_point(v)
 
         q = self.scale_q(q)
         scores = self.qk_scores(q, k.transpose(-2, -1))

@@ -167,7 +167,7 @@ class TestQKVConcepts:
     @pytest.mark.parametrize("cls,leaf", [
         (QConcept, "rope_q"),
         (KConcept, "rope_k"),
-        (VConcept, "v_id"),
+        (VConcept, "v_relevance_inspection_point"),
     ])
     def test_per_head_mask(self, model_no_prefix, per_head_relevance, cls, leaf):
         c = cls(model_no_prefix)
@@ -180,7 +180,7 @@ class TestQKVConcepts:
         assert torch.equal(masked[0], per_head_relevance[0])
 
     @pytest.mark.parametrize("cls,leaf", [
-        (QConcept, "rope_q"), (KConcept, "rope_k"), (VConcept, "v_id"),
+        (QConcept, "rope_q"), (KConcept, "rope_k"), (VConcept, "v_relevance_inspection_point"),
     ])
     def test_attribute_shape(self, model_no_prefix, per_head_relevance, cls, leaf):
         c = cls(model_no_prefix)
@@ -188,7 +188,7 @@ class TestQKVConcepts:
         assert rel.shape == (B, NUM_HEADS)
 
     @pytest.mark.parametrize("cls,leaf", [
-        (QConcept, "rope_q"), (KConcept, "rope_k"), (VConcept, "v_id"),
+        (QConcept, "rope_q"), (KConcept, "rope_k"), (VConcept, "v_relevance_inspection_point"),
     ])
     def test_dim_split(self, model_no_prefix, per_head_relevance, cls, leaf):
         c = cls(model_no_prefix, dim_split=True)

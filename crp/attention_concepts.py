@@ -19,7 +19,7 @@ specific submodule of the unfolded Eva attention:
 * :class:`HeadConcept`              → ``...attn.context``
 * :class:`QConcept`                 → ``...attn.rope_q``
 * :class:`KConcept`                 → ``...attn.rope_k``
-* :class:`VConcept`                 → ``...attn.v_id``
+* :class:`VConcept`                 → ``...attn.v_relevance_inspection_point``
 * :class:`AttnOutputDimConcept`     → ``...attn.proj_drop`` (spatial tokens only)
 * :class:`RegisterTokenConcept`     → ``...attn.proj_drop`` (prefix tokens only)
 
@@ -289,7 +289,7 @@ class KConcept(_PerHeadAttentionConcept):
 class VConcept(_PerHeadAttentionConcept):
     """One concept per attention head's V vector (post per-head reshape).
 
-    **Pass** ``layer_name`` **=** the path to ``...attn.v_id`` (an
+    **Pass** ``layer_name`` **=** the path to ``...attn.v_relevance_inspection_point`` (an
     ``nn.Identity`` placed after the per-head reshape so V is hookable;
     V is otherwise reshape-only between the qkv split and the bilinear).
     Tensor: ``(B, num_heads, N, head_dim)``.

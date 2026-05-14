@@ -662,11 +662,11 @@ class TestTimmAttentionUnfolded:
 
     def test_exposes_concept_hook_submodules(self, synthetic_timm_attention):
         """The unfolded form must expose the named submodules our concept
-        classes target: context (HeadConcept), q_id/k_id/v_id (Q/K/V),
+        classes target: context (HeadConcept), q_relevance_inspection_point/k_relevance_inspection_point/v_relevance_inspection_point (Q/K/V),
         proj_drop (AttnOutputDim / RegisterToken)."""
         from crp.attention_unfolded import TimmAttentionUnfolded
         unfolded = TimmAttentionUnfolded(synthetic_timm_attention)
-        for name in ("context", "q_id", "k_id", "v_id", "proj_drop", "qk_scores", "softmax"):
+        for name in ("context", "q_relevance_inspection_point", "k_relevance_inspection_point", "v_relevance_inspection_point", "proj_drop", "qk_scores", "softmax"):
             assert hasattr(unfolded, name), f"missing hookable submodule: {name}"
 
 

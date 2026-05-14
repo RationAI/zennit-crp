@@ -5,7 +5,7 @@ to the new attention-unfolded concept classes:
 
 * :class:`crp.attention_concepts.HeadConcept` (per-head, optional dim_split)
 * :class:`crp.attention_concepts.QConcept` / :class:`KConcept` / :class:`VConcept`
-  (per-head, optional dim_split, target rope_q / rope_k / v_id)
+  (per-head, optional dim_split, target rope_q / rope_k / v_relevance_inspection_point)
 * :class:`crp.attention_concepts.AttnOutputDimConcept` (per-channel, spatial-aggregated)
 * :class:`crp.attention_concepts.RegisterTokenConcept` (per prefix token)
 
@@ -232,7 +232,7 @@ def row_label(concept, cid, layer_name: str) -> str:
         blocks.22.attn.context
         H1,D15
 
-        blocks.5.attn.q_id
+        blocks.5.attn.q_relevance_inspection_point
         H0,Q
     """
     # Strip the ``backbone.`` prefix and any leading module wrapping —
