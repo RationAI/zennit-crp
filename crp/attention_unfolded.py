@@ -519,12 +519,17 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
                 instances.append(inst)
         return instances
 
-    def register(
+    def register(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         parent: nn.Module,
         attr_name: str,
         original: nn.Module,
     ) -> None:
+        # Signature intentionally differs from ``Canonizer.register(self)``;
+        # zennit's own canonizers (e.g. ``MergeBatchNorm.register(linears,
+        # batch_norm)``) do the same — ABC enforces method NAME, not
+        # signature, and zennit's lifecycle calls ``apply()`` which then
+        # dispatches to this overload.
         self.parent = parent
         self.attr_name = attr_name
         self.original_module = original
@@ -756,7 +761,7 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
                 instances.append(inst)
         return instances
 
-    def register(
+    def register(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         parent: nn.Module,
         attr_name: str,
@@ -764,6 +769,9 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
         *,
         num_prefix_tokens: int = 1,
     ) -> None:
+        # See note on ``EvaAttentionSubstitutionCanonizer.register`` —
+        # zennit's lifecycle dispatches through ``apply()``; the ABC
+        # only requires the method name.
         self.parent = parent
         self.attr_name = attr_name
         self.original_module = original
@@ -818,7 +826,8 @@ class _SoftmaxIdentityRuleFn(Function):
         return F.softmax(x, dim=-1)
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, *grad_outputs):
+        (grad_out,) = grad_outputs
         return grad_out
 
 
@@ -836,7 +845,8 @@ class _ScaleIdentityRuleFn(Function):
         return x * scalar
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, *grad_outputs):
+        (grad_out,) = grad_outputs
         return grad_out, None
 
 
@@ -884,7 +894,8 @@ class _AlphaBetaMatmulFn(Function):
         return out
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(ctx, *grad_outputs):
+        (grad_out,) = grad_outputs
         a_pos, a_neg, b_pos, b_neg, y_pos, y_neg = ctx.saved_tensors
         eps = ctx.epsilon
         alpha = ctx.alpha

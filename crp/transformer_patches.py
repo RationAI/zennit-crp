@@ -164,7 +164,8 @@ class _ResidualRatioFn(Function):
         return x + branch
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, *grad_outputs):
+        (grad_output,) = grad_outputs
         x, branch = ctx.saved_tensors
         abs_x = x.abs()
         abs_b = branch.abs()
