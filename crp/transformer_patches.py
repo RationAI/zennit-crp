@@ -57,6 +57,10 @@ import torch
 import torch.nn as nn
 from torch.autograd import Function
 
+from timm.layers.pos_embed import resample_abs_pos_embed
+from timm.models.eva import EvaBlock
+from timm.models.vision_transformer import Block as TimmBlock, VisionTransformer
+
 from zennit.canonizers import AttributeCanonizer, Canonizer, CompositeCanonizer
 from zennit.composites import LayerMapComposite
 from zennit.core import BasicHook, ParamMod, Stabilizer, stabilize
@@ -345,7 +349,6 @@ def vit_pos_embed_palrp(self, x):
         return torch.cat(to_cat + [x.view(x.shape[0], -1, x.shape[-1])], dim=1)
 
     if self.dynamic_img_size:
-        from timm.layers.pos_embed import resample_abs_pos_embed
         B, H, W, C = x.shape
         prev_grid_size = self.patch_embed.grid_size
         pos_embed = resample_abs_pos_embed(
@@ -490,10 +493,6 @@ class TimmBlockResidualCanonizer(AttributeCanonizer):
         super().__init__(self._attribute_map)
 
     def _attribute_map(self, _name, module):
-        try:
-            from timm.models.vision_transformer import Block as TimmBlock
-        except ImportError:
-            return None
         if not isinstance(module, TimmBlock):
             return None
         needed = ("ls1", "ls2", "drop_path1", "drop_path2", "norm1",
@@ -542,10 +541,6 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
         super().__init__(self._attribute_map)
 
     def _attribute_map(self, _name, module):
-        try:
-            from timm.models.eva import EvaBlock
-        except ImportError:
-            return None
         if not isinstance(module, EvaBlock):
             return None
         needed = ("drop_path1", "drop_path2", "norm1", "norm2", "attn", "mlp",
@@ -579,10 +574,6 @@ class VitPosEmbedPALRPCanonizer(AttributeCanonizer):
         super().__init__(self._attribute_map)
 
     def _attribute_map(self, _name, module):
-        try:
-            from timm.models.vision_transformer import VisionTransformer
-        except ImportError:
-            return None
         if not isinstance(module, VisionTransformer) or not hasattr(module, "_pos_embed"):
             return None
         return _bind_forward(module, vit_pos_embed_palrp, attr="_pos_embed")

@@ -80,6 +80,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 
+from timm.layers import apply_rot_embed_cat
+from timm.models.eva import EvaAttention
+from timm.models.vision_transformer import Attention as TimmAttention
+
 from zennit.canonizers import AttributeCanonizer, Canonizer
 
 
@@ -183,8 +187,6 @@ class RotaryEmbedding(nn.Module):
     ) -> torch.Tensor:
         if rope is None:
             return q
-        from timm.layers import apply_rot_embed_cat
-
         rope_used = rope.detach() if self.detach_rope else rope
         npt = self.num_prefix_tokens
         if npt == 0:
@@ -500,11 +502,6 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         self.unfolded_module: Optional[EvaAttentionUnfolded] = None
 
     def apply(self, root_module: nn.Module) -> List["EvaAttentionSubstitutionCanonizer"]:
-        try:
-            from timm.models.eva import EvaAttention
-        except ImportError:
-            return []
-
         instances: List[EvaAttentionSubstitutionCanonizer] = []
         for parent_name, parent in root_module.named_modules():
             for attr_name, child in parent.named_children():
@@ -735,11 +732,6 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
         self.unfolded_module: Optional[TimmAttentionUnfolded] = None
 
     def apply(self, root_module: nn.Module) -> List["TimmAttentionSubstitutionCanonizer"]:
-        try:
-            from timm.models.vision_transformer import Attention as TimmAttention
-        except ImportError:
-            return []
-
         # Stock timm `Attention` does not carry `num_prefix_tokens`. The
         # value lives on the top-level `VisionTransformer` instance and the
         # canonizer is the right place to read it once and mediate it down
