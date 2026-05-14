@@ -291,7 +291,20 @@ class LayerScaleMul(nn.Module):
         return self.gamma * x
 
 
-# ─── 2. Container: EvaAttentionUnfolded (vanilla forward) ───────────────────
+# ─── 2. Shared reshape helper ───────────────────────────────────────────────
+
+
+def _to_heads(t: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    """``(B, N, num_heads * head_dim) → (B, num_heads, N, head_dim)``.
+
+    Per-head reshape shared by :class:`EvaAttentionUnfolded` and
+    :class:`TimmAttentionUnfolded` forwards.
+    """
+    B, N, _ = t.shape
+    return t.reshape(B, N, num_heads, head_dim).transpose(1, 2)
+
+
+# ─── 3. Container: EvaAttentionUnfolded (vanilla forward) ───────────────────
 
 
 class EvaAttentionUnfolded(nn.Module):
@@ -398,12 +411,9 @@ class EvaAttentionUnfolded(nn.Module):
         qkv_flat = self.qkv(x)
         q_flat, k_flat, v_flat = self.split(qkv_flat)
 
-        def _to_heads(t: torch.Tensor) -> torch.Tensor:
-            return t.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-
-        q = _to_heads(q_flat)
-        k = _to_heads(k_flat)
-        v = _to_heads(v_flat)
+        q = _to_heads(q_flat, self.num_heads, self.head_dim)
+        k = _to_heads(k_flat, self.num_heads, self.head_dim)
+        v = _to_heads(v_flat, self.num_heads, self.head_dim)
         v = self.v_relevance_inspection_point(v)
 
         q = self.q_norm(q)
@@ -562,13 +572,19 @@ class TimmAttentionUnfolded(nn.Module):
     can canonize them and the concept classes can target ``q_relevance_inspection_point`` /
     ``k_relevance_inspection_point`` / ``v_relevance_inspection_point`` / ``context`` / ``proj_drop``.
 
-    Forward signature: ``(x, attn_mask=None, is_causal=False)`` — matches
-    the stock timm `Attention.forward` exactly. Numerical output is
-    bit-identical to stock when the source instance has
-    ``fused_attn=False`` (the explicit-math path); when ``fused_attn=True``
-    on the source, stock uses ``F.scaled_dot_product_attention`` which
-    can differ at fp32 noise level, but the substituted unfolded
-    instance takes the explicit path either way.
+    Forward signature: ``(x, attn_mask=None, is_causal=False)``. Mirrors
+    stock ``timm.models.vision_transformer.Attention.forward`` so the
+    substitution canonizer's ``setattr(parent, 'attn', unfolded)`` is
+    transparent to the calling block — the block keeps invoking
+    ``self.attn(x, attn_mask=…, is_causal=…)`` with no signature break.
+    For ViT image classification ``is_causal`` is always ``False``; the
+    kwarg is accepted but trivially unused on that path.
+
+    Numerical output is bit-identical to stock when the source has
+    ``fused_attn=False`` (explicit-math path); ``fused_attn=True`` source
+    uses ``F.scaled_dot_product_attention`` which can differ at fp32
+    noise level, but the substituted unfolded instance takes the
+    explicit path either way.
 
     Parameters
     ----------
@@ -648,12 +664,9 @@ class TimmAttentionUnfolded(nn.Module):
         qkv_flat = self.qkv(x)
         q_flat, k_flat, v_flat = self.split(qkv_flat)
 
-        def _to_heads(t: torch.Tensor) -> torch.Tensor:
-            return t.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-
-        q = _to_heads(q_flat)
-        k = _to_heads(k_flat)
-        v = _to_heads(v_flat)
+        q = _to_heads(q_flat, self.num_heads, self.head_dim)
+        k = _to_heads(k_flat, self.num_heads, self.head_dim)
+        v = _to_heads(v_flat, self.num_heads, self.head_dim)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
