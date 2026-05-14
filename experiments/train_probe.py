@@ -63,11 +63,19 @@ import torch.multiprocessing as _torch_mp
 import torch.nn.functional as F
 import typer
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-from torch.utils.data import DataLoader, TensorDataset, random_split
+from timm.data import resolve_data_config
+from torch.utils.data import DataLoader, Subset, TensorDataset, random_split
 from torchmetrics.classification import MulticlassAccuracy
+from torchvision.transforms import (
+    Compose,
+    RandomHorizontalFlip,
+    RandomResizedCrop,
+    RandomRotation,
+    ToTensor,
+)
 
 from experiments.datasets import load as load_dataset
-from experiments.models import BASES, HEADS, build_base, build_head
+from experiments.models import BASES, HEADS, build_base, build_head, build_probe
 
 # File-system sharing → DataLoader workers don't need /dev/shm
 # (containers cap it at 64 MB).
@@ -564,11 +572,6 @@ def _make_train_transform(base_obj):
     birds are rendered upright. Hflip is safe — birds are bilaterally
     symmetric.
     """
-    from torchvision.transforms import (
-        Compose, RandomResizedCrop, RandomHorizontalFlip, RandomRotation,
-        ToTensor,
-    )
-    from timm.data import resolve_data_config
     cfg = resolve_data_config({}, model=base_obj.backbone)
     size = cfg["input_size"][-1]
     return Compose([
@@ -659,7 +662,6 @@ def finetune_cmd(
     print(f"  out: {out}")
 
     print(f"\nbuilding model: {base_name} + {head_name}", flush=True)
-    from experiments.models import build_probe
     model = build_probe(
         base_name, head_name,
         num_classes=num_classes, head_kwargs=head_kwargs,
@@ -693,7 +695,6 @@ def finetune_cmd(
     perm = torch.randperm(n, generator=gen).tolist()
     val_idx = perm[:n_val]
     train_idx = perm[n_val:]
-    from torch.utils.data import Subset
     train_ds = Subset(ds_train, train_idx)
     val_ds = Subset(ds_val, val_idx)
     print(f"  split: train={len(train_ds)}, val={len(val_ds)}")

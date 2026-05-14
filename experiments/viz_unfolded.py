@@ -26,6 +26,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from PIL import Image as _PIL
 
 from crp.attention_concepts import (
     HeadConcept,
@@ -63,7 +64,6 @@ def panel(ax: plt.Axes, image_np: np.ndarray, heatmap_np: np.ndarray, *, cmap="s
     """Image + heatmap side-by-side on one axis."""
     H, W = image_np.shape[:2]
     if heatmap_np.shape != (H, W):
-        from PIL import Image as _PIL
         heatmap_np = np.array(
             _PIL.fromarray(heatmap_np.astype(np.float32), mode="F").resize(
                 (W, H), resample=_PIL.NEAREST,
