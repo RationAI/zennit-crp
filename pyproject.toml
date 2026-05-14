@@ -72,3 +72,8 @@ train-probe = "experiments.train_probe:app"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.409",
+]

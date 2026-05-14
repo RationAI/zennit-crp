@@ -63,8 +63,8 @@ from timm.models.vision_transformer import Block as TimmBlock, VisionTransformer
 
 from zennit.canonizers import AttributeCanonizer, Canonizer, CompositeCanonizer
 from zennit.composites import LayerMapComposite
-from zennit.core import BasicHook, ParamMod, Stabilizer, stabilize
-from zennit.rules import Epsilon, Gamma, GammaMod, NoMod, Pass
+from zennit.core import BasicHook, stabilize
+from zennit.rules import Epsilon, Gamma, Pass
 
 
 # ─── 1. Stabilizers ──────────────────────────────────────────────────────────
