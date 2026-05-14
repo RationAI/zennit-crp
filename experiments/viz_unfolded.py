@@ -14,10 +14,11 @@ read each concept's ``LAYER_SUFFIX`` and ``_dims`` registration to figure
 out the right hook point and id-space. The atlas helpers list concept ids,
 attribute one image, then plot one image+heatmap panel per id.
 
-All paths assume the model has been substituted with
-``EvaAttentionUnfolded`` via :class:`EvaAttentionSubstitutionCanonizer`
-(installed automatically by :class:`AttnLRPCombinedComposite` when
-``use_unfolded_attention=True``).
+All paths assume the model has been substituted with the unfolded
+attention variant via the relevant substitution canonizer
+(:class:`EvaAttentionSubstitutionCanonizer` or
+:class:`TimmAttentionSubstitutionCanonizer`), which
+:class:`AttnLRPCombinedComposite` installs unconditionally.
 """
 from __future__ import annotations
 

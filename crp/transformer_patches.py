@@ -460,16 +460,6 @@ class DropoutPassthroughCanonizer(AttributeCanonizer):
         return type(self)()
 
 
-# NOTE: ``TimmAttentionForwardCanonizer`` and ``EvaAttentionForwardCanonizer``
-# were removed in the always-unfold cleanup. All attention (standard timm
-# AND Eva) is now substituted with unfolded variants
-# (:class:`crp.attention_unfolded.TimmAttentionUnfolded`,
-# :class:`crp.attention_unfolded.EvaAttentionUnfolded`) by their respective
-# substitution canonizers. AttnLRP rules apply uniformly to both via the
-# per-rule canonizers (:class:`BilinearMatmulAlphaBetaCanonizer`,
-# :class:`SoftmaxIdentityCanonizer`, :class:`ScaleByConstantIdentityCanonizer`).
-
-
 class TimmBlockResidualCanonizer(AttributeCanonizer):
     """Canonizer that swaps ``forward`` on timm ``vision_transformer.Block``
     to apply a conservative LRP rule at each residual addition.

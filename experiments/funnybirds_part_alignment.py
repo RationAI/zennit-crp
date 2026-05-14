@@ -109,7 +109,6 @@ def main():
     print(f"loaded {len(ds)} test images, taking the first {args.n_images}")
 
     composite = AttnLRPCombinedComposite(
-        matmul_factor_2=True, use_unfolded_attention=True,
         alpha=args.alpha, beta=args.beta,
         layerscale_uniform=True, residual_lrp="ratio",
     )
