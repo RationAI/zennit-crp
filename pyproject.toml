@@ -76,4 +76,5 @@ addopts = "-ra"
 [dependency-groups]
 dev = [
     "pyright>=1.1.409",
+    "polars>=1.0",
 ]
