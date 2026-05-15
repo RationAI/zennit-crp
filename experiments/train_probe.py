@@ -71,6 +71,7 @@ from timm.data import resolve_data_config
 from torch.utils.data import DataLoader, Subset, TensorDataset, random_split
 from torchmetrics.classification import MulticlassAccuracy
 from torchvision.transforms import (
+    ColorJitter,
     Compose,
     RandAugment,
     RandomHorizontalFlip,
@@ -114,10 +115,22 @@ def probe_path(base: str, head: str, dataset: str) -> Path:
     return DATA_DIR / f"{base}_{head}_probe_{dataset}.pt"
 
 
-def _dataset_kwargs(dataset: str, dsprites_target: str, *, split: str = "train") -> dict:
+def _dataset_kwargs(
+    dataset: str, dsprites_target: str, *,
+    split: str = "train", dsprites_n_per_class: Optional[int] = None,
+    funny_birds_clean_only: bool = False,
+) -> dict:
     if dataset == "dsprites":
-        return {"target": dsprites_target}
-    if dataset in ("funny_birds", "imagenette", "colored_mnist"):
+        kw: dict = {"target": dsprites_target}
+        if dsprites_n_per_class is not None:
+            kw["n_per_class"] = dsprites_n_per_class
+        return kw
+    if dataset == "funny_birds":
+        kw = {"split": split}
+        if funny_birds_clean_only:
+            kw["clean_only"] = True
+        return kw
+    if dataset in ("imagenette", "colored_mnist"):
         return {"split": split}
     return {}
 
@@ -706,15 +719,18 @@ class _FinetuneLM(L.LightningModule):
         raise ValueError(f"unknown scheduler {self.hparams.scheduler!r}; choose 'none' or 'cosine'")
 
 
-def _make_train_transform(base_obj, *, randaugment: bool = False):
-    """Augmented training transform: optional ``RandAugment`` + random
-    crop + flip + rotation + ``ToTensor``. No normalize — Lightning's
-    ``_FinetuneLM`` applies normalize at the forward boundary so the
-    dataset stays uniform with the eval transform.
+def _make_train_transform(base_obj, *, randaugment: bool = False,
+                          colorjitter_hue: float = 0.0):
+    """Augmented training transform: optional ``RandAugment`` + optional
+    hue jitter + random crop + flip + rotation + ``ToTensor``. No
+    normalize — Lightning's ``_FinetuneLM`` applies normalize at the
+    forward boundary so the dataset stays uniform with the eval transform.
 
     Crop scale leaves at least 70% of the image visible; rotation is
     small (±15°). RandAugment composes 2 random ops at magnitude 9 —
-    the timm/AugReg default for ImageNet ViTs.
+    the timm/AugReg default for ImageNet ViTs. ``colorjitter_hue=0.5``
+    randomizes hue across the full circle — used for ColoredMNIST to
+    break the colour↔digit shortcut so the model has to learn shape.
     """
     cfg = resolve_data_config({}, model=base_obj.backbone)
     size = cfg["input_size"][-1]
@@ -723,6 +739,8 @@ def _make_train_transform(base_obj, *, randaugment: bool = False):
         RandomHorizontalFlip(p=0.5),
         RandomRotation(degrees=15),
     ]
+    if colorjitter_hue > 0:
+        ops.append(ColorJitter(hue=colorjitter_hue))
     if randaugment:
         # RandAugment runs on PIL images; insert before ToTensor.
         ops.append(RandAugment(num_ops=2, magnitude=9))
@@ -808,6 +826,13 @@ def finetune_cmd(
         False, "--randaugment",
         help="Stack RandAugment on top of the basic geometric augs.",
     ),
+    colorjitter_hue: float = typer.Option(
+        0.0, "--colorjitter-hue",
+        help="ColorJitter hue range (0 = off, 0.5 = full circle). For "
+             "ColoredMNIST set this to 0.5 to randomise hue at train "
+             "time and break the colour↔digit shortcut; without it, "
+             "the model latches onto colour and test acc collapses.",
+    ),
     mixup: float = typer.Option(
         0.0, "--mixup",
         help="Mixup α (Beta distribution). 0 = off; 0.8 = ImageNet ViT default.",
@@ -834,6 +859,23 @@ def finetune_cmd(
     warmup_epochs: int = typer.Option(
         0, "--warmup-epochs",
         help="(--scheduler cosine) Linear warmup epochs from lr×1e-6 to lr.",
+    ),
+    dsprites_target: str = typer.Option(
+        "shape", "--dsprites-target",
+        help="(dsprites only) Latent factor used as label.",
+    ),
+    dsprites_n_per_class: Optional[int] = typer.Option(
+        None, "--dsprites-n-per-class",
+        help="(dsprites only) Subsample to this many images per class. "
+             "Default = full 737k. Use ~5000-10000 for fast iteration; "
+             "the 3-class shape task is trivial enough that 30 k images "
+             "suffice for >99 % val_acc.",
+    ),
+    funny_birds_clean_only: bool = typer.Option(
+        True, "--funny-birds-clean-only/--funny-birds-all",
+        help="(funny_birds only) Filter train split to intact-bird samples "
+             "(~29 k of 50 k). Default True — matches the 98 % advertised "
+             "test accuracy.",
     ),
     output_dir: Optional[Path] = typer.Option(
         None, "--output-dir",
@@ -880,7 +922,11 @@ def finetune_cmd(
         head_kwargs: dict = {}
         # num_classes comes from the dataset.
         ds_probe = load_dataset(
-            dataset, transform=None, **_dataset_kwargs(dataset, "shape"),
+            dataset, transform=None, **_dataset_kwargs(
+            dataset, dsprites_target,
+            dsprites_n_per_class=dsprites_n_per_class,
+            funny_birds_clean_only=funny_birds_clean_only,
+        ),
         )
         num_classes = int(ds_probe.num_classes)
         ckpt = None
@@ -925,10 +971,14 @@ def finetune_cmd(
         "weight_decay": weight_decay, "batch_size": batch_size,
         "accumulate_grad_batches": accumulate_grad_batches,
         "val_frac": val_frac, "precision": precision, "augment": augment,
-        "randaugment": randaugment, "mixup": mixup, "cutmix": cutmix,
+        "randaugment": randaugment, "colorjitter_hue": colorjitter_hue,
+        "mixup": mixup, "cutmix": cutmix,
         "label_smoothing": label_smoothing, "llrd": llrd,
         "scheduler": scheduler, "warmup_epochs": warmup_epochs,
         "from_scratch": from_scratch, "probe": str(probe) if probe else None,
+        "dsprites_target": dsprites_target,
+        "dsprites_n_per_class": dsprites_n_per_class,
+        "funny_birds_clean_only": funny_birds_clean_only,
         "seed": seed,
     }
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -953,13 +1003,26 @@ def finetune_cmd(
     print("\nloading dataset", flush=True)
     base_obj = build_base(base_name)
     val_tfm = base_obj.get_transform()
-    train_tfm = _make_train_transform(base_obj, randaugment=randaugment) if augment else val_tfm
+    train_tfm = (
+        _make_train_transform(
+            base_obj, randaugment=randaugment, colorjitter_hue=colorjitter_hue,
+        )
+        if augment else val_tfm
+    )
 
     ds_train = load_dataset(
-        dataset, transform=train_tfm, **_dataset_kwargs(dataset, "shape"),
+        dataset, transform=train_tfm, **_dataset_kwargs(
+            dataset, dsprites_target,
+            dsprites_n_per_class=dsprites_n_per_class,
+            funny_birds_clean_only=funny_birds_clean_only,
+        ),
     )
     ds_val = load_dataset(
-        dataset, transform=val_tfm, **_dataset_kwargs(dataset, "shape"),
+        dataset, transform=val_tfm, **_dataset_kwargs(
+            dataset, dsprites_target,
+            dsprites_n_per_class=dsprites_n_per_class,
+            funny_birds_clean_only=funny_birds_clean_only,
+        ),
     )
     n = len(ds_train)
     n_val = max(1, int(round(n * val_frac)))
