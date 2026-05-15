@@ -634,6 +634,9 @@ class _FinetuneLM(L.LightningModule):
         scheduler: str = "none", warmup_epochs: int = 0, max_epochs: int = 50,
         llrd: float = 1.0,
         mixup: float = 0.0, cutmix: float = 0.0, label_smoothing: float = 0.0,
+        onecycle_pct_start: float = 0.1,
+        onecycle_div_factor: float = 25.0,
+        onecycle_final_div_factor: float = 1e4,
         normalize=None,
     ) -> None:
         super().__init__()
@@ -716,7 +719,29 @@ class _FinetuneLM(L.LightningModule):
                 lr_sched = CosineAnnealingLR(opt, T_max=total)
             return {"optimizer": opt,
                     "lr_scheduler": {"scheduler": lr_sched, "interval": "epoch"}}
-        raise ValueError(f"unknown scheduler {self.hparams.scheduler!r}; choose 'none' or 'cosine'")
+        if self.hparams.scheduler == "onecycle":
+            # Smith's SuperConvergence (1cycle). Each param group's
+            # `lr` set above becomes the *peak*; OneCycleLR ramps from
+            # peak / div_factor up to peak (pct_start of total steps),
+            # then anneals down to peak / final_div_factor.
+            # Steps per step (not per epoch) — total_steps comes from
+            # the Lightning trainer via dataloader length × epochs.
+            from torch.optim.lr_scheduler import OneCycleLR
+            total_steps = self.trainer.estimated_stepping_batches
+            max_lrs = [g["lr"] for g in opt.param_groups]
+            lr_sched = OneCycleLR(
+                opt,
+                max_lr=max_lrs,
+                total_steps=total_steps,
+                pct_start=self.hparams.onecycle_pct_start,
+                anneal_strategy="cos",
+                div_factor=self.hparams.onecycle_div_factor,
+                final_div_factor=self.hparams.onecycle_final_div_factor,
+                three_phase=False,
+            )
+            return {"optimizer": opt,
+                    "lr_scheduler": {"scheduler": lr_sched, "interval": "step"}}
+        raise ValueError(f"unknown scheduler {self.hparams.scheduler!r}; choose 'none', 'cosine', or 'onecycle'")
 
 
 def _make_train_transform(base_obj, *, randaugment: bool = False,
@@ -854,7 +879,21 @@ def finetune_cmd(
     ),
     scheduler: str = typer.Option(
         "none", "--scheduler",
-        help="LR schedule: 'none' or 'cosine' (warmup → cosine annealing).",
+        help="LR schedule: 'none', 'cosine' (warmup → cosine), or "
+             "'onecycle' (Smith SuperConvergence — peak then anneal).",
+    ),
+    onecycle_pct_start: float = typer.Option(
+        0.1, "--onecycle-pct-start",
+        help="(--scheduler onecycle) Fraction of total steps spent ramping "
+             "to peak LR. Smith default 0.3; 0.1 is fine for short fine-tunes.",
+    ),
+    onecycle_div_factor: float = typer.Option(
+        25.0, "--onecycle-div-factor",
+        help="(--scheduler onecycle) initial_lr = peak / div_factor.",
+    ),
+    onecycle_final_div_factor: float = typer.Option(
+        1e4, "--onecycle-final-div-factor",
+        help="(--scheduler onecycle) final_lr = initial_lr / final_div_factor.",
     ),
     warmup_epochs: int = typer.Option(
         0, "--warmup-epochs",
@@ -975,6 +1014,9 @@ def finetune_cmd(
         "mixup": mixup, "cutmix": cutmix,
         "label_smoothing": label_smoothing, "llrd": llrd,
         "scheduler": scheduler, "warmup_epochs": warmup_epochs,
+        "onecycle_pct_start": onecycle_pct_start,
+        "onecycle_div_factor": onecycle_div_factor,
+        "onecycle_final_div_factor": onecycle_final_div_factor,
         "from_scratch": from_scratch, "probe": str(probe) if probe else None,
         "dsprites_target": dsprites_target,
         "dsprites_n_per_class": dsprites_n_per_class,
@@ -1050,6 +1092,9 @@ def finetune_cmd(
         backbone_lr=backbone_lr, head_lr=head_lr, weight_decay=weight_decay,
         scheduler=scheduler, warmup_epochs=warmup_epochs, max_epochs=epochs,
         llrd=llrd, mixup=mixup, cutmix=cutmix, label_smoothing=label_smoothing,
+        onecycle_pct_start=onecycle_pct_start,
+        onecycle_div_factor=onecycle_div_factor,
+        onecycle_final_div_factor=onecycle_final_div_factor,
         normalize=base_obj.get_normalize(),
     )
 
