@@ -555,6 +555,198 @@ above pending.
 
 ---
 
+## Entry 7 — Concept-class consolidation: six → three with one shape contract
+
+**Problem statement.** The early Phase-1 concept design had six classes
+(`HeadConcept`, `QConcept`, `KConcept`, `VConcept`, `AttnOutputDimConcept`,
+`RegisterTokenConcept`), each tied to a different submodule (`context`,
+`rope_q`, `rope_k`, `v_id`, `proj_drop`, `proj_drop` with prefix mask).
+This created two problems: (1) per-concept code duplication across the
+mask/attribute/reference-sampling triple; (2) artificial coupling
+between *what* you condition on (a head) and *where* you hook (Q vs K
+vs V vs output) — they should be orthogonal.
+
+**Solutions considered.**
+1. Keep six classes, factor a shared base. Cosmetic; doesn't decouple.
+2. Three classes, four hookable sites, single shape contract `(B, N, D)`.
+   The site choice becomes a parameter independent of the concept type.
+3. One generic `MaskConcept(mask_fn)` class with the partition encoded
+   in a callable. Too generic; loses naming / discoverability.
+
+**Evaluated + results.** Adopted option (2). Implementation in
+`crp/attention_concepts.py`:
+
+* `HeadConcept(num_heads)` — slices `D` into `H` contiguous head
+  segments of size `d_h = D/H`. One concept ID = one head.
+* `EmbeddingDimConcept(num_heads)` — one concept ID per single dim of
+  `D`. The `num_heads` arg is metadata only (used by `head_of(d)` for
+  display).
+* `TokenConcept(token_filter=slice(None))` — one concept ID per token
+  position; an optional `token_filter` restricts the universe (e.g.\
+  `slice(0, 5)` = cls + register tokens on DINOv3, `slice(5, None)` =
+  spatial patches only).
+
+**Single shape contract**: all four hookable sites carry `(B, N, D)`:
+
+* `q_lrp_probe`, `k_lrp_probe`, `v_lrp_probe` — post-qkv-split,
+  pre-head-reshape (the unfolded `_to_heads` is *after* the probes).
+* `proj_drop` — the attention block's output projection.
+
+Any of the three concepts can attach at any site; meaning shifts with
+the site: `HeadConcept @ proj_drop` answers "which head drove the
+final block output?", `HeadConcept @ q_lrp_probe` answers "which input
+pixels populated this head's query subspace?", and so on.
+
+**Probe renaming.** The Phase-1 names `q_id` / `k_id` / `v_id` were
+plain `nn.Identity` instances and easy to confuse with each other and
+with stray Identities elsewhere in the graph. Renamed to
+`q_lrp_probe` / `k_lrp_probe` / `v_lrp_probe` and made instances of a
+typed marker class `LRPInspectionLayer(nn.Identity)`. Discovery now
+goes through `get_layer_names(model, [LRPInspectionLayer])` — exact,
+unambiguous, fewer false positives.
+
+**Conclusion.** "Concept = what" and "site = where" are orthogonal.
+The unified `(B, N, D)` shape contract lets one class cover the
+combinatorial space without per-pair code. The previous six-class
+taxonomy was an early-stage artifact; collapsing to three reduced the
+maintenance surface by ~half while expanding the addressable
+(concept × site) space from 6 to 12. Commits on
+`transformer-multi-concept`; see `crp/attention_concepts.py` for the
+current implementation.
+
+---
+
+## Entry 8 — Vit\_small development substrate on three small datasets
+
+**Problem statement.** The DINOv3 ViT-L/16 is too large for fast
+iteration on XAI methodology — every attribution takes seconds, every
+training run is hours, and we don't know what the model "should" focus
+on (ImageNet is too varied). We need a small model trained on datasets
+with *known* ground truth properties so heatmaps can be checked
+against an external standard, not just against visual plausibility.
+
+**Solutions considered.**
+1. Use an existing pretrained small ViT (e.g.\ a HuggingFace checkpoint
+   on FunnyBirds). None exist; checked the FunnyBirds paper's repo,
+   no released small-model weights.
+2. Train `vit_small_patch16_224.augreg_in21k_ft_in1k` (22 M params)
+   from the in21k init on three small datasets.
+3. Train ViT-tiny (5.7 M params). Smaller still; we picked vit_small
+   for slightly more capacity at marginal extra training cost.
+
+**Evaluated + results.** Adopted option (2). Training CLI extension in
+`experiments/train_probe.py finetune --from-scratch` with:
+
+* `--llrd <rate>` — layer-wise LR decay (0.65 default for the
+  ImageNet ViT recipe).
+* `--mixup <α>` / `--cutmix <α>` — torchvision v2-style augmentations.
+* `--label-smoothing <ε>`.
+* `--randaugment` — RandAugment(2, 9), the timm AugReg default.
+* `--scheduler cosine --warmup-epochs N` — already present, applied to
+  finetune too.
+* `--output-dir <path>` — auto-timestamped run dir under
+  `data/runs/finetune_<base>_<dataset>/<UTC ts>/` containing
+  `best.pt`, `config.json`, `metrics.csv`.
+
+Per-dataset results:
+
+| Dataset | train-val acc | test acc | Time | Notes |
+|---|---:|---:|---:|---|
+| dSprites (3-class shape, 15 k subsample) | 0.9986 | 0.999 | ~5 min | trivial; ceiling. patience=3 stopped at epoch 6. |
+| ColoredMNIST (10-class, 0.99 correlation) | 0.978 | 0.127 | ~5 min | **intentionally biased** (see below). |
+| FunnyBirds (50-class, clean-only train) | ≥0.85 (in progress) | — | ~1 h | ImageNet ViT recipe; converging. |
+
+**ColoredMNIST as a bias probe.** The model learned the colour
+shortcut (train-val 0.978 on correlated colours, test 0.127 on
+uniformly random colours). This is the *intended outcome*. We have a
+model whose failure mode is mathematically pinned: it uses colour
+pixels, not stroke geometry. Any XAI method should produce heatmaps
+that fire on colour-bearing regions. If it produces stroke-aligned
+heatmaps, the method is mis-identifying the cause of the prediction.
+This is the *only* deliverable in our set with a known wrong answer —
+the other two (dSprites, FunnyBirds) are tests for correctness.
+
+A `--colorjitter-hue 0.5` flag is now wired for the ablation
+direction — randomising hue at train time breaks the shortcut and
+forces shape learning. Not the default.
+
+**Conclusion.** `vit_small` is the development substrate. Heatmaps can
+be sanity-checked against ground truth (parts on FunnyBirds, shape
+pixels on dSprites, colour pixels on ColoredMNIST). The DINOv3 ViT-L
+work remains the *target* — the methodology developed on `vit_small`
+generalises straight up because canonizer + composite design is
+backbone-agnostic. Pull-quote: "A 22 M-parameter ViT-S/16 trained
+deliberately to learn a colour shortcut on a digit-classification task
+is the simplest known sanity check for whether an XAI method
+identifies the true cause of a prediction; any method that fails to
+localise colour pixels on this model is also unreliable on
+naturally-occurring shortcuts in larger models."
+
+---
+
+## Entry 9 — Drop-in XAI baselines: LeGrad and Chefer's rollout
+
+**Problem statement.** Before claiming our AttnLRP / CRP attributions
+are correct on a new model, we want to cross-check against widely-cited
+gradient-on-attention methods. The minimum set of baselines that
+covers the design space:
+
+1. A *non-LRP gradient-on-attention* method (Chefer 2021,
+   arXiv:2012.09838) — uses `(grad ⊙ A)_+` per block, rolled up
+   across blocks via matrix multiplication. Different theory family
+   from AttnLRP; orthogonal cross-check.
+2. A *recent feature-formation-sensitivity* method (LeGrad,
+   Bousselham 2024, arXiv:2404.03214) — gradient of prediction w.r.t.\
+   attention weights of each layer, aggregated per layer.
+
+**Solutions considered.**
+1. Quantitative comparison via Quantus / SaCo faithfulness metrics.
+   Rejected — adds eval-harness complexity. We want *manual* heatmap
+   inspection on the trained `vit_small`, on a model whose ground
+   truth we already know.
+2. Pip-installable wrappers (`legrad_torch` for LeGrad, no PyPI
+   package for Chefer). The LeGrad wrapper expects OpenCLIP
+   `model.visual` interface and doesn't drop into a timm
+   classification head; the formula itself is short.
+3. Inline reproduction of both formulas as notebook cells.
+
+**Evaluated + results.** Adopted option (3). Both methods hook the
+post-softmax attention weight tensor `A ∈ ℝ^(B×H×N×N)` which both our
+`TimmAttentionUnfolded` and our `EvaAttentionUnfolded` expose as a
+named submodule. No composite needed — these are stock-model methods.
+
+**LeGrad inline** (`tutorials/vit_crp/vit_small_baselines/...`):
+```
+score_layer = mean_over_heads( clamp_min(grad_A ⊙ A, 0) )[cls_row, npt:]
+heatmap = sum_over_target_blocks( score_layer ).reshape(H_patches, W_patches)
+```
+
+**Chefer inline** (same notebook):
+```
+R_block = mean_over_heads( clamp_min(grad_A ⊙ A, 0) )            # (N, N)
+R       = I; for block in blocks: R += R_block @ R               # rollup
+heatmap = R[0, npt:].reshape(H_patches, W_patches)               # cls row
+```
+
+Difference: LeGrad sums per-block scores; Chefer accumulates via
+matmul rollup. Both are short enough to fit in a single notebook cell
+each; no `experiments/scripts/` helper module needed.
+
+**Conclusion.** Two drop-in baselines wired into the
+`vit_small_baselines` notebook alongside cells for our AttnLRP/CRP
+attribution on the same focal image. The cells are templates: change
+`TARGET_BLOCKS` (LeGrad) or `UP_TO_BLOCK` (Chefer) at the top of the
+cell to inspect different depths. No statistics, no automated
+comparison — those belong in a separate eval harness. The point here
+is *manual sanity*: looking at three different methods on the same
+image and seeing whether they agree on where the model is looking.
+
+Trained `vit_small` checkpoints sit under
+`data/runs/finetune_vit_small_<dataset>/<ts>/best.pt`; the notebook
+auto-globs the most recent run.
+
+---
+
 ## Standing references
 
 * **AttnLRP**: Achtibat et al., ICML 2024, arXiv:2402.05602.
@@ -578,3 +770,15 @@ above pending.
   spatial heatmaps.
 * **RoFormer**: Su et al. 2021, arXiv:2104.09864. Source of RoPE;
   justifies that detaching cos/sin is a no-op (no learnable params).
+* **FunnyBirds**: Hesse et al. ICCV 2023, arXiv:2308.06248. 50 procedural
+  bird species with per-part ground-truth segmentation; primary
+  test-bed for part-localisation faithfulness.
+* **dSprites**: Higgins et al. ICLR 2017 ($\beta$-VAE). 737k synthetic
+  2D shapes with known latent factors; ground-truth disentanglement.
+* **Learning from Failure (LfF)**: Nam et al. NeurIPS 2020,
+  arXiv:2007.02561. Source of the ColoredMNIST setup we reproduce
+  programmatically (digit↔colour correlation broken at test time).
+* **LeGrad**: Bousselham et al. 2024, arXiv:2404.03214. Feature
+  formation sensitivity baseline for ViT attribution.
+* **Chefer's rollout**: Chefer et al. CVPR 2021, arXiv:2012.09838.
+  Gradient-weighted attention rollout baseline.
