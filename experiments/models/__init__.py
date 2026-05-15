@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Type
 
-from .bases import Base, ViTBase, DinoV3
+from .bases import Base, ViTBase, ViTSmall, DinoV3
 from .heads import Head, LinearHead, AttentiveHead, BlockHead
 from .probe import Probe
 
@@ -26,6 +26,7 @@ from .probe import Probe
 
 BASES: Dict[str, Type[Base]] = {
     "vit_base":   ViTBase,
+    "vit_small":  ViTSmall,
     "vit_dinov3": DinoV3,
 }
 
@@ -78,7 +79,7 @@ def build_probe(
 
 __all__ = [
     "BASES", "HEADS",
-    "Base", "ViTBase", "DinoV3",
+    "Base", "ViTBase", "ViTSmall", "DinoV3",
     "Head", "LinearHead", "AttentiveHead", "BlockHead",
     "Probe",
     "build_base", "build_head", "build_probe",

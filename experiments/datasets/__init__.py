@@ -14,6 +14,9 @@ Modules
   ~1.5 GB synthetic-birds zip (Hesse et al. ICCV 2023).
 * ``dsprites`` — :class:`DSpritesDataset`. Auto-downloads ~26 MB
   parquet (Higgins et al. 2017).
+* ``colored_mnist`` — :class:`ColoredMNISTDataset`. Reproduces the
+  IEEE-dataport ColoredMNIST scheme (digit ↔ hue correlation, broken
+  at test time) from torchvision MNIST (~12 MB).
 
 The flat ``load(name, ...)`` dispatcher and ``load_imagenette`` /
 ``load_imagenet_val_hf`` functions are re-exported here.
@@ -48,6 +51,7 @@ from .imagenette import ImagenetteDataset  # noqa: F401
 from .imagenet import ImagenetValHFDataset  # noqa: F401
 from .funny_birds import FunnyBirdsDataset  # noqa: F401
 from .dsprites import DSpritesDataset  # noqa: F401
+from .colored_mnist import ColoredMNISTDataset  # noqa: F401
 
 
 # Bridge: register the new class-based loaders so ``load(name)`` works for
@@ -64,9 +68,16 @@ def _dsprites_factory(root, *, target="shape", transform=None, **kw):
     )
 
 
+def _colored_mnist_factory(root, *, split="train", transform=None, **kw):
+    return ColoredMNISTDataset(
+        root=root, split=split, transform=transform, **kw,
+    )
+
+
 DATASETS = dict(_LEGACY_DATASETS)
 DATASETS["funny_birds"] = _funny_birds_factory
 DATASETS["dsprites"] = _dsprites_factory
+DATASETS["colored_mnist"] = _colored_mnist_factory
 
 
 def load(name: str, *, root: _Optional[_Path] = None, **kwargs):
@@ -74,7 +85,7 @@ def load(name: str, *, root: _Optional[_Path] = None, **kwargs):
     is ``<repo>/data``.
 
     Available names: ``imagenette``, ``imagenet_val_hf``, ``funny_birds``,
-    ``dsprites``.
+    ``dsprites``, ``colored_mnist``.
     """
     if name not in DATASETS:
         raise ValueError(
@@ -97,4 +108,5 @@ __all__ = [
     "ImagenetValHFDataset",
     "FunnyBirdsDataset",
     "DSpritesDataset",
+    "ColoredMNISTDataset",
 ]

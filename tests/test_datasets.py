@@ -28,10 +28,10 @@ def test_imports():
         CuratedDataset, DATASETS, IMAGENETTE_TO_IMAGENET,
         load, load_imagenette, load_imagenet_val_hf,
         ImagenetteDataset, ImagenetValHFDataset,
-        FunnyBirdsDataset, DSpritesDataset,
+        FunnyBirdsDataset, DSpritesDataset, ColoredMNISTDataset,
     )
     expected_names = {"imagenette", "imagenet_val_hf",
-                      "funny_birds", "dsprites"}
+                      "funny_birds", "dsprites", "colored_mnist"}
     assert set(DATASETS) == expected_names
 
 
