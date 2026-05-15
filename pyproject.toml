@@ -39,6 +39,7 @@ dependencies = [
   "nbformat>=5.10.4",
   "nbconvert>=7.17.1",
   "torchview>=0.2.7",
+  "legrad-torch>=1.1",
 ]
 
 [project.optional-dependencies]
