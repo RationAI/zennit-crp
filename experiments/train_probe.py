@@ -53,21 +53,26 @@ head_kwargs=ckpt["head_kwargs"])`` and loads ``head_state_dict`` into
 """
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 import lightning as L
 import torch
 import torch.multiprocessing as _torch_mp
+import torch.nn as nn
 import torch.nn.functional as F
 import typer
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from lightning.pytorch.loggers import CSVLogger
 from timm.data import resolve_data_config
 from torch.utils.data import DataLoader, Subset, TensorDataset, random_split
 from torchmetrics.classification import MulticlassAccuracy
 from torchvision.transforms import (
     Compose,
+    RandAugment,
     RandomHorizontalFlip,
     RandomResizedCrop,
     RandomRotation,
@@ -92,7 +97,8 @@ if torch.cuda.is_available():
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DATA_DIR = REPO_ROOT / "data"
-DATASETS = ("funny_birds", "dsprites", "imagenet_val_hf", "imagenette")
+RUNS_DIR = DATA_DIR / "runs"
+DATASETS = ("funny_birds", "dsprites", "imagenet_val_hf", "imagenette", "colored_mnist")
 
 app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
 
@@ -108,11 +114,11 @@ def probe_path(base: str, head: str, dataset: str) -> Path:
     return DATA_DIR / f"{base}_{head}_probe_{dataset}.pt"
 
 
-def _dataset_kwargs(dataset: str, dsprites_target: str) -> dict:
+def _dataset_kwargs(dataset: str, dsprites_target: str, *, split: str = "train") -> dict:
     if dataset == "dsprites":
         return {"target": dsprites_target}
-    if dataset in ("funny_birds", "imagenette"):
-        return {"split": "train"}
+    if dataset in ("funny_birds", "imagenette", "colored_mnist"):
+        return {"split": split}
     return {}
 
 
@@ -274,7 +280,10 @@ class _ProbeLM(L.LightningModule):
         kw = dict(num_classes=num_classes)
         self.train_acc = MulticlassAccuracy(**kw)
         self.val_acc = MulticlassAccuracy(**kw)
-        self.val_acc5 = MulticlassAccuracy(top_k=5, **kw)
+        # top-5 only well-defined when num_classes >= 5; fall back to
+        # top-1 for tiny-class datasets (dsprites: 3, etc.) so the
+        # metric does not raise.
+        self.val_acc5 = MulticlassAccuracy(top_k=min(5, num_classes), **kw)
 
     def _step(self, batch, stage, acc, acc5=None):
         x, y = batch
@@ -507,10 +516,101 @@ def train_cmd(
 # composite is built around for a few extra percentage points of accuracy.
 
 
+def _llrd_param_groups(
+    model, *, backbone_lr: float, head_lr: float, weight_decay: float,
+    llrd: float,
+):
+    """Build AdamW param groups with **layer-wise LR decay** on the
+    backbone — earlier blocks get lower LR (LR scaled by ``llrd**depth``,
+    counted from the *output* end). Standard fine-tune trick: lets the
+    head and late blocks adapt fast while keeping early features stable.
+
+    Returns ``[{params, lr, weight_decay}, ...]``. With ``llrd=1.0`` this
+    collapses to two groups (backbone, head) — the legacy behaviour.
+    """
+    backbone = model.backbone
+    if llrd >= 1.0 or not hasattr(backbone, "blocks"):
+        return [
+            {"params": list(backbone.parameters()), "lr": backbone_lr,
+             "weight_decay": weight_decay},
+            {"params": list(model.head.parameters()), "lr": head_lr,
+             "weight_decay": weight_decay},
+        ]
+
+    n_blocks = len(backbone.blocks)
+    block_param_ids = {
+        id(p) for blk in backbone.blocks for p in blk.parameters()
+    }
+    # Patch embed + cls_token + pos_embed + register tokens — treat as
+    # "layer 0" (deepest decay).
+    early = [p for p in backbone.parameters() if id(p) not in block_param_ids
+             and not _is_final_norm_param(backbone, p)]
+    final_norm = [p for p in backbone.parameters() if id(p) not in block_param_ids
+                  and _is_final_norm_param(backbone, p)]
+
+    groups = []
+    if early:
+        groups.append({"params": early, "lr": backbone_lr * (llrd ** n_blocks),
+                       "weight_decay": weight_decay})
+    for i, blk in enumerate(backbone.blocks):
+        depth_from_output = n_blocks - 1 - i
+        groups.append({"params": list(blk.parameters()),
+                       "lr": backbone_lr * (llrd ** depth_from_output),
+                       "weight_decay": weight_decay})
+    if final_norm:
+        groups.append({"params": final_norm, "lr": backbone_lr,
+                       "weight_decay": weight_decay})
+    groups.append({"params": list(model.head.parameters()), "lr": head_lr,
+                   "weight_decay": weight_decay})
+    return groups
+
+
+def _is_final_norm_param(backbone, p):
+    """Detect post-block norm / fc_norm parameters — these sit at the
+    output end and stay at full backbone_lr (no decay)."""
+    for name in ("norm", "fc_norm"):
+        mod = getattr(backbone, name, None)
+        if mod is not None and any(p is q for q in mod.parameters()):
+            return True
+    return False
+
+
+def _mixup_or_cutmix(x: torch.Tensor, y: torch.Tensor, mixup_alpha: float,
+                     cutmix_alpha: float):
+    """Draw one of mixup / cutmix (50/50 if both enabled) and apply to
+    the batch in-place. Returns ``(x, y_a, y_b, lam)``; loss is then
+    ``lam * CE(logits, y_a) + (1 - lam) * CE(logits, y_b)``.
+    """
+    use_cutmix = cutmix_alpha > 0 and (mixup_alpha == 0 or torch.rand(()) < 0.5)
+    alpha = cutmix_alpha if use_cutmix else mixup_alpha
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = float(torch.distributions.Beta(alpha, alpha).sample())
+    perm = torch.randperm(x.size(0), device=x.device)
+    y_a, y_b = y, y[perm]
+    if use_cutmix:
+        # Random box, area = (1 - lam) of image.
+        _, _, H, W = x.shape
+        cut_rat = (1.0 - lam) ** 0.5
+        cw, ch = int(W * cut_rat), int(H * cut_rat)
+        cx, cy = torch.randint(W, (1,)).item(), torch.randint(H, (1,)).item()
+        x1, x2 = max(cx - cw // 2, 0), min(cx + cw // 2, W)
+        y1, y2 = max(cy - ch // 2, 0), min(cy + ch // 2, H)
+        x = x.clone()
+        x[:, :, y1:y2, x1:x2] = x[perm, :, y1:y2, x1:x2]
+        # Re-derive lam from the actual box area.
+        lam = 1.0 - ((x2 - x1) * (y2 - y1) / (W * H))
+    else:
+        x = lam * x + (1.0 - lam) * x[perm]
+    return x, y_a, y_b, lam
+
+
 class _FinetuneLM(L.LightningModule):
     """Lightning wrapper for end-to-end fine-tuning of a base+head probe.
 
-    Two parameter groups: backbone (small LR) and head (larger LR). Runs
+    Param groups: optional layer-wise LR decay on the backbone + a
+    separate head group. Optional cosine schedule with warmup. Optional
+    mixup / cutmix and label smoothing applied at the loss level. Runs
     the backbone live every batch — no cache — so the head sees fresh
     augmented views each epoch.
     """
@@ -518,6 +618,9 @@ class _FinetuneLM(L.LightningModule):
     def __init__(
         self, model, num_classes: int,
         backbone_lr: float, head_lr: float, weight_decay: float,
+        scheduler: str = "none", warmup_epochs: int = 0, max_epochs: int = 50,
+        llrd: float = 1.0,
+        mixup: float = 0.0, cutmix: float = 0.0, label_smoothing: float = 0.0,
         normalize=None,
     ) -> None:
         super().__init__()
@@ -530,12 +633,15 @@ class _FinetuneLM(L.LightningModule):
         kw = dict(num_classes=num_classes)
         self.train_acc = MulticlassAccuracy(**kw)
         self.val_acc = MulticlassAccuracy(**kw)
-        self.val_acc5 = MulticlassAccuracy(top_k=5, **kw)
+        # top-5 only well-defined when num_classes >= 5; fall back to
+        # top-1 for tiny-class datasets (dsprites: 3, etc.) so the
+        # metric does not raise.
+        self.val_acc5 = MulticlassAccuracy(top_k=min(5, num_classes), **kw)
 
-    def _step(self, batch, stage, acc, acc5=None):
+    def _eval_step(self, batch, stage, acc, acc5=None):
         x, y = batch
         logits = self.model(self.normalize(x))
-        loss = F.cross_entropy(logits, y)
+        loss = F.cross_entropy(logits, y, label_smoothing=self.hparams.label_smoothing)
         acc(logits, y)
         self.log(f"{stage}_loss", loss, prog_bar=True, on_epoch=True, on_step=False)
         self.log(f"{stage}_acc", acc, prog_bar=True, on_epoch=True, on_step=False)
@@ -545,48 +651,118 @@ class _FinetuneLM(L.LightningModule):
         return loss
 
     def training_step(self, batch, _):
-        return self._step(batch, "train", self.train_acc)
+        x, y = batch
+        x = self.normalize(x)
+        if self.hparams.mixup > 0 or self.hparams.cutmix > 0:
+            x, y_a, y_b, lam = _mixup_or_cutmix(
+                x, y, self.hparams.mixup, self.hparams.cutmix,
+            )
+            logits = self.model(x)
+            loss = (lam * F.cross_entropy(logits, y_a, label_smoothing=self.hparams.label_smoothing)
+                    + (1 - lam) * F.cross_entropy(logits, y_b, label_smoothing=self.hparams.label_smoothing))
+            # Train accuracy under mixup is meaningless; log against y_a as a proxy.
+            self.train_acc(logits, y_a)
+        else:
+            logits = self.model(x)
+            loss = F.cross_entropy(logits, y, label_smoothing=self.hparams.label_smoothing)
+            self.train_acc(logits, y)
+        self.log("train_loss", loss, prog_bar=True, on_epoch=True, on_step=False)
+        self.log("train_acc", self.train_acc, prog_bar=True, on_epoch=True, on_step=False)
+        return loss
 
     def validation_step(self, batch, _):
-        return self._step(batch, "val", self.val_acc, self.val_acc5)
+        return self._eval_step(batch, "val", self.val_acc, self.val_acc5)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
-            [
-                {"params": self.model.backbone.parameters(), "lr": self.hparams.backbone_lr},
-                {"params": self.model.head.parameters(), "lr": self.hparams.head_lr},
-            ],
-            weight_decay=self.hparams.weight_decay,
+        param_groups = _llrd_param_groups(
+            self.model, backbone_lr=self.hparams.backbone_lr,
+            head_lr=self.hparams.head_lr, weight_decay=self.hparams.weight_decay,
+            llrd=self.hparams.llrd,
         )
+        opt = torch.optim.AdamW(param_groups)
+
+        if self.hparams.scheduler == "none":
+            return opt
+        if self.hparams.scheduler == "cosine":
+            warmup = self.hparams.warmup_epochs
+            total = self.hparams.max_epochs
+            from torch.optim.lr_scheduler import (
+                CosineAnnealingLR, LinearLR, SequentialLR,
+            )
+            if warmup > 0:
+                lr_sched = SequentialLR(
+                    opt,
+                    schedulers=[
+                        LinearLR(opt, start_factor=1e-6, end_factor=1.0,
+                                 total_iters=warmup),
+                        CosineAnnealingLR(opt, T_max=max(1, total - warmup)),
+                    ],
+                    milestones=[warmup],
+                )
+            else:
+                lr_sched = CosineAnnealingLR(opt, T_max=total)
+            return {"optimizer": opt,
+                    "lr_scheduler": {"scheduler": lr_sched, "interval": "epoch"}}
+        raise ValueError(f"unknown scheduler {self.hparams.scheduler!r}; choose 'none' or 'cosine'")
 
 
-def _make_train_transform(base_obj):
-    """Augmented training transform: random crop + flip + rotation +
-    ``ToTensor`` only. No normalize — Lightning's `_FinetuneLM` applies
-    normalize at the forward boundary so the dataset stays uniform with
-    the eval transform (which is also unnormalized) and stays
-    display-ready.
+def _make_train_transform(base_obj, *, randaugment: bool = False):
+    """Augmented training transform: optional ``RandAugment`` + random
+    crop + flip + rotation + ``ToTensor``. No normalize — Lightning's
+    ``_FinetuneLM`` applies normalize at the forward boundary so the
+    dataset stays uniform with the eval transform.
 
-    Crop scale leaves at least 70% of the image visible (FunnyBirds birds
-    fill most of the frame); rotation is small (±15°) since the synthetic
-    birds are rendered upright. Hflip is safe — birds are bilaterally
-    symmetric.
+    Crop scale leaves at least 70% of the image visible; rotation is
+    small (±15°). RandAugment composes 2 random ops at magnitude 9 —
+    the timm/AugReg default for ImageNet ViTs.
     """
     cfg = resolve_data_config({}, model=base_obj.backbone)
     size = cfg["input_size"][-1]
-    return Compose([
+    ops = [
         RandomResizedCrop(size, scale=(0.7, 1.0), interpolation=3),
         RandomHorizontalFlip(p=0.5),
         RandomRotation(degrees=15),
-        ToTensor(),
-    ])
+    ]
+    if randaugment:
+        # RandAugment runs on PIL images; insert before ToTensor.
+        ops.append(RandAugment(num_ops=2, magnitude=9))
+    ops.append(ToTensor())
+    return Compose(ops)
+
+
+def _auto_run_dir(name: str) -> Path:
+    """Return ``data/runs/<name>/<UTC timestamp>/`` (created)."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    out = RUNS_DIR / name / ts
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 
 @app.command("finetune")
 def finetune_cmd(
-    probe: Path = typer.Argument(
-        ..., help="Path to a probe checkpoint produced by `train` "
-                  "(e.g. data/vit_dinov3_attentive_probe_funny_birds.pt).",
+    probe: Optional[Path] = typer.Argument(
+        None, help="Path to a probe checkpoint produced by `train` "
+                  "(e.g. data/vit_dinov3_attentive_probe_funny_birds.pt). "
+                  "Omit and pass --from-scratch to start fresh.",
+    ),
+    from_scratch: bool = typer.Option(
+        False, "--from-scratch",
+        help="Skip probe-checkpoint loading; build a fresh head and "
+             "fine-tune end-to-end. Requires --base, --dataset; --head "
+             "defaults to 'linear'. Used for vit_small full fine-tune "
+             "where there's no prior probe run.",
+    ),
+    base: Optional[str] = typer.Option(
+        None, "--base",
+        help=f"(--from-scratch only) Base architecture. One of: {', '.join(BASES)}.",
+    ),
+    head: str = typer.Option(
+        "linear", "--head",
+        help=f"(--from-scratch only) Head architecture. One of: {', '.join(HEADS)}.",
+    ),
+    dataset: Optional[str] = typer.Option(
+        None, "--dataset",
+        help=f"(--from-scratch only) Dataset. One of: {', '.join(DATASETS)}.",
     ),
     epochs: int = typer.Option(
         15, "--epochs", help="Max epochs (each epoch is a full backbone forward+backward pass).",
@@ -598,23 +774,21 @@ def finetune_cmd(
         1e-5, "--backbone-lr",
         help="Very small LR for the backbone — large enough to nudge "
              "features toward the task, small enough not to destroy "
-             "DINOv3's pretrained representation.",
+             "the pretrained representation.",
     ),
     head_lr: float = typer.Option(
         1e-4, "--head-lr",
-        help="LR for the head (~10× backbone-lr). Re-tunes the trained "
-             "head as the backbone moves under it.",
+        help="LR for the head (~10× backbone-lr). Re-tunes the head "
+             "as the backbone moves under it.",
     ),
     weight_decay: float = typer.Option(1e-2, "--weight-decay"),
     batch_size: int = typer.Option(
         8, "--batch-size",
-        help="Live ViT-L forward+backward — keep small to fit GPU memory. "
-             "On a 10 GB MIG slice, bs=8 with bf16-mixed leaves headroom.",
+        help="Live backbone forward+backward — keep small to fit GPU memory.",
     ),
     accumulate_grad_batches: int = typer.Option(
         4, "--accumulate-grad-batches",
-        help="Effective batch size = batch_size × accumulate_grad_batches. "
-             "Keeps small per-step memory while approximating a larger batch.",
+        help="Effective batch size = batch_size × accumulate_grad_batches.",
     ),
     val_frac: float = typer.Option(0.1, "--val-frac"),
     num_workers: int = typer.Option(
@@ -623,51 +797,149 @@ def finetune_cmd(
     ),
     precision: str = typer.Option(
         "bf16-mixed", "--precision",
-        help="Mixed precision for the backbone forward+backward. A100 "
-             "supports bf16 natively. Use '32-true' to force fp32 for debugging.",
+        help="Mixed precision for the backbone forward+backward. "
+             "Use '32-true' to force fp32 for debugging.",
     ),
     augment: bool = typer.Option(
         True, "--augment/--no-augment",
-        help="Enable training-time augmentation (random crop + hflip + "
-             "small rotation). Disable to ablate the augmentation effect.",
+        help="Enable training-time augmentation (RRC + hflip + rotation).",
+    ),
+    randaugment: bool = typer.Option(
+        False, "--randaugment",
+        help="Stack RandAugment on top of the basic geometric augs.",
+    ),
+    mixup: float = typer.Option(
+        0.0, "--mixup",
+        help="Mixup α (Beta distribution). 0 = off; 0.8 = ImageNet ViT default.",
+    ),
+    cutmix: float = typer.Option(
+        0.0, "--cutmix",
+        help="CutMix α. 0 = off; if both mixup and cutmix are non-zero "
+             "one is chosen 50/50 per batch.",
+    ),
+    label_smoothing: float = typer.Option(
+        0.0, "--label-smoothing",
+        help="Label smoothing ε passed to cross-entropy.",
+    ),
+    llrd: float = typer.Option(
+        1.0, "--llrd",
+        help="Layer-wise LR decay rate. Backbone block i (counting from "
+             "input) gets lr × llrd^(depth - 1 - i). 1.0 = off; 0.65 = "
+             "common ImageNet ViT fine-tune setting.",
+    ),
+    scheduler: str = typer.Option(
+        "none", "--scheduler",
+        help="LR schedule: 'none' or 'cosine' (warmup → cosine annealing).",
+    ),
+    warmup_epochs: int = typer.Option(
+        0, "--warmup-epochs",
+        help="(--scheduler cosine) Linear warmup epochs from lr×1e-6 to lr.",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir",
+        help="Run directory for best.pt + config.json + metrics.csv. "
+             "Default: data/runs/finetune_<base>_<dataset>/<UTC ts>/.",
     ),
     out: Optional[Path] = typer.Option(
         None, "--out",
-        help="Output .pt path. Default: <probe>_finetuned.pt",
+        help="(legacy probe-resume) Output .pt path. If --output-dir is "
+             "set, this is ignored.",
     ),
     seed: int = typer.Option(0, "--seed"),
 ):
-    """Fine-tune a base+head probe end-to-end (backbone unfrozen).
+    """Fine-tune a base+head model end-to-end (backbone unfrozen).
 
-    Drops the cached features and runs the backbone live every batch.
-    Trains backbone with very small LR (default 1e-5) and head with 10×
-    that. Logs per-epoch val_acc; checkpoints best-by-val-acc.
+    Two flows:
+
+    * **probe-resume** — pass a probe checkpoint as the first arg; the
+      backbone is unfrozen and the trained head continues training. Used
+      to push DINOv3 probes past their frozen-backbone ceiling.
+    * **--from-scratch** — pass ``--base``, ``--dataset`` (and optionally
+      ``--head``); a fresh head is built and the whole stack is
+      fine-tuned. Used for the vit_small runs on FunnyBirds / dSprites /
+      ColoredMNIST. Combine with ``--llrd 0.65 --scheduler cosine
+      --warmup-epochs 5 --randaugment --mixup 0.8 --label-smoothing 0.1``
+      for the standard ImageNet ViT recipe.
+
+    Always writes ``best.pt`` (model + metadata), ``config.json`` (the
+    full Typer params), and ``metrics.csv`` (per-epoch logs) into the
+    run directory.
     """
     L.seed_everything(seed, workers=True)
 
-    print(f"loading probe checkpoint: {probe}", flush=True)
-    ckpt = torch.load(probe, map_location="cpu", weights_only=False)
-    base_name = ckpt["base"]
-    head_name = ckpt["head"]
-    head_kwargs = ckpt.get("head_kwargs", {})
-    num_classes = int(ckpt["num_classes"])
-    dataset = ckpt["dataset"]
-    print(f"  base={base_name}  head={head_name}  head_kwargs={head_kwargs}")
-    print(f"  num_classes={num_classes}  dataset={dataset}")
-    print(f"  starting val_acc (frozen backbone): {ckpt.get('val_acc', '?'):.4f}")
+    if from_scratch:
+        if base is None or dataset is None:
+            raise typer.BadParameter("--from-scratch requires --base and --dataset")
+        if base not in BASES:
+            raise typer.BadParameter(f"unknown base {base!r}; choose from {sorted(BASES)}")
+        if head not in HEADS:
+            raise typer.BadParameter(f"unknown head {head!r}; choose from {sorted(HEADS)}")
+        if dataset not in DATASETS:
+            raise typer.BadParameter(f"unknown dataset {dataset!r}; choose from {sorted(DATASETS)}")
+        base_name, head_name = base, head
+        head_kwargs: dict = {}
+        # num_classes comes from the dataset.
+        ds_probe = load_dataset(
+            dataset, transform=None, **_dataset_kwargs(dataset, "shape"),
+        )
+        num_classes = int(ds_probe.num_classes)
+        ckpt = None
+        print(f"from-scratch fine-tune: base={base_name}  head={head_name}  "
+              f"dataset={dataset}  num_classes={num_classes}", flush=True)
+    else:
+        if probe is None:
+            raise typer.BadParameter("missing probe checkpoint (or pass --from-scratch)")
+        print(f"loading probe checkpoint: {probe}", flush=True)
+        ckpt = torch.load(probe, map_location="cpu", weights_only=False)
+        base_name = ckpt["base"]
+        head_name = ckpt["head"]
+        head_kwargs = ckpt.get("head_kwargs", {})
+        num_classes = int(ckpt["num_classes"])
+        dataset = ckpt["dataset"]
+        print(f"  base={base_name}  head={head_name}  head_kwargs={head_kwargs}")
+        print(f"  num_classes={num_classes}  dataset={dataset}")
+        print(f"  starting val_acc (frozen backbone): {ckpt.get('val_acc', '?'):.4f}")
 
-    if out is None:
-        out = probe.with_name(probe.stem + "_finetuned.pt")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    print(f"  out: {out}")
+    # Resolve run dir (timestamped) — single source of truth for outputs.
+    if output_dir is None:
+        if out is not None:
+            # Legacy: place artifacts next to --out.
+            run_dir = out.parent
+            run_dir.mkdir(parents=True, exist_ok=True)
+            best_path = out
+        else:
+            run_dir = _auto_run_dir(f"finetune_{base_name}_{dataset}")
+            best_path = run_dir / "best.pt"
+    else:
+        run_dir = Path(output_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        best_path = run_dir / "best.pt"
+    print(f"  run dir: {run_dir}")
+    print(f"  best  →  {best_path}")
+
+    # Persist the full Typer config for reproducibility.
+    cfg = {
+        "base": base_name, "head": head_name, "dataset": dataset,
+        "num_classes": num_classes, "epochs": epochs, "patience": patience,
+        "backbone_lr": backbone_lr, "head_lr": head_lr,
+        "weight_decay": weight_decay, "batch_size": batch_size,
+        "accumulate_grad_batches": accumulate_grad_batches,
+        "val_frac": val_frac, "precision": precision, "augment": augment,
+        "randaugment": randaugment, "mixup": mixup, "cutmix": cutmix,
+        "label_smoothing": label_smoothing, "llrd": llrd,
+        "scheduler": scheduler, "warmup_epochs": warmup_epochs,
+        "from_scratch": from_scratch, "probe": str(probe) if probe else None,
+        "seed": seed,
+    }
+    (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
 
     print(f"\nbuilding model: {base_name} + {head_name}", flush=True)
     model = build_probe(
         base_name, head_name,
         num_classes=num_classes, head_kwargs=head_kwargs,
     )
-    # Load trained head weights.
-    model.head.load_state_dict(ckpt["head_state_dict"])
+    if ckpt is not None:
+        model.head.load_state_dict(ckpt["head_state_dict"])
     # Unfreeze backbone — train mode + requires_grad.
     for p in model.backbone.parameters():
         p.requires_grad_(True)
@@ -681,7 +953,7 @@ def finetune_cmd(
     print("\nloading dataset", flush=True)
     base_obj = build_base(base_name)
     val_tfm = base_obj.get_transform()
-    train_tfm = _make_train_transform(base_obj) if augment else val_tfm
+    train_tfm = _make_train_transform(base_obj, randaugment=randaugment) if augment else val_tfm
 
     ds_train = load_dataset(
         dataset, transform=train_tfm, **_dataset_kwargs(dataset, "shape"),
@@ -713,10 +985,12 @@ def finetune_cmd(
     lm = _FinetuneLM(
         model, num_classes=num_classes,
         backbone_lr=backbone_lr, head_lr=head_lr, weight_decay=weight_decay,
+        scheduler=scheduler, warmup_epochs=warmup_epochs, max_epochs=epochs,
+        llrd=llrd, mixup=mixup, cutmix=cutmix, label_smoothing=label_smoothing,
         normalize=base_obj.get_normalize(),
     )
 
-    ckpt_dir = out.parent / "_lightning_ckpts" / out.stem
+    ckpt_dir = run_dir / "_lightning_ckpts"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt_cb = ModelCheckpoint(
         dirpath=ckpt_dir, filename="best",
@@ -725,9 +999,13 @@ def finetune_cmd(
     early_cb = EarlyStopping(
         monitor="val_acc", mode="max", patience=patience, verbose=True,
     )
+    csv_logger = CSVLogger(save_dir=str(run_dir), name="", version="")
 
     print(f"\nstarting fine-tune: {epochs} max epochs, "
-          f"backbone_lr={backbone_lr}, head_lr={head_lr}, "
+          f"backbone_lr={backbone_lr}, head_lr={head_lr}, llrd={llrd}, "
+          f"sched={scheduler}{f'+warmup{warmup_epochs}' if scheduler == 'cosine' else ''}, "
+          f"mixup={mixup}, cutmix={cutmix}, label_smoothing={label_smoothing}, "
+          f"randaugment={randaugment}, "
           f"effective_bs={batch_size}×{accumulate_grad_batches}={batch_size * accumulate_grad_batches}, "
           f"precision={precision}", flush=True)
 
@@ -735,6 +1013,7 @@ def finetune_cmd(
         max_epochs=epochs,
         accelerator="auto", devices=1,
         callbacks=[ckpt_cb, early_cb],
+        logger=csv_logger,
         log_every_n_steps=10,
         enable_model_summary=False,
         accumulate_grad_batches=accumulate_grad_batches,
@@ -752,7 +1031,7 @@ def finetune_cmd(
         "head": head_name,
         "head_kwargs": head_kwargs,
         "num_classes": num_classes,
-        "embed_dim": int(ckpt.get("embed_dim", 0)) or int(model.backbone.embed_dim),
+        "embed_dim": int(model.backbone.embed_dim),
         "dataset": dataset,
         # Both backbone and head weights — the backbone is no longer the
         # stock pretrained one after fine-tuning, so we save it fully.
@@ -761,16 +1040,17 @@ def finetune_cmd(
         "val_acc": float(metrics["val_acc"]),
         "val_acc5": float(metrics["val_acc5"]),
         "val_loss": float(metrics["val_loss"]),
-        "finetuned_from": str(probe),
+        "finetuned_from": str(probe) if probe else None,
         "backbone_lr": backbone_lr,
         "head_lr": head_lr,
+        "config": cfg,
     }
-    torch.save(payload, out)
+    torch.save(payload, best_path)
 
     print(f"\nbest val_acc  = {payload['val_acc']:.4f}", flush=True)
     print(f"     val_acc5 = {payload['val_acc5']:.4f}", flush=True)
     print(f"     val_loss = {payload['val_loss']:.4f}", flush=True)
-    print(f"\nwrote fine-tuned probe to {out}", flush=True)
+    print(f"\nwrote fine-tuned model to {best_path}", flush=True)
 
 
 if __name__ == "__main__":
