@@ -130,8 +130,8 @@ nb.cells = [
     # ─── 1. Setup ───────────────────────────────────────────────────────────
     md("## 1. Setup"),
     code(
-        "%cd ../../..",
-        "%ls",
+        "# %cd ../../..",
+        "# %ls",
         "from __future__ import annotations",
         "import warnings",
         "from pathlib import Path",
@@ -747,7 +747,7 @@ nb.cells = [
         "head_ids = list(range(NUM_HEADS))   # show all heads",
         "ref = fv.get_max_reference(head_ids, layer, 'relevance', (0, 8), composite=composite)",
         "print(f'HeadConcept at {layer} — top-8 reference samples per head ({NUM_HEADS} heads)')",
-        "plot_grid(ref, figsize=(12, 1.5 * NUM_HEADS), padding=False)",
+        "_ = plot_grid(ref, figsize=(12, 3 * NUM_HEADS), padding=False)",
     ),
     code(
         "# Same HeadConcept, hooked at q_lrp_probe — ‘which input pixels',",
@@ -756,7 +756,7 @@ nb.cells = [
         "layer = layers[0]",
         "ref = fv.get_max_reference(list(range(NUM_HEADS)), layer, 'relevance', (0, 8), composite=composite)",
         "print(f'HeadConcept at {layer}')",
-        "plot_grid(ref, figsize=(12, 1.5 * NUM_HEADS), padding=False)",
+        "_ = plot_grid(ref, figsize=(12, 3 * NUM_HEADS), padding=False)",
     ),
     code(
         "# Same idea for v_lrp_probe — value subspace.",
@@ -764,7 +764,7 @@ nb.cells = [
         "layer = layers[0]",
         "ref = fv.get_max_reference(list(range(NUM_HEADS)), layer, 'relevance', (0, 8), composite=composite)",
         "print(f'HeadConcept at {layer}')",
-        "plot_grid(ref, figsize=(12, 1.5 * NUM_HEADS), padding=False)",
+        "_ = plot_grid(ref, figsize=(12, 3 * NUM_HEADS), padding=False)",
     ),
     code(
         "# EmbeddingDimConcept at proj_drop — top-K dims.",
@@ -777,7 +777,7 @@ nb.cells = [
         "dim_ids = list(range(TOP_K))",
         "ref = fv.get_max_reference(dim_ids, layer, 'relevance', (0, 8), composite=composite)",
         "print(f'EmbeddingDimConcept at {layer} — dims {dim_ids}')",
-        "plot_grid(ref, figsize=(12, 1.5 * TOP_K), padding=False)",
+        "_ = plot_grid(ref, figsize=(12, 3 * TOP_K), padding=False)",
     ),
     code(
         "# TokenConcept at proj_drop — per-token-position attribution.",
@@ -791,7 +791,7 @@ nb.cells = [
         "ref = fv.get_max_reference(token_ids, layer, 'relevance', (0, 8), composite=composite)",
         "labels = ['cls'] + [f'reg{i}' for i in range(NUM_PREFIX_TOKENS - 1)]",
         "print(f'TokenConcept at {layer} — prefix-token positions: {labels}')",
-        "plot_grid(ref, figsize=(12, 1.5 * NUM_PREFIX_TOKENS), padding=False)",
+        "_ = plot_grid(ref, figsize=(12, 3 * NUM_PREFIX_TOKENS), padding=False)",
     ),
 
     # ─── 7. Conditional propagation cascade (inline) ───────────────────────
