@@ -99,40 +99,93 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DATA_DIR = REPO_ROOT / "data"
 RUNS_DIR = DATA_DIR / "runs"
-DATASETS = ("funny_birds", "dsprites", "imagenet_val_hf", "imagenette", "colored_mnist")
+
+
+# ── Training-dataset registry ────────────────────────────────────────────────
+#
+# One enum-style entry per named training dataset variant. Each entry maps
+# the user-facing CLI choice to `(dataset_name, base_kwargs)` for
+# :func:`experiments.datasets.load`. Dataset-specific overrides
+# (e.g. dsprites target / n_per_class) come from CLI flags that apply only
+# when the matching variant is selected.
+#
+# The choice string is also used as part of on-disk paths
+# (`data/runs/finetune_<base>_<train-ds>/...`) so it must be filesystem-safe
+# — kebab-case is fine.
+
+TRAIN_DATASETS: dict[str, tuple[str, dict]] = {
+    # FunnyBirds — split the train set by ablation status. The official
+    # test split is always zero-ablation; we don't include it here because
+    # you don't train on it.
+    "funny-birds-train-clean":   ("funny_birds",   {"split": "train", "clean_only": True}),
+    "funny-birds-train-full":    ("funny_birds",   {"split": "train", "clean_only": False}),
+    # dSprites — default target=shape (3 classes); override via --dsprites-target.
+    "dsprites":                  ("dsprites",      {"target": "shape"}),
+    # ColoredMNIST — biased train split (0.99 colour↔digit correlation).
+    "colored-mnist-train":       ("colored_mnist", {"split": "train"}),
+    # Imagenette / ImageNet val — included so the cache & finetune paths
+    # work uniformly on these too.
+    "imagenette-train":          ("imagenette",    {"split": "train"}),
+    "imagenet-val-hf":           ("imagenet_val_hf", {}),
+}
+
+
+# Default `--train-ds` choice per legacy dataset name (used by probe-resume
+# flow where the original train-ds isn't recorded in the checkpoint).
+_PROBE_TRAIN_DS_DEFAULTS: dict[str, str] = {
+    "funny_birds":     "funny-birds-train-clean",
+    "dsprites":        "dsprites",
+    "colored_mnist":   "colored-mnist-train",
+    "imagenette":      "imagenette-train",
+    "imagenet_val_hf": "imagenet-val-hf",
+}
+
 
 app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
 
 
-# ── Cache paths ──────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def cache_path(base: str, dataset: str, kind: str) -> Path:
-    return DATA_DIR / f"{base}_{dataset}_{kind}_feats.pt"
+def _resolve_train_ds(
+    train_ds: str, *,
+    dsprites_target: Optional[str] = None,
+    dsprites_n_per_class: Optional[int] = None,
+) -> tuple[str, dict]:
+    """Look up the registry entry for ``train_ds`` and apply any
+    dataset-specific overrides. Returns ``(dataset_name, kwargs)`` ready to
+    pass to :func:`experiments.datasets.load`.
 
-
-def probe_path(base: str, head: str, dataset: str) -> Path:
-    return DATA_DIR / f"{base}_{head}_probe_{dataset}.pt"
-
-
-def _dataset_kwargs(
-    dataset: str, dsprites_target: str, *,
-    split: str = "train", dsprites_n_per_class: Optional[int] = None,
-    funny_birds_clean_only: bool = False,
-) -> dict:
-    if dataset == "dsprites":
-        kw: dict = {"target": dsprites_target}
+    Raises ``typer.BadParameter`` if ``train_ds`` is unknown or if a
+    dataset-specific flag is set on the wrong dataset.
+    """
+    if train_ds not in TRAIN_DATASETS:
+        raise typer.BadParameter(
+            f"unknown --train-ds {train_ds!r}; choose from "
+            f"{sorted(TRAIN_DATASETS)}"
+        )
+    dataset_name, base_kw = TRAIN_DATASETS[train_ds]
+    kw = dict(base_kw)
+    if dataset_name == "dsprites":
+        if dsprites_target is not None:
+            kw["target"] = dsprites_target
         if dsprites_n_per_class is not None:
             kw["n_per_class"] = dsprites_n_per_class
-        return kw
-    if dataset == "funny_birds":
-        kw = {"split": split}
-        if funny_birds_clean_only:
-            kw["clean_only"] = True
-        return kw
-    if dataset in ("imagenette", "colored_mnist"):
-        return {"split": split}
-    return {}
+    else:
+        if dsprites_target is not None or dsprites_n_per_class is not None:
+            raise typer.BadParameter(
+                f"--dsprites-* flags are only valid with --train-ds dsprites; "
+                f"got --train-ds {train_ds!r}"
+            )
+    return dataset_name, kw
+
+
+def cache_path(base: str, train_ds: str, kind: str) -> Path:
+    return DATA_DIR / f"{base}_{train_ds}_{kind}_feats.pt"
+
+
+def probe_path(base: str, head: str, train_ds: str) -> Path:
+    return DATA_DIR / f"{base}_{head}_probe_{train_ds}.pt"
 
 
 # ── cache command ────────────────────────────────────────────────────────────
@@ -143,8 +196,8 @@ def cache_cmd(
     base: str = typer.Argument(
         ..., help=f"Base architecture. One of: {', '.join(BASES)}.",
     ),
-    dataset: str = typer.Argument(
-        ..., help=f"Dataset name. One of: {', '.join(DATASETS)}.",
+    train_ds: str = typer.Argument(
+        ..., help=f"Training-dataset choice. One of: {', '.join(sorted(TRAIN_DATASETS))}.",
     ),
     kind: str = typer.Option(
         "cls", "--kind",
@@ -163,9 +216,14 @@ def cache_cmd(
     force: bool = typer.Option(
         False, "--force", help="Re-extract even if cache exists.",
     ),
-    dsprites_target: str = typer.Option(
-        "shape", "--dsprites-target",
-        help="Latent factor used as the classification target for dsprites.",
+    dsprites_target: Optional[str] = typer.Option(
+        None, "--dsprites-target",
+        help="(--train-ds dsprites only) Override the latent factor used as "
+             "the classification target.",
+    ),
+    dsprites_n_per_class: Optional[int] = typer.Option(
+        None, "--dsprites-n-per-class",
+        help="(--train-ds dsprites only) Subsample to this many images per class.",
     ),
 ):
     """Extract and cache features from a frozen base.
@@ -175,12 +233,14 @@ def cache_cmd(
     """
     if base not in BASES:
         raise typer.BadParameter(f"unknown base {base!r}; choose from {sorted(BASES)}")
-    if dataset not in DATASETS:
-        raise typer.BadParameter(f"unknown dataset {dataset!r}; choose from {sorted(DATASETS)}")
     if kind not in ("cls", "tokens"):
         raise typer.BadParameter(f"unknown kind {kind!r}; choose 'cls' or 'tokens'")
+    dataset_name, dataset_kwargs = _resolve_train_ds(
+        train_ds, dsprites_target=dsprites_target,
+        dsprites_n_per_class=dsprites_n_per_class,
+    )
 
-    out = cache_path(base, dataset, kind)
+    out = cache_path(base, train_ds, kind)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists() and not force:
         d = torch.load(out, map_location="cpu", mmap=True)
@@ -189,11 +249,11 @@ def cache_cmd(
         return
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device  : {device}")
-    print(f"base    : {base}")
-    print(f"dataset : {dataset}")
-    print(f"kind    : {kind}")
-    print(f"out     : {out}")
+    print(f"device   : {device}")
+    print(f"base     : {base}")
+    print(f"train_ds : {train_ds}  ({dataset_name} {dataset_kwargs})")
+    print(f"kind     : {kind}")
+    print(f"out      : {out}")
 
     print("\nbuilding base (frozen)")
     base_obj = build_base(base).to(device)
@@ -202,10 +262,8 @@ def cache_cmd(
     print(f"  embed_dim={base_obj.embed_dim}")
 
     print("\nloading dataset")
-    ds = load_dataset(
-        dataset, transform=transform, **_dataset_kwargs(dataset, dsprites_target),
-    )
-    print(f"  {dataset}: {len(ds)} images, {ds.num_classes} classes")
+    ds = load_dataset(dataset_name, transform=transform, **dataset_kwargs)
+    print(f"  {train_ds}: {len(ds)} images, {ds.num_classes} classes")
 
     # Dataset yields unnormalized [0,1] tensors. Normalize at the forward
     # boundary so the model sees its expected input distribution while
@@ -264,7 +322,9 @@ def cache_cmd(
     print(f"\nsaving cache to {out}", flush=True)
     torch.save(
         {"feats": feats, "labels": labels,
-         "base": base, "dataset": dataset, "kind": kind,
+         "base": base, "train_ds": train_ds,
+         "dataset": dataset_name, "dataset_kwargs": dataset_kwargs,
+         "kind": kind,
          "num_classes": int(ds.num_classes),
          "embed_dim": int(base_obj.embed_dim)},
         out,
@@ -357,8 +417,8 @@ def train_cmd(
     head: str = typer.Argument(
         ..., help=f"Head architecture. One of: {', '.join(HEADS)}.",
     ),
-    dataset: str = typer.Argument(
-        ..., help=f"Dataset name. One of: {', '.join(DATASETS)}.",
+    train_ds: str = typer.Argument(
+        ..., help=f"Training-dataset choice. One of: {', '.join(sorted(TRAIN_DATASETS))}.",
     ),
     epochs: int = typer.Option(
         50, "--epochs", help="Max epochs (EarlyStopping usually stops earlier).",
@@ -387,13 +447,13 @@ def train_cmd(
         help="LR schedule. 'none' (default — constant LR) or 'cosine' "
              "(warmup → cosine annealing, the DINOv2/v3 probe protocol).",
     ),
-    warmup_epochs: int = typer.Option(
-        5, "--warmup-epochs",
+    cosine_warmup_epochs: int = typer.Option(
+        5, "--cosine-warmup-epochs",
         help="(--scheduler cosine only) Linear warmup epochs from lr×1e-6 to lr.",
     ),
     out: Optional[Path] = typer.Option(
         None, "--out",
-        help="Output .pt path. Default: data/<base>_<head>_probe_<dataset>.pt",
+        help="Output .pt path. Default: data/<base>_<head>_probe_<train-ds>.pt",
     ),
     seed: int = typer.Option(0, "--seed"),
 ):
@@ -406,35 +466,37 @@ def train_cmd(
         raise typer.BadParameter(f"unknown base {base!r}; choose from {sorted(BASES)}")
     if head not in HEADS:
         raise typer.BadParameter(f"unknown head {head!r}; choose from {sorted(HEADS)}")
-    if dataset not in DATASETS:
-        raise typer.BadParameter(f"unknown dataset {dataset!r}; choose from {sorted(DATASETS)}")
+    if train_ds not in TRAIN_DATASETS:
+        raise typer.BadParameter(
+            f"unknown --train-ds {train_ds!r}; choose from {sorted(TRAIN_DATASETS)}"
+        )
 
     L.seed_everything(seed, workers=True)
 
     head_cls = HEADS[head]
     kind = head_cls.input_kind
-    cache = cache_path(base, dataset, kind)
+    cache = cache_path(base, train_ds, kind)
     if not cache.exists():
         raise typer.Exit(
             f"\nMissing feature cache at {cache}. Run:\n\n"
-            f"    uv run python experiments/train_probe.py cache "
-            f"{base} {dataset} --kind {kind}\n"
+            f"    uv run python -m experiments.train_probe cache "
+            f"{base} {train_ds} --kind {kind}\n"
         )
 
     if out is None:
-        out = probe_path(base, head, dataset)
+        out = probe_path(base, head, train_ds)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"base    : {base}")
+    print(f"base     : {base}")
     head_info = ""
     if head == "attentive":
         head_info = f" (num_heads={num_heads})"
     elif head == "block":
         head_info = f" (num_heads={num_heads}, mlp_ratio={mlp_ratio})"
-    print(f"head    : {head}{head_info}")
-    print(f"dataset : {dataset}")
-    print(f"cache   : {cache}")
-    print(f"out     : {out}")
+    print(f"head     : {head}{head_info}")
+    print(f"train_ds : {train_ds}")
+    print(f"cache    : {cache}")
+    print(f"out      : {out}")
 
     print(f"\nloading cache (mmap={kind == 'tokens'})")
     d = torch.load(cache, map_location="cpu", mmap=(kind == "tokens"))
@@ -462,19 +524,19 @@ def train_cmd(
     n = len(feats)
     n_val = max(1, int(round(n * val_frac)))
     full = TensorDataset(feats, labels)
-    train_ds, val_ds = random_split(
+    train_split, val_split = random_split(
         full, [n - n_val, n_val],
         generator=torch.Generator().manual_seed(seed),
     )
-    print(f"\nsplit: train={len(train_ds)}, val={len(val_ds)}")
+    print(f"\nsplit: train={len(train_split)}, val={len(val_split)}")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_split, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_split, batch_size=batch_size, shuffle=False)
 
     lm = _ProbeLM(
         head_obj, num_classes=num_classes,
         lr=lr, weight_decay=weight_decay,
-        scheduler=scheduler, warmup_epochs=warmup_epochs, max_epochs=epochs,
+        scheduler=scheduler, warmup_epochs=cosine_warmup_epochs, max_epochs=epochs,
     )
 
     ckpt_dir = out.parent / "_lightning_ckpts" / out.stem
@@ -507,7 +569,9 @@ def train_cmd(
         "head_kwargs": head_kwargs,
         "num_classes": num_classes,
         "embed_dim": embed_dim,
-        "dataset": dataset,
+        "train_ds": train_ds,
+        "dataset": d.get("dataset"),       # bare dataset name from cache
+        "dataset_kwargs": d.get("dataset_kwargs"),
         "head_state_dict": lm.head.state_dict(),
         "val_acc": float(metrics["val_acc"]),
         "val_acc5": float(metrics["val_acc5"]),
@@ -791,9 +855,9 @@ def finetune_cmd(
     from_scratch: bool = typer.Option(
         False, "--from-scratch",
         help="Skip probe-checkpoint loading; build a fresh head and "
-             "fine-tune end-to-end. Requires --base, --dataset; --head "
-             "defaults to 'linear'. Used for vit_small full fine-tune "
-             "where there's no prior probe run.",
+             "fine-tune end-to-end. Requires --base and --train-ds; "
+             "--head defaults to 'linear'. Used for vit_small full "
+             "fine-tune where there's no prior probe run.",
     ),
     base: Optional[str] = typer.Option(
         None, "--base",
@@ -803,9 +867,11 @@ def finetune_cmd(
         "linear", "--head",
         help=f"(--from-scratch only) Head architecture. One of: {', '.join(HEADS)}.",
     ),
-    dataset: Optional[str] = typer.Option(
-        None, "--dataset",
-        help=f"(--from-scratch only) Dataset. One of: {', '.join(DATASETS)}.",
+    train_ds: Optional[str] = typer.Option(
+        None, "--train-ds",
+        help="(--from-scratch only) Training-dataset choice. One of: "
+             f"{', '.join(sorted(TRAIN_DATASETS))}. "
+             "Encodes both dataset name and variant (clean vs full, etc.).",
     ),
     epochs: int = typer.Option(
         15, "--epochs", help="Max epochs (each epoch is a full backbone forward+backward pass).",
@@ -871,11 +937,11 @@ def finetune_cmd(
         0.0, "--label-smoothing",
         help="Label smoothing ε passed to cross-entropy.",
     ),
-    llrd: float = typer.Option(
-        1.0, "--llrd",
-        help="Layer-wise LR decay rate. Backbone block i (counting from "
-             "input) gets lr × llrd^(depth - 1 - i). 1.0 = off; 0.65 = "
-             "common ImageNet ViT fine-tune setting.",
+    layerwise_lr_decay: float = typer.Option(
+        1.0, "--layerwise-lr-decay",
+        help="Per-block backbone LR decay rate (was: --llrd). Backbone "
+             "block i (counting from input) gets lr × rate^(depth-1-i). "
+             "1.0 = off; 0.65–0.7 = common ImageNet ViT fine-tune setting.",
     ),
     scheduler: str = typer.Option(
         "none", "--scheduler",
@@ -895,31 +961,26 @@ def finetune_cmd(
         1e4, "--onecycle-final-div-factor",
         help="(--scheduler onecycle) final_lr = initial_lr / final_div_factor.",
     ),
-    warmup_epochs: int = typer.Option(
-        0, "--warmup-epochs",
+    cosine_warmup_epochs: int = typer.Option(
+        0, "--cosine-warmup-epochs",
         help="(--scheduler cosine) Linear warmup epochs from lr×1e-6 to lr.",
     ),
-    dsprites_target: str = typer.Option(
-        "shape", "--dsprites-target",
-        help="(dsprites only) Latent factor used as label.",
+    dsprites_target: Optional[str] = typer.Option(
+        None, "--dsprites-target",
+        help="(--train-ds dsprites only) Override the latent factor used "
+             "as label. Default = 'shape' (3-class).",
     ),
     dsprites_n_per_class: Optional[int] = typer.Option(
         None, "--dsprites-n-per-class",
-        help="(dsprites only) Subsample to this many images per class. "
-             "Default = full 737k. Use ~5000-10000 for fast iteration; "
-             "the 3-class shape task is trivial enough that 30 k images "
-             "suffice for >99 % val_acc.",
-    ),
-    funny_birds_clean_only: bool = typer.Option(
-        True, "--funny-birds-clean-only/--funny-birds-all",
-        help="(funny_birds only) Filter train split to intact-bird samples "
-             "(~29 k of 50 k). Default True — matches the 98 % advertised "
-             "test accuracy.",
+        help="(--train-ds dsprites only) Subsample to this many images "
+             "per class. Default = full 737 k. Use ~5000-10000 for fast "
+             "iteration; the 3-class shape task is trivial enough that "
+             "30 k images suffice for > 99 % val_acc.",
     ),
     output_dir: Optional[Path] = typer.Option(
         None, "--output-dir",
         help="Run directory for best.pt + config.json + metrics.csv. "
-             "Default: data/runs/finetune_<base>_<dataset>/<UTC ts>/.",
+             "Default: data/runs/finetune_<base>_<train-ds>/<UTC ts>/.",
     ),
     out: Optional[Path] = typer.Option(
         None, "--out",
@@ -935,12 +996,16 @@ def finetune_cmd(
     * **probe-resume** — pass a probe checkpoint as the first arg; the
       backbone is unfrozen and the trained head continues training. Used
       to push DINOv3 probes past their frozen-backbone ceiling.
-    * **--from-scratch** — pass ``--base``, ``--dataset`` (and optionally
-      ``--head``); a fresh head is built and the whole stack is
-      fine-tuned. Used for the vit_small runs on FunnyBirds / dSprites /
-      ColoredMNIST. Combine with ``--llrd 0.65 --scheduler cosine
-      --warmup-epochs 5 --randaugment --mixup 0.8 --label-smoothing 0.1``
-      for the standard ImageNet ViT recipe.
+    * **--from-scratch** — pass ``--base`` and ``--train-ds`` (and
+      optionally ``--head``); a fresh head is built and the whole stack
+      is fine-tuned. Used for the vit_small runs. Validated recipe on
+      FunnyBirds:
+
+        ``--scheduler onecycle --onecycle-pct-start 0.1
+        --backbone-lr 5e-4 --head-lr 5e-3 --layerwise-lr-decay 0.7
+        --randaugment --label-smoothing 0.1``
+
+      hits test top-1 0.984 in 25 epochs.
 
     Always writes ``best.pt`` (model + metadata), ``config.json`` (the
     full Typer params), and ``metrics.csv`` (per-epoch logs) into the
@@ -949,28 +1014,23 @@ def finetune_cmd(
     L.seed_everything(seed, workers=True)
 
     if from_scratch:
-        if base is None or dataset is None:
-            raise typer.BadParameter("--from-scratch requires --base and --dataset")
+        if base is None or train_ds is None:
+            raise typer.BadParameter("--from-scratch requires --base and --train-ds")
         if base not in BASES:
             raise typer.BadParameter(f"unknown base {base!r}; choose from {sorted(BASES)}")
         if head not in HEADS:
             raise typer.BadParameter(f"unknown head {head!r}; choose from {sorted(HEADS)}")
-        if dataset not in DATASETS:
-            raise typer.BadParameter(f"unknown dataset {dataset!r}; choose from {sorted(DATASETS)}")
+        dataset_name, dataset_kwargs = _resolve_train_ds(
+            train_ds, dsprites_target=dsprites_target,
+            dsprites_n_per_class=dsprites_n_per_class,
+        )
         base_name, head_name = base, head
         head_kwargs: dict = {}
-        # num_classes comes from the dataset.
-        ds_probe = load_dataset(
-            dataset, transform=None, **_dataset_kwargs(
-            dataset, dsprites_target,
-            dsprites_n_per_class=dsprites_n_per_class,
-            funny_birds_clean_only=funny_birds_clean_only,
-        ),
-        )
+        ds_probe = load_dataset(dataset_name, transform=None, **dataset_kwargs)
         num_classes = int(ds_probe.num_classes)
         ckpt = None
         print(f"from-scratch fine-tune: base={base_name}  head={head_name}  "
-              f"dataset={dataset}  num_classes={num_classes}", flush=True)
+              f"train_ds={train_ds}  num_classes={num_classes}", flush=True)
     else:
         if probe is None:
             raise typer.BadParameter("missing probe checkpoint (or pass --from-scratch)")
@@ -980,9 +1040,26 @@ def finetune_cmd(
         head_name = ckpt["head"]
         head_kwargs = ckpt.get("head_kwargs", {})
         num_classes = int(ckpt["num_classes"])
-        dataset = ckpt["dataset"]
+        # Resolve train_ds from the probe checkpoint: prefer the explicit
+        # field (new), fall back to the legacy `dataset` + default-variant
+        # lookup (old probe checkpoints have only the bare dataset name).
+        ckpt_train_ds = ckpt.get("train_ds")
+        if ckpt_train_ds is not None and ckpt_train_ds in TRAIN_DATASETS:
+            train_ds = ckpt_train_ds
+        else:
+            legacy_dataset = ckpt.get("dataset")
+            train_ds = _PROBE_TRAIN_DS_DEFAULTS.get(legacy_dataset)
+            if train_ds is None:
+                raise RuntimeError(
+                    f"probe ckpt {probe} has no recognisable train-ds: "
+                    f"train_ds={ckpt_train_ds!r}, dataset={legacy_dataset!r}"
+                )
+        dataset_name, dataset_kwargs = _resolve_train_ds(
+            train_ds, dsprites_target=dsprites_target,
+            dsprites_n_per_class=dsprites_n_per_class,
+        )
         print(f"  base={base_name}  head={head_name}  head_kwargs={head_kwargs}")
-        print(f"  num_classes={num_classes}  dataset={dataset}")
+        print(f"  num_classes={num_classes}  train_ds={train_ds}  ({dataset_name} {dataset_kwargs})")
         print(f"  starting val_acc (frozen backbone): {ckpt.get('val_acc', '?'):.4f}")
 
     # Resolve run dir (timestamped) — single source of truth for outputs.
@@ -993,7 +1070,7 @@ def finetune_cmd(
             run_dir.mkdir(parents=True, exist_ok=True)
             best_path = out
         else:
-            run_dir = _auto_run_dir(f"finetune_{base_name}_{dataset}")
+            run_dir = _auto_run_dir(f"finetune_{base_name}_{train_ds}")
             best_path = run_dir / "best.pt"
     else:
         run_dir = Path(output_dir)
@@ -1004,7 +1081,9 @@ def finetune_cmd(
 
     # Persist the full Typer config for reproducibility.
     cfg = {
-        "base": base_name, "head": head_name, "dataset": dataset,
+        "base": base_name, "head": head_name,
+        "train_ds": train_ds, "dataset": dataset_name,
+        "dataset_kwargs": dataset_kwargs,
         "num_classes": num_classes, "epochs": epochs, "patience": patience,
         "backbone_lr": backbone_lr, "head_lr": head_lr,
         "weight_decay": weight_decay, "batch_size": batch_size,
@@ -1012,15 +1091,15 @@ def finetune_cmd(
         "val_frac": val_frac, "precision": precision, "augment": augment,
         "randaugment": randaugment, "colorjitter_hue": colorjitter_hue,
         "mixup": mixup, "cutmix": cutmix,
-        "label_smoothing": label_smoothing, "llrd": llrd,
-        "scheduler": scheduler, "warmup_epochs": warmup_epochs,
+        "label_smoothing": label_smoothing,
+        "layerwise_lr_decay": layerwise_lr_decay,
+        "scheduler": scheduler, "cosine_warmup_epochs": cosine_warmup_epochs,
         "onecycle_pct_start": onecycle_pct_start,
         "onecycle_div_factor": onecycle_div_factor,
         "onecycle_final_div_factor": onecycle_final_div_factor,
         "from_scratch": from_scratch, "probe": str(probe) if probe else None,
         "dsprites_target": dsprites_target,
         "dsprites_n_per_class": dsprites_n_per_class,
-        "funny_birds_clean_only": funny_birds_clean_only,
         "seed": seed,
     }
     (run_dir / "config.json").write_text(json.dumps(cfg, indent=2))
@@ -1052,20 +1131,8 @@ def finetune_cmd(
         if augment else val_tfm
     )
 
-    ds_train = load_dataset(
-        dataset, transform=train_tfm, **_dataset_kwargs(
-            dataset, dsprites_target,
-            dsprites_n_per_class=dsprites_n_per_class,
-            funny_birds_clean_only=funny_birds_clean_only,
-        ),
-    )
-    ds_val = load_dataset(
-        dataset, transform=val_tfm, **_dataset_kwargs(
-            dataset, dsprites_target,
-            dsprites_n_per_class=dsprites_n_per_class,
-            funny_birds_clean_only=funny_birds_clean_only,
-        ),
-    )
+    ds_train = load_dataset(dataset_name, transform=train_tfm, **dataset_kwargs)
+    ds_val   = load_dataset(dataset_name, transform=val_tfm,   **dataset_kwargs)
     n = len(ds_train)
     n_val = max(1, int(round(n * val_frac)))
     gen = torch.Generator().manual_seed(seed)
@@ -1090,8 +1157,9 @@ def finetune_cmd(
     lm = _FinetuneLM(
         model, num_classes=num_classes,
         backbone_lr=backbone_lr, head_lr=head_lr, weight_decay=weight_decay,
-        scheduler=scheduler, warmup_epochs=warmup_epochs, max_epochs=epochs,
-        llrd=llrd, mixup=mixup, cutmix=cutmix, label_smoothing=label_smoothing,
+        scheduler=scheduler, warmup_epochs=cosine_warmup_epochs, max_epochs=epochs,
+        llrd=layerwise_lr_decay,
+        mixup=mixup, cutmix=cutmix, label_smoothing=label_smoothing,
         onecycle_pct_start=onecycle_pct_start,
         onecycle_div_factor=onecycle_div_factor,
         onecycle_final_div_factor=onecycle_final_div_factor,
@@ -1110,8 +1178,9 @@ def finetune_cmd(
     csv_logger = CSVLogger(save_dir=str(run_dir), name="", version="")
 
     print(f"\nstarting fine-tune: {epochs} max epochs, "
-          f"backbone_lr={backbone_lr}, head_lr={head_lr}, llrd={llrd}, "
-          f"sched={scheduler}{f'+warmup{warmup_epochs}' if scheduler == 'cosine' else ''}, "
+          f"backbone_lr={backbone_lr}, head_lr={head_lr}, "
+          f"layerwise_lr_decay={layerwise_lr_decay}, "
+          f"sched={scheduler}{f'+warmup{cosine_warmup_epochs}' if scheduler == 'cosine' else ''}, "
           f"mixup={mixup}, cutmix={cutmix}, label_smoothing={label_smoothing}, "
           f"randaugment={randaugment}, "
           f"effective_bs={batch_size}×{accumulate_grad_batches}={batch_size * accumulate_grad_batches}, "
@@ -1140,7 +1209,9 @@ def finetune_cmd(
         "head_kwargs": head_kwargs,
         "num_classes": num_classes,
         "embed_dim": int(model.backbone.embed_dim),
-        "dataset": dataset,
+        "train_ds": train_ds,
+        "dataset": dataset_name,
+        "dataset_kwargs": dataset_kwargs,
         # Both backbone and head weights — the backbone is no longer the
         # stock pretrained one after fine-tuning, so we save it fully.
         "backbone_state_dict": lm.model.backbone.state_dict(),
