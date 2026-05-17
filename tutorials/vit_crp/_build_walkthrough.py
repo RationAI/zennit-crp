@@ -130,7 +130,7 @@ nb.cells = [
     # ─── 1. Setup ───────────────────────────────────────────────────────────
     md("## 1. Setup"),
     code(
-        "# %cd ../../..",
+        "# %cd ../..",
         "# %ls",
         "from __future__ import annotations",
         "import warnings",

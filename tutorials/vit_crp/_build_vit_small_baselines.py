@@ -1,7 +1,7 @@
 """Build the vit_small XAI-baselines notebook.
 
 Idempotent — re-run to regenerate ``vit_small_baselines.ipynb``. Sister
-notebook to ``dinov3_unfolded/walkthrough.ipynb`` but focused on:
+notebook to ``walkthrough.ipynb`` but focused on:
 
 * training the same vit_small backbone on three small datasets
   (FunnyBirds, dSprites, ColoredMNIST) via the project's finetune CLI;
@@ -37,7 +37,7 @@ nb.cells = [
     md(
         "# vit_small × {FunnyBirds, dSprites, ColoredMNIST} — XAI baselines",
         "",
-        "Companion to `dinov3_unfolded/walkthrough.ipynb`. Two parts:",
+        "Companion to `walkthrough.ipynb`. Two parts:",
         "",
         "1. **Train a small ViT** — the project's finetune CLI applied to",
         "   the 22 M-parameter `vit_small_patch16_224.augreg_in21k_ft_in1k`",
@@ -64,7 +64,7 @@ nb.cells = [
     # ─── 1. Setup ─────────────────────────────────────────────────────────
     md("## 1. Setup"),
     code(
-        "%cd ../../..",
+        "%cd ../..",
         "%ls",
         "from __future__ import annotations",
         "from pathlib import Path",
