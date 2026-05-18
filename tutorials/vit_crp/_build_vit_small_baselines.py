@@ -64,8 +64,8 @@ nb.cells = [
     # ─── 1. Setup ─────────────────────────────────────────────────────────
     md("## 1. Setup"),
     code(
-        "%cd ../..",
-        "%ls",
+        "# %cd ../..",
+        "# %ls",
         "from __future__ import annotations",
         "from pathlib import Path",
         "",
