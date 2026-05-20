@@ -144,3 +144,7 @@ var/
 venv.bak/
 venv/
 wheels/
+
+# Scratch / dev artifacts
+tmp/
+

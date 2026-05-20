@@ -224,6 +224,30 @@ def dropout_passthrough_forward(self, x):
     return x
 
 
+def _make_mha_cplrp_forward(original_forward):
+    """Build an ``nn.MultiheadAttention.forward`` replacement that
+    implements CP-LRP by detaching ``query`` and ``key`` before
+    delegating to ``original_forward`` (which is the BOUND method of the
+    target instance, captured at canonizer-apply time).
+
+    Mirror of :func:`lxt.efficient.patches.cp_multi_head_attention_forward`:
+    once Q and K carry no gradient, the softmax weights downstream are a
+    graph constant, and ``out = softmax(QKᵀ/√d) @ V`` routes
+    ``R_V = weightsᵀ @ R_out`` via standard autograd → CP-LRP value path.
+
+    `torchvision.models.vit_b_16` calls MHA with ``query is key is value``
+    (self-attention). After ``query.detach()`` and ``key.detach()``, the
+    three are distinct tensor objects, so MHA's ``_in_projection_packed``
+    fast-path is skipped and the chunked ``_in_projection`` path is used:
+    the Q and K row-blocks of ``in_proj_weight`` get no gradient, only
+    the V block does. The Q/K linear projections are LRP-dead exactly as
+    LXT's recipe intends.
+    """
+    def patched(self, query, key, value, *args, **kwargs):
+        return original_forward(query.detach(), key.detach(), value, *args, **kwargs)
+    return patched
+
+
 # NOTE: ``_eva_attention_forward`` was removed in the unfolding refactor.
 # Eva attention is now handled by :class:`crp.attention_unfolded.EvaAttentionUnfolded`
 # + :class:`crp.attention_unfolded.EvaAttentionSubstitutionCanonizer`. The
@@ -555,6 +579,43 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
         )
 
 
+class TorchvisionMHACPLRPCanonizer(AttributeCanonizer):
+    """Canonizer that installs CP-LRP on ``torch.nn.MultiheadAttention``.
+
+    Drop-in zennit replacement for LXT's instance-level patch in
+    :func:`lxt.efficient.patches.cp_multi_head_attention_forward`. Each
+    matched MHA instance gets its forward rebound to a wrapper that
+    calls ``query.detach()`` and ``key.detach()`` before delegating to
+    the original forward — so Q,K paths carry no gradient and only the
+    value path receives relevance.
+
+    Targets ``nn.MultiheadAttention`` (any instance). The intended use
+    is on `torchvision.models.vision_transformer` ViTs (vit_b_16,
+    vit_l_16, etc.); other models using ``nn.MultiheadAttention`` are
+    canonized identically.
+
+    Combine with :class:`LayerNormForwardCanonizer`,
+    :class:`GELUIdentityRuleCanonizer`, and
+    :class:`DropoutPassthroughCanonizer` to obtain the zennit-side
+    equivalent of LXT-efficient's published vision-transformer recipe
+    (``lxt.efficient.models.vit_torch.cp_LRP``).
+    """
+
+    def __init__(self):
+        super().__init__(self._attribute_map)
+
+    def _attribute_map(self, _name, module):
+        if not isinstance(module, nn.MultiheadAttention):
+            return None
+        # Capture the BOUND original forward so the closure has self pre-baked.
+        original_forward = module.forward
+        patched = _make_mha_cplrp_forward(original_forward)
+        return _bind_forward(module, patched)
+
+    def copy(self):
+        return type(self)()
+
+
 class VitPosEmbedPALRPCanonizer(AttributeCanonizer):
     """Canonizer that swaps ``_pos_embed`` on timm ``VisionTransformer``
     instances to apply the PA-LRP uniform rule (Bakish et al. 2025;
@@ -857,6 +918,7 @@ __all__ = [
     "DropoutPassthroughCanonizer",
     "TimmBlockResidualCanonizer",
     "EvaBlockResidualCanonizer",
+    "TorchvisionMHACPLRPCanonizer",
     "VitPosEmbedPALRPCanonizer",
     "TimmViTCanonizer",
     # composites (3 total — clean, no remedy-toggle bloat)
