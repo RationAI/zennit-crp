@@ -89,48 +89,66 @@ def _signed_eps_add(input: torch.Tensor, epsilon: float) -> torch.Tensor:
 
 class _IdentityRuleFn(Function):
     """LRP-0 identity rule for element-wise activations (Bach et al. 2015;
-    AttnLRP §3.2.2, Eq. 9): backward returns ``(output/stab(output)) · R_y``.
+    AttnLRP §3.2.2, Eq. 9). Backward returns ``saved · R_y`` where the
+    saved factor depends on the chosen convention.
 
     For elementwise ``y = f(x)`` the LRP-0 derivation treats the activation
     as a 1×1 "linear" with weight ``f(x)/x`` per element, giving::
 
         R_x_i = x_i · (f(x_i)/x_i) / y_i · R_y_i = R_y_i   (when y_i ≠ 0)
 
-    so the rule reduces to ``R_x = R_y`` whenever the element contributed
-    to the output, and to 0 when it did not. The ε-stabilised form is::
+    The TWO equivalent ε-stabilised implementations differ only by
+    *which* convention they are paired with:
 
-        R_x = R_y · y / (y + ε·sign(y))   ≈ R_y for |y| ≫ ε, 0 for |y| ≪ ε.
+    * **Relevance-space** (``formula='relevance'``, default): save
+      ``y / (y + ε)``. Backward ≈ ``R_y`` for active elements, ≈ 0 for
+      inactive. Correct when zennit's stock BasicHook is in use — the
+      hook returns relevance directly, so the identity rule must do the
+      same.
 
-    Implementation: save ``output / stab(output)`` on forward (≈ ±1
-    everywhere except where output is near zero), multiply by incoming
-    relevance on backward.
+    * **Gradient×input** (``formula='grad_times_input'``): save
+      ``y / (x + ε)`` — the per-element ``f(x)/x``. Correct when
+      :func:`lxt.efficient.zennit_patches.monkey_patch_zennit` has
+      patched zennit's BasicHook to operate in gradient×input space
+      (multiply by output going in, divide by input going out). Matches
+      LXT's :class:`lxt.efficient.rules.identity_rule_implicit_fn` —
+      bit-for-bit when ``epsilon`` matches LXT's default (``1e-10``).
 
-    *Earlier (buggy) version used ``output/stab(input)`` instead* — that
-    over-dampened relevance whenever the input was near ε regardless of
-    whether the activation was active, breaking conservation by up to
-    100× per layer (see ``experiments/audit_identity_rule.py``).
+    Mixing conventions breaks: ``y/(y+ε)`` under monkey_patch_zennit
+    over-passes relevance through inactive GELU elements (≈1 instead of
+    ≈0 because ``y/(y+ε)`` is ~1 whenever |y| ≫ ε, even when x is very
+    negative). Pick the formula that matches the surrounding hook
+    convention.
 
     Parameters (via :func:`identity_rule_implicit`):
 
     * ``epsilon`` — stabiliser magnitude. Default ``1e-6``.
     * ``signed`` — when True, use ``y + ε·sign(y)`` instead of ``y + ε``
-      (AttnLRP Eq. 16). zennit's :func:`zennit.core.stabilize` is
-      sign-aware by default; this flag exists for parity with the
-      paper's notation.
+      in the denominator (AttnLRP Eq. 16). Applies to ``'relevance'``
+      mode only.
+    * ``formula`` — ``'relevance'`` or ``'grad_times_input'`` (see
+      above). Default ``'relevance'``.
     """
 
     @staticmethod
-    def forward(ctx, fn, input, epsilon=1e-6, signed=False):
+    def forward(ctx, fn, input, epsilon=1e-6, signed=False, formula="relevance"):
         output = fn(input)
         if input.requires_grad:
-            denom = _signed_eps_add(output, epsilon) if signed else output + epsilon
-            ctx.save_for_backward(output / denom)
+            if formula == "relevance":
+                denom = _signed_eps_add(output, epsilon) if signed else output + epsilon
+                ctx.save_for_backward(output / denom)
+            elif formula == "grad_times_input":
+                ctx.save_for_backward(output / (input + epsilon))
+            else:
+                raise ValueError(
+                    f"formula must be 'relevance' or 'grad_times_input'; got {formula!r}"
+                )
         return output
 
     @staticmethod
     def backward(ctx, *out_relevance):
         gradient = ctx.saved_tensors[0] * out_relevance[0]
-        return None, gradient, None, None
+        return None, gradient, None, None, None
 
 
 class _DivideGradientFn(Function):
@@ -180,9 +198,12 @@ class _ResidualRatioFn(Function):
 # Convenience callables (used inside the forward replacements below).
 
 
-def identity_rule_implicit(fn, input, *, epsilon: float = 1e-6):
-    """Apply ``fn(input)`` with the AttnLRP identity rule inlined into backward."""
-    return _IdentityRuleFn.apply(fn, input, epsilon)
+def identity_rule_implicit(
+    fn, input, *, epsilon: float = 1e-6, formula: str = "relevance",
+):
+    """Apply ``fn(input)`` with the AttnLRP identity rule inlined into
+    backward. See :class:`_IdentityRuleFn` for the ``formula`` choices."""
+    return _IdentityRuleFn.apply(fn, input, epsilon, False, formula)
 
 
 def divide_gradient(input, factor: int = 2):
@@ -437,18 +458,28 @@ class LayerNormForwardCanonizer(AttributeCanonizer):
 class GELUIdentityRuleCanonizer(AttributeCanonizer):
     """Canonizer that routes ``nn.GELU`` through :class:`_IdentityRuleFn`.
 
-    AttnLRP §3.2.2 — element-wise non-linearities use the identity rule
-    (relevance flows through ``output / stab(output)``, ≈ ``R_y`` for
-    active activations and ≈ 0 for inactive).
+    AttnLRP §3.2.2 — element-wise non-linearities use the identity rule.
 
     Parameters
     ----------
     epsilon : float
         Stabiliser magnitude. Default ``1e-6``.
+    formula : {'relevance', 'grad_times_input'}
+        Selects the identity-rule kernel formula. ``'relevance'``
+        (default) saves ``y/(y+ε)`` and is correct in zennit's
+        relevance-space convention. ``'grad_times_input'`` saves
+        ``y/(x+ε)`` and is correct when
+        :func:`lxt.efficient.zennit_patches.monkey_patch_zennit` is
+        active (zennit's BasicHook runs in gradient×input space).
+        Mixing conventions yields incorrect heatmaps on signed
+        activations like GELU. See :class:`_IdentityRuleFn`.
     """
 
-    def __init__(self, *, epsilon: float = 1e-6):
+    def __init__(
+        self, *, epsilon: float = 1e-6, formula: str = "relevance",
+    ):
         self.epsilon = epsilon
+        self.formula = formula
         super().__init__(self._attribute_map)
 
     def _attribute_map(self, _name, module):
@@ -456,16 +487,20 @@ class GELUIdentityRuleCanonizer(AttributeCanonizer):
             return None
         original_forward = type(module).forward
         eps = self.epsilon
+        formula = self.formula
 
         def patched(self, x):
             return identity_rule_implicit(
-                lambda inp: original_forward(self, inp), x, epsilon=eps,
+                lambda inp: original_forward(self, inp),
+                x,
+                epsilon=eps,
+                formula=formula,
             )
 
         return _bind_forward(module, patched)
 
     def copy(self):
-        return type(self)(epsilon=self.epsilon)
+        return type(self)(epsilon=self.epsilon, formula=self.formula)
 
 
 class DropoutPassthroughCanonizer(AttributeCanonizer):
