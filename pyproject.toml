@@ -40,6 +40,8 @@ dependencies = [
   "nbconvert>=7.17.1",
   "torchview>=0.2.7",
   "legrad-torch>=1.1",
+  "plotly>=5.0,<6.0",
+  "bokeh>=3.0",
 ]
 
 [project.optional-dependencies]
