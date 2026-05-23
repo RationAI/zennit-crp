@@ -74,8 +74,11 @@ def attention_lol(
     curve_bend: float = 0.18,
     max_lines: int = 20000,
     heatmap_height: int = 100,
+    scale: float = 1.0,
 ):
     """Side-by-side attention viz. Images scaled to common display height."""
+    frame_height = int(round(frame_height * scale))
+    heatmap_height = int(round(heatmap_height * scale))
     if attention.ndim != 4:
         raise ValueError(
             f"attention must be 4-D (H1,W1,H2,W2); got shape {attention.shape}"
@@ -251,14 +254,14 @@ def attention_lol(
         x0="x0", y0="y0", x1="x1", y1="y1",
         cx0="cx0", cy0="cy0", cx1="cx1", cy1="cy1",
         source=pos_src,
-        line_color="#1f77ff", line_alpha="line_alpha",
+        line_color="#ff2020", line_alpha="line_alpha",
         line_width="line_width", line_cap="round",
     )
     neg_glyph = fig.bezier(
         x0="x0", y0="y0", x1="x1", y1="y1",
         cx0="cx0", cy0="cy0", cx1="cx1", cy1="cy1",
         source=neg_src,
-        line_color="#ff2020", line_alpha="line_alpha",
+        line_color="#1f77ff", line_alpha="line_alpha",
         line_width="line_width", line_cap="round",
     )
     # Default: only positives shown.
@@ -327,7 +330,7 @@ def attention_lol(
     # Flat mapped tensor for JS partial aggregation.
     att_src = ColumnDataSource(dict(att=[mapped.astype(f32).ravel()]))
 
-    heat_mapper = LinearColorMapper(palette=tuple(reversed(RdBu11)),
+    heat_mapper = LinearColorMapper(palette=RdBu11,
                                     low=-1.0, high=1.0)
 
     # Heatmap aspect ratio == image aspect ratio. Each heatmap has the same
@@ -378,7 +381,7 @@ def attention_lol(
                         title="Threshold |tanh(attention)|", width=300)
     method_radio = RadioGroup(labels=["mean", "max"], active=0, inline=True,
                               width=140)
-    sign_chk = CheckboxGroup(labels=["positive (blue)", "negative (red)"],
+    sign_chk = CheckboxGroup(labels=["positive (red)", "negative (blue)"],
                              active=[0], width=180)
     grid_chk = CheckboxGroup(labels=["Show grid"], active=[], width=100)
     reset_btn = Button(label="Clear selection", width=140, button_type="warning")
