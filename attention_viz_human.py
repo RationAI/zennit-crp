@@ -75,6 +75,7 @@ def attention_lol(
     max_lines: int = 20000,
     heatmap_height: int = 100,
     scale: float = 1.0,
+    logistic_steepness: float = 1.0,
 ):
     """Side-by-side attention viz. Images scaled to common display height."""
     frame_height = int(round(frame_height * scale))
@@ -112,7 +113,6 @@ def attention_lol(
     from bokeh.models import (ColumnDataSource, CustomJS, Div, Slider,
                               CheckboxGroup, Button, Range1d, TapTool,
                               RadioGroup, LinearColorMapper, ColorBar)
-    from bokeh.palettes import RdBu11
     from bokeh.layouts import column, row, gridplot
     from bokeh.io import show, output_notebook, state
     if not state.curstate().notebook:
@@ -168,7 +168,7 @@ def attention_lol(
 
     # -- attention bezier curves --------------------------------------------
     # Modified logistic: tanh maps (-inf, +inf) -> (-1, +1) smoothly.
-    mapped = np.tanh(np.asarray(attention, dtype=np.float64))
+    mapped = np.tanh(logistic_steepness * np.asarray(attention, dtype=np.float64))
 
     # Cell centres
     ccx1 = x_off1 + (np.arange(W1) + 0.5) * cell_w1
@@ -330,8 +330,24 @@ def attention_lol(
     # Flat mapped tensor for JS partial aggregation.
     att_src = ColumnDataSource(dict(att=[mapped.astype(f32).ravel()]))
 
-    heat_mapper = LinearColorMapper(palette=RdBu11,
-                                    low=-1.0, high=1.0)
+    # Custom diverging palette: full blue -> white -> full red.
+    def _lerp_hex(c0, c1, t):
+        r = round(c0[0] + (c1[0] - c0[0]) * t)
+        g = round(c0[1] + (c1[1] - c0[1]) * t)
+        b = round(c0[2] + (c1[2] - c0[2]) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+    BLUE  = (0, 0, 255)
+    WHITE = (255, 255, 255)
+    RED   = (255, 0, 0)
+    N = 11
+    half = N // 2
+    palette = []
+    for k in range(half):
+        palette.append(_lerp_hex(BLUE, WHITE, k / half))
+    palette.append(_lerp_hex(WHITE, WHITE, 0))
+    for k in range(1, half + 1):
+        palette.append(_lerp_hex(WHITE, RED, k / half))
+    heat_mapper = LinearColorMapper(palette=palette, low=-1.0, high=1.0)
 
     # Heatmap aspect ratio == image aspect ratio. Each heatmap has the same
     # display size as its image above → cells size = main-fig grid cells.
@@ -368,9 +384,22 @@ def attention_lol(
         line_color=None, width_units="data", height_units="data",
     )
 
-    color_bar = ColorBar(color_mapper=heat_mapper, height=heatmap_height,
-                         width=12, location=(0, 0), label_standoff=6)
-    fig_heat.add_layout(color_bar, "right")
+    # ColorBar inside frame, centered in gap between heatmaps.
+    # `location` tuple = pixel offset from frame's bottom-left (NOT data).
+    gap_px_in_frame = gap_px * frame_width / total_w
+    gap_center_x_px = int(round((x_off1 + disp_w1 + gap_px / 2) * frame_width / total_w))
+    bar_w_px = max(8, int(gap_px_in_frame * 0.5))
+    bar_h_px = max(30, heatmap_height - 20)
+    color_bar = ColorBar(
+        color_mapper=heat_mapper,
+        location=(gap_center_x_px - bar_w_px // 2,
+                  (heatmap_height - bar_h_px) // 2),
+        width=bar_w_px,
+        height=bar_h_px,
+        orientation="vertical",
+        label_standoff=4,
+    )
+    fig_heat.add_layout(color_bar)
 
     # -- widgets -----------------------------------------------------------
     debug_div = Div(text="Tap cells (multi-select). Both images selectable.",
