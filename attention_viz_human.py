@@ -297,17 +297,32 @@ def attention_lol(
 
     # -- heatmaps under each image -----------------------------------------
     f32 = np.float32
-    mean_h1 = mapped.mean(axis=(2, 3)).astype(f32)
-    mean_h2 = mapped.mean(axis=(0, 1)).astype(f32)
-    max_h1  = mapped.max(axis=(2, 3)).astype(f32)
-    max_h2  = mapped.max(axis=(0, 1)).astype(f32)
+    # Flat per-cell value arrays. Rect glyph keyed by `value` field.
+    mean_h1_f = mapped.mean(axis=(2, 3)).astype(f32).ravel()
+    mean_h2_f = mapped.mean(axis=(0, 1)).astype(f32).ravel()
+    max_h1_f  = mapped.max(axis=(2, 3)).astype(f32).ravel()
+    max_h2_f  = mapped.max(axis=(0, 1)).astype(f32).ravel()
 
-    heat1_src = ColumnDataSource(dict(image=[mean_h1]))
-    heat2_src = ColumnDataSource(dict(image=[mean_h2]))
-    # Precomputed full aggregations (no selection case).
+    # Cell centers in heatmap data coords (same x as main fig grid cells).
+    h1_xs, h1_ys = [], []
+    for i in range(H1):
+        for j in range(W1):
+            h1_xs.append(x_off1 + (j + 0.5) * cell_w1)
+            h1_ys.append((i + 0.5) * (disp_h / H1))
+    h2_xs, h2_ys = [], []
+    for i in range(H2):
+        for j in range(W2):
+            h2_xs.append(x_off2 + (j + 0.5) * cell_w2)
+            h2_ys.append((i + 0.5) * (disp_h / H2))
+
+    heat1_src = ColumnDataSource(dict(x=h1_xs, y=h1_ys,
+                                       value=mean_h1_f.tolist()))
+    heat2_src = ColumnDataSource(dict(x=h2_xs, y=h2_ys,
+                                       value=mean_h2_f.tolist()))
+    # Precomputed full aggregations as flat lists.
     precomp_src = ColumnDataSource(dict(
-        mean_h1=[mean_h1], max_h1=[max_h1],
-        mean_h2=[mean_h2], max_h2=[max_h2],
+        mean_h1=[mean_h1_f.tolist()], max_h1=[max_h1_f.tolist()],
+        mean_h2=[mean_h2_f.tolist()], max_h2=[max_h2_f.tolist()],
     ))
     # Flat mapped tensor for JS partial aggregation.
     att_src = ColumnDataSource(dict(att=[mapped.astype(f32).ravel()]))
@@ -335,12 +350,20 @@ def attention_lol(
     fig_heat.min_border_top = 0
     fig_heat.min_border_bottom = 0
 
-    fig_heat.image(image="image", x=x_off1, y=y_off_h1,
-                   dw=disp_w1, dh=dh1,
-                   source=heat1_src, color_mapper=heat_mapper)
-    fig_heat.image(image="image", x=x_off2, y=y_off_h2,
-                   dw=disp_w2, dh=dh2,
-                   source=heat2_src, color_mapper=heat_mapper)
+    cell_h1_heat = disp_h / H1
+    cell_h2_heat = disp_h / H2
+    fig_heat.rect(
+        x="x", y="y", width=cell_w1, height=cell_h1_heat,
+        source=heat1_src,
+        fill_color={"field": "value", "transform": heat_mapper},
+        line_color=None, width_units="data", height_units="data",
+    )
+    fig_heat.rect(
+        x="x", y="y", width=cell_w2, height=cell_h2_heat,
+        source=heat2_src,
+        fill_color={"field": "value", "transform": heat_mapper},
+        line_color=None, width_units="data", height_units="data",
+    )
 
     color_bar = ColorBar(color_mapper=heat_mapper, height=heatmap_height,
                          width=12, location=(0, 0), label_standoff=6)
@@ -392,82 +415,73 @@ def attention_lol(
     heatmaps_code = """
         const useMax = method_radio.active === 1;
         const att = att_src.data.att[0];
+        const H2W2 = H2 * W2;
 
-        // heatmap1: aggregate over (i2,j2). If no S2 -> precomputed full.
+        // heatmap1: per (i1,j1) aggregate over (i2,j2). No S2 -> precomp full.
+        const v1 = heat1_src.data.value;
         if (!has2) {
-            heat1_src.data.image = [useMax ? precomp_src.data.max_h1[0]
-                                            : precomp_src.data.mean_h1[0]];
+            const full = useMax ? precomp_src.data.max_h1[0]
+                                : precomp_src.data.mean_h1[0];
+            for (let k = 0; k < v1.length; k++) v1[k] = full[k];
         } else {
-            const h1 = [];
-            const sel2_i = [], sel2_j = [];
+            const sel2_lin = [];
             for (let kk = 0; kk < m2.length; kk++) {
-                if (m2[kk] === 1) { sel2_i.push((kk / W2) | 0); sel2_j.push(kk % W2); }
+                if (m2[kk] === 1) sel2_lin.push(kk);
             }
-            const N2 = sel2_i.length;
+            const N2 = sel2_lin.length;
             for (let i1 = 0; i1 < H1; i1++) {
-                const row = new Float32Array(W1);
-                const base1 = i1 * W1;
                 for (let j1 = 0; j1 < W1; j1++) {
-                    const base2 = (base1 + j1) * H2 * W2;
+                    const base = (i1 * W1 + j1) * H2W2;
                     let v;
                     if (useMax) {
                         v = -Infinity;
                         for (let n = 0; n < N2; n++) {
-                            const a = att[base2 + sel2_i[n] * W2 + sel2_j[n]];
+                            const a = att[base + sel2_lin[n]];
                             if (a > v) v = a;
                         }
                     } else {
                         let s = 0.0;
-                        for (let n = 0; n < N2; n++) {
-                            s += att[base2 + sel2_i[n] * W2 + sel2_j[n]];
-                        }
+                        for (let n = 0; n < N2; n++) s += att[base + sel2_lin[n]];
                         v = s / N2;
                     }
-                    row[j1] = v;
+                    v1[i1 * W1 + j1] = v;
                 }
-                h1.push(row);
             }
-            heat1_src.data.image = [h1];
         }
         heat1_src.change.emit();
 
-        // heatmap2: aggregate over (i1,j1). If no S1 -> precomputed full.
+        // heatmap2: per (i2,j2) aggregate over (i1,j1). No S1 -> precomp full.
+        const v2 = heat2_src.data.value;
         if (!has1) {
-            heat2_src.data.image = [useMax ? precomp_src.data.max_h2[0]
-                                            : precomp_src.data.mean_h2[0]];
+            const full = useMax ? precomp_src.data.max_h2[0]
+                                : precomp_src.data.mean_h2[0];
+            for (let k = 0; k < v2.length; k++) v2[k] = full[k];
         } else {
-            const h2 = [];
-            const sel1_i = [], sel1_j = [];
+            const sel1_lin = [];
             for (let kk = 0; kk < m1.length; kk++) {
-                if (m1[kk] === 1) { sel1_i.push((kk / W1) | 0); sel1_j.push(kk % W1); }
+                if (m1[kk] === 1) sel1_lin.push(kk);
             }
-            const N1 = sel1_i.length;
-            const H2W2 = H2 * W2;
+            const N1 = sel1_lin.length;
             for (let i2 = 0; i2 < H2; i2++) {
-                const row = new Float32Array(W2);
                 for (let j2 = 0; j2 < W2; j2++) {
                     const off22 = i2 * W2 + j2;
                     let v;
                     if (useMax) {
                         v = -Infinity;
                         for (let n = 0; n < N1; n++) {
-                            const idx = (sel1_i[n] * W1 + sel1_j[n]) * H2W2 + off22;
-                            const a = att[idx];
+                            const a = att[sel1_lin[n] * H2W2 + off22];
                             if (a > v) v = a;
                         }
                     } else {
                         let s = 0.0;
                         for (let n = 0; n < N1; n++) {
-                            const idx = (sel1_i[n] * W1 + sel1_j[n]) * H2W2 + off22;
-                            s += att[idx];
+                            s += att[sel1_lin[n] * H2W2 + off22];
                         }
                         v = s / N1;
                     }
-                    row[j2] = v;
+                    v2[i2 * W2 + j2] = v;
                 }
-                h2.push(row);
             }
-            heat2_src.data.image = [h2];
         }
         heat2_src.change.emit();
     """
