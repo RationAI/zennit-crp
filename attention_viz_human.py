@@ -388,11 +388,12 @@ def attention_lol(
     # `location` tuple = pixel offset from frame's bottom-left (NOT data).
     gap_px_in_frame = gap_px * frame_width / total_w
     gap_center_x_px = int(round((x_off1 + disp_w1 + gap_px / 2) * frame_width / total_w))
+    gap_start_x_px = int(round((x_off1 + disp_w1) * frame_width / total_w))
     bar_w_px = max(8, int(gap_px_in_frame * 0.5))
     bar_h_px = max(30, heatmap_height - 20)
     color_bar = ColorBar(
         color_mapper=heat_mapper,
-        location=(gap_center_x_px - bar_w_px // 2,
+        location=(gap_start_x_px,
                   (heatmap_height - bar_h_px) // 2),
         width=bar_w_px,
         height=bar_h_px,
