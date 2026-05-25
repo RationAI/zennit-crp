@@ -211,6 +211,8 @@ nb.cells = [
         "top1 = int(logits.argmax(-1).item())",
         "print(f'top-1 class  : {top1} ({categories[top1]})')",
         "print(f'top-1 logit  : {logits[0, top1].item():.4f}')",
+        "top5 = [int(i) for i in logits.topk(5, dim=-1).indices[0].tolist()]",
+        "print(f'top-5 classes: {top5} ({\", \".join(categories[i] for i in top5)})')",
         "print(f'input shape  : {tuple(x_norm.shape)}')",
         "",
         "# Display image (after un-normalising for visualization).",
