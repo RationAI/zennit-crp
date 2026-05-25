@@ -35,6 +35,11 @@ Single-input modules:
 * :class:`ReshapeMergeHeads` — ``x.transpose(1, 2).reshape(B, N, out_dim)``.
 * :class:`LayerScaleMul` — ``γ * x`` (γ is a learnable per-channel
   parameter from the parent ``EvaBlock``).
+* :class:`LRPInspectionLayer` (base) + role-specific subclasses
+  :class:`QInspectionLayer` / :class:`KInspectionLayer` /
+  :class:`VInspectionLayer` — ``nn.Identity`` placeholders marking
+  hookable LRP probe sites. Subclassing lets layer_map composites target
+  Q vs K vs V independently.
 
 Container modules:
 
@@ -64,6 +69,10 @@ LRP-rule canonizers (one per rule, registered at attribution time):
   :class:`ResidualAdd`.
 * :class:`LayerScaleUniformCanonizer` — uniform allocation rule
   (AttnLRP Eq. 7) on :class:`LayerScaleMul`.
+* :class:`StopGradient` — zennit ``Hook`` that zeros backward relevance.
+  Layer-map onto :class:`QInspectionLayer` / :class:`KInspectionLayer`
+  for the CP-LRP attention rule (LXT, Achtibat et al.): relevance flows
+  through the value path only.
 
 The autograd ``Function`` kernels (``_AlphaBetaMatmulFn``,
 ``_SoftmaxIdentityRuleFn``, ``_ScaleIdentityRuleFn``) live near the
@@ -85,6 +94,7 @@ from timm.models.eva import EvaAttention
 from timm.models.vision_transformer import Attention as TimmAttention
 
 from zennit.canonizers import AttributeCanonizer, Canonizer
+from zennit.core import Hook
 
 
 # ─── 1. Vanilla atomic modules ──────────────────────────────────────────────
@@ -299,9 +309,43 @@ class LRPInspectionLayer(nn.Identity):
     its own class name is so graphviz / torchview renders ``LRPInspectionLayer``
     instead of an anonymous ``Identity`` node, and so
     ``get_layer_names(model, [LRPInspectionLayer])`` can enumerate the
-    sites that concept classes are designed to hook (the ``q_lrp_probe``,
-    ``k_lrp_probe``, ``v_lrp_probe`` attributes on the unfolded attention
-    containers).
+    sites that concept classes are designed to hook.
+
+    Three role-specific subclasses (:class:`QInspectionLayer`,
+    :class:`KInspectionLayer`, :class:`VInspectionLayer`) are used on the
+    unfolded attention containers. Subclassing lets ``LayerMapComposite``
+    target Q vs K vs V independently (e.g. mapping
+    ``QInspectionLayer → StopGradient()`` for CP-LRP-style attention)
+    while ``isinstance(m, LRPInspectionLayer)`` enumeration still catches
+    all three for concept hooking.
+    """
+    pass
+
+
+class QInspectionLayer(LRPInspectionLayer):
+    """Identity probe at the Q slot of an unfolded attention container.
+
+    Layer-map target for Q-specific LRP rules — e.g. :class:`StopGradient`
+    for the CP-LRP attention rule (block relevance flow through the Q
+    projection).
+    """
+    pass
+
+
+class KInspectionLayer(LRPInspectionLayer):
+    """Identity probe at the K slot of an unfolded attention container.
+
+    See :class:`QInspectionLayer`. Pair with :class:`StopGradient` in the
+    composite layer_map for CP-LRP attention.
+    """
+    pass
+
+
+class VInspectionLayer(LRPInspectionLayer):
+    """Identity probe at the V slot of an unfolded attention container.
+
+    See :class:`QInspectionLayer`. Under CP-LRP, the V probe stays as a
+    pure identity so relevance flows through the value path unchanged.
     """
     pass
 
@@ -412,10 +456,11 @@ class EvaAttentionUnfolded(nn.Module):
         # ``(B, N, embed_dim)``, identical to ``proj_drop`` output. One
         # shape contract everywhere: HeadConcept slices embed_dim per-head
         # internally; the per-head reshape is downstream and irrelevant
-        # to attribution.
-        self.q_lrp_probe = LRPInspectionLayer()
-        self.k_lrp_probe = LRPInspectionLayer()
-        self.v_lrp_probe = LRPInspectionLayer()
+        # to attribution. Distinct subclasses (Q/K/V) so a LayerMapComposite
+        # can target them independently with different LRP rules.
+        self.q_lrp_probe = QInspectionLayer()
+        self.k_lrp_probe = KInspectionLayer()
+        self.v_lrp_probe = VInspectionLayer()
 
     def forward(
         self,
@@ -670,10 +715,12 @@ class TimmAttentionUnfolded(nn.Module):
         # ``_to_heads`` — tensor shape is ``(B, N, embed_dim)``, identical
         # to ``proj_drop`` output. HeadConcept slices embed_dim per-head
         # internally; q_norm / k_norm and the per-head reshape are
-        # downstream and not inspected through these probes.
-        self.q_lrp_probe = LRPInspectionLayer()
-        self.k_lrp_probe = LRPInspectionLayer()
-        self.v_lrp_probe = LRPInspectionLayer()
+        # downstream and not inspected through these probes. Distinct
+        # subclasses (Q/K/V) so a LayerMapComposite can target them
+        # independently with different LRP rules.
+        self.q_lrp_probe = QInspectionLayer()
+        self.k_lrp_probe = KInspectionLayer()
+        self.v_lrp_probe = VInspectionLayer()
 
     def forward(
         self,
@@ -1071,6 +1118,54 @@ class ResidualRatioCanonizer(AttributeCanonizer):
         return type(self)(epsilon=self.epsilon)
 
 
+class StopGradient(Hook):
+    """LRP rule that blocks relevance flow through the module.
+
+    Backward returns a zero tensor in place of every non-``None`` element
+    of ``grad_input`` — i.e. the LRP relevance reaching the module on its
+    upstream side does not propagate further down. Forward is untouched
+    (zennit's :class:`Hook` is a backward-side rule; the module's own
+    forward still runs and downstream activations are unaffected).
+
+    Designed for use in :class:`LayerMapComposite`'s ``layer_map`` to
+    target :class:`QInspectionLayer` / :class:`KInspectionLayer` for the
+    **CP-LRP attention rule** (Chefer et al. 2021; adopted by LXT,
+    Achtibat et al. *LRP eXplains Transformers*): the Q and K linear
+    projections receive zero relevance, and the entire attention output
+    relevance flows through the V path via standard autograd on
+    ``context = softmax(QKᵀ/√d) @ v`` (softmax weights become a graph
+    constant once Q,K gradients are killed).
+
+    Combine with the natural autograd backward on :class:`BilinearMatmul`
+    — do NOT pair with :class:`BilinearMatmulAlphaBetaCanonizer`, which
+    would override backward on ``context`` and break the CP-LRP value
+    attribution.
+
+    Example usage in a composite::
+
+        from zennit.composites import LayerMapComposite
+        from crp.attention_unfolded import (
+            QInspectionLayer, KInspectionLayer, StopGradient,
+        )
+
+        layer_map = [
+            (QInspectionLayer, StopGradient()),
+            (KInspectionLayer, StopGradient()),
+            # ... other rules ...
+        ]
+        composite = LayerMapComposite(layer_map=layer_map, canonizers=[...])
+    """
+
+    def backward(self, module, grad_input, grad_output):
+        return tuple(
+            torch.zeros_like(gi) if gi is not None else None
+            for gi in grad_input
+        )
+
+    def copy(self) -> "StopGradient":
+        return type(self)()
+
+
 class LayerScaleUniformCanonizer(AttributeCanonizer):
     """Apply uniform allocation rule (AttnLRP Eq. 7) to :class:`LayerScaleMul`.
 
@@ -1119,6 +1214,9 @@ __all__ = [
     "ReshapeMergeHeads",
     "LayerScaleMul",
     "LRPInspectionLayer",
+    "QInspectionLayer",
+    "KInspectionLayer",
+    "VInspectionLayer",
     # Containers + substitution canonizers
     "EvaAttentionUnfolded",
     "EvaAttentionSubstitutionCanonizer",
@@ -1130,6 +1228,7 @@ __all__ = [
     "ScaleByConstantIdentityCanonizer",
     "ResidualRatioCanonizer",
     "LayerScaleUniformCanonizer",
+    "StopGradient",
     # Autograd Function kernels (used internally by canonizers)
     "_SoftmaxIdentityRuleFn",
     "_ScaleIdentityRuleFn",
