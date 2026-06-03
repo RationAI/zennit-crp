@@ -189,9 +189,9 @@ unfolded-attention probe sites — `q_lrp_probe` / `k_lrp_probe` /
 | `EmbeddingDimConcept` | `embed_dim` | per embedding dimension      | `(B, embed_dim)`     |
 | `TokenConcept`        | `N`         | per token position           | `(B, N_filtered)`    |
 
-The three classes live in [`crp/attention_concepts.py`](crp/attention_concepts.py);
+The three classes live in [`crp/concepts.py`](crp/concepts.py);
 the probe sites are installed by the attention-substitution canonizers in
-[`crp/attention_unfolded.py`](crp/attention_unfolded.py).
+[`zennit_ext/attention_unfolded.py`](zennit_ext/attention_unfolded.py).
 The recommended entry point is the
 [**walkthrough notebook**](tutorials/vit_crp/walkthrough.ipynb), which
 covers setup, Imagenette download, FeatureVisualization indexing, and a

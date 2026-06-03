@@ -4,7 +4,7 @@ CRP = Concept Relevance Propagation on top of [zennit](https://github.com/chr5tp
 This fork extends CRP from CNNs to **vision transformers** (AttnLRP). Everything is
 already implemented — **find the tool below before writing new code.**
 
-**Authoritative source = the code in `crp/` + the two upstream notebooks**
+**Authoritative source = the code in `crp/` + `zennit_ext/` + the two upstream notebooks**
 (`tutorials/attributions.ipynb`, `tutorials/feature_visualization.ipynb`). The prose
 notes in `research/` (CURRENT_STATE, UNFOLDING_ATTENTION_REFACTOR, …) are historical
 record and contain stale API names — do not copy APIs from them.
@@ -23,12 +23,12 @@ record and contain stale API names — do not copy APIs from them.
 
 ---
 
-## 1. Composites (the LRP rules) — zennit + `crp/transformer_patches.py`
+## 1. Composites (the LRP rules) — zennit + `zennit_ext/attnlrp_composites.py`
 
 - **CNN / generic:** use zennit composites directly, e.g.
   `EpsilonPlusFlat([SequentialMergeBatchNorm()])`. Canonizers go in the list.
 - **ViT:** use this fork's composites (canonizers incl. attention-unfolding are
-  pre-bundled — no manual setup). Three, all in `crp/transformer_patches.py`:
+  pre-bundled — no manual setup). Three, all in `zennit_ext/attnlrp_composites.py`:
 
   | Composite | Use when |
   |---|---|
@@ -74,7 +74,7 @@ hierarchy. Use for "which lower-layer concepts build this one".
 
 ---
 
-## 3. Concepts — `crp/concepts.py` (CNN) · `crp/attention_concepts.py` (ViT)
+## 3. Concepts — `crp/concepts.py` (CNN + ViT)
 
 - **`ChannelConcept`** (CNN/generic): one concept = one channel. `mask`, `attribute`,
   `reference_sampling`.
@@ -87,7 +87,7 @@ hierarchy. Use for "which lower-layer concepts build this one".
   | `TokenConcept(token_filter=…)` | per token position |
 
   `token_filter` slices the token axis: `slice(0,1)` cls, register/spatial ranges, etc.
-  **Probe sites** (from `crp/attention_unfolded.py` substitution canonizers, auto-installed
+  **Probe sites** (from `zennit_ext/attention_unfolded.py` substitution canonizers, auto-installed
   by the composites): `blocks.N.attn.{q_lrp_probe,k_lrp_probe,v_lrp_probe}` (Q/K/V token
   sequences) or `blocks.N.attn.proj_drop` (block output).
 
