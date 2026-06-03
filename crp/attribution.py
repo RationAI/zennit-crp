@@ -323,9 +323,10 @@ class CondAttribution:
             composite = Composite()
 
         # Order rationale:
-        # - Enter user `composite` first so its canonizers (e.g.
-        #   QKVTapCanonizer adding ``qkv_tap`` Identity submodules) run before
-        #   any module-name lookup downstream.
+        # - Enter user `composite` first so its canonizers (e.g. the
+        #   attention-substitution canonizers that install the
+        #   ``q_lrp_probe`` / ``k_lrp_probe`` / ``v_lrp_probe`` / ``proj_drop``
+        #   submodules) run before any module-name lookup downstream.
         # - Recording-layer forward hooks are registered *inside* this context,
         #   so they can find canonizer-created submodules; they're cleared on
         #   exit before the canonizer reverts.
@@ -692,6 +693,6 @@ class AttributionGraph:
 
 # NOTE: ``AttentionAttribution`` (legacy POC wrapper around ``CondAttribution``
 # with ``AttentionHeadConcept.mask`` as default) was removed in iter-5. Use
-# :class:`CondAttribution` directly with one of the four classes from
-# :mod:`crp.attention_concepts` (``HeadConcept`` / ``KQVConcept`` /
-# ``KQVHeadConcept`` / ``HeadDimConcept``) and pass ``mask_map=concept.mask``.
+# :class:`CondAttribution` directly with one of the three classes from
+# :mod:`crp.concepts` (``HeadConcept`` / ``EmbeddingDimConcept`` /
+# ``TokenConcept``) and pass ``mask_map=concept.mask``.

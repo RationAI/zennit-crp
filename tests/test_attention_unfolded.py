@@ -1,9 +1,9 @@
-"""Unit tests for ``crp.attention_unfolded``.
+"""Unit tests for ``zennit_ext``.
 
 After the LRP-cleanup refactor, every module here has a vanilla PyTorch
 forward and autograd's standard backward. LRP behaviour (custom backward
-= relevance flow) is layered in EXCLUSIVELY by per-module canonizers
-(``BilinearMatmulAlphaBetaCanonizer`` etc.) at attribution time.
+= relevance flow) is layered in EXCLUSIVELY by zennit Hook rules (assigned via a composite layer_map)
+at attribution time.
 
 So the test matrix is:
 
@@ -29,23 +29,23 @@ import torch.nn.functional as F
 
 timm = pytest.importorskip("timm")
 
-from crp.attention_unfolded import (
+from zennit.rules import Pass
+
+from zennit_ext import (
     AddBias,
+    AlphaBetaMatmul,
     BilinearMatmul,
-    BilinearMatmulAlphaBetaCanonizer,
     ChunkAlongLastDim,
     EvaAttentionSubstitutionCanonizer,
     EvaAttentionUnfolded,
     LayerScaleMul,
-    LayerScaleUniformCanonizer,
     ReshapeMergeHeads,
     ResidualAdd,
-    ResidualRatioCanonizer,
+    ResidualRatio,
     RotaryEmbedding,
     ScaleByConstant,
-    ScaleByConstantIdentityCanonizer,
     SoftmaxAlongLastDim,
-    SoftmaxIdentityCanonizer,
+    Uniform,
 )
 
 
@@ -60,6 +60,12 @@ def _apply_canonizer(canonizer, *modules):
     """
     root = nn.Sequential(*modules)
     return canonizer.apply(root)
+
+
+def _apply_hook(hook, module):
+    """Register a zennit Hook (LRP rule) on a single module; return a
+    one-element list whose ``.remove()`` tears the hook down at teardown."""
+    return [hook.register(module)]
 
 
 # ─── 1. BilinearMatmul ──────────────────────────────────────────────────────
@@ -91,7 +97,7 @@ class TestBilinearMatmul:
         — critical so heads remain trainable after attribution sessions."""
         torch.manual_seed(4)
         m = BilinearMatmul()
-        instances = _apply_canonizer(BilinearMatmulAlphaBetaCanonizer(), m)
+        instances = _apply_hook(AlphaBetaMatmul(), m)
         for inst in instances:
             inst.remove()
         # Now retrain-style call: should match bare matmul.
@@ -110,8 +116,8 @@ class TestBilinearMatmul:
         a = torch.randn(2, 4, 6) + 0.5
         b = torch.randn(2, 6, 3) + 0.5
         m = BilinearMatmul()
-        instances = _apply_canonizer(
-            BilinearMatmulAlphaBetaCanonizer(alpha=0.5, beta=0.5, epsilon=1e-6), m,
+        instances = _apply_hook(
+            AlphaBetaMatmul(alpha=0.5, beta=0.5, epsilon=1e-6), m,
         )
         try:
             assert torch.allclose(m(a, b), a @ b, atol=0)
@@ -135,8 +141,8 @@ class TestBilinearMatmul:
         a = (torch.randn(1, 100, 50) * 2.0).requires_grad_(True)
         b = (torch.randn(1, 50, 80) * 2.0).requires_grad_(True)
         m = BilinearMatmul()
-        instances = _apply_canonizer(
-            BilinearMatmulAlphaBetaCanonizer(alpha=0.5, beta=0.5, epsilon=1e-6), m,
+        instances = _apply_hook(
+            AlphaBetaMatmul(alpha=0.5, beta=0.5, epsilon=1e-6), m,
         )
         try:
             y = m(a, b)
@@ -177,7 +183,7 @@ class TestSoftmaxAlongLastDim:
         torch.manual_seed(2)
         x = torch.randn(2, 3, 7)
         m = SoftmaxAlongLastDim()
-        instances = _apply_canonizer(SoftmaxIdentityCanonizer(), m)
+        instances = _apply_hook(Pass(), m)
         try:
             assert torch.allclose(m(x), F.softmax(x, dim=-1), atol=0)
         finally:
@@ -189,7 +195,7 @@ class TestSoftmaxAlongLastDim:
         torch.manual_seed(3)
         x = torch.randn(2, 5, requires_grad=True)
         m = SoftmaxAlongLastDim()
-        instances = _apply_canonizer(SoftmaxIdentityCanonizer(), m)
+        instances = _apply_hook(Pass(), m)
         try:
             y = m(x)
             R_y = torch.randn_like(y)
@@ -262,7 +268,7 @@ class TestScaleByConstant:
     def test_identity_canonizer_forward_unchanged(self):
         x = torch.randn(2, 5)
         m = ScaleByConstant(0.5)
-        instances = _apply_canonizer(ScaleByConstantIdentityCanonizer(), m)
+        instances = _apply_hook(Pass(), m)
         try:
             assert torch.equal(m(x), x * 0.5)
         finally:
@@ -273,7 +279,7 @@ class TestScaleByConstant:
         """Constant absorbs no relevance: R_in == R_out."""
         x = torch.randn(2, 5, requires_grad=True)
         m = ScaleByConstant(0.5)
-        instances = _apply_canonizer(ScaleByConstantIdentityCanonizer(), m)
+        instances = _apply_hook(Pass(), m)
         try:
             y = m(x)
             R_y = torch.randn_like(y)
@@ -343,7 +349,7 @@ class TestResidualAdd:
         x = (torch.randn(2, 5) + 0.5).requires_grad_(True)
         b = (torch.randn(2, 5) + 0.5).requires_grad_(True)
         m = ResidualAdd()
-        instances = _apply_canonizer(ResidualRatioCanonizer(epsilon=1e-6), m)
+        instances = _apply_hook(ResidualRatio(epsilon=1e-6), m)
         try:
             y = m(x, b)
             R_y = torch.randn_like(y)
@@ -378,7 +384,7 @@ class TestLayerScaleMul:
         gamma = nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
         x = torch.randn(2, 4, 3, requires_grad=True)
         m = LayerScaleMul(gamma)
-        instances = _apply_canonizer(LayerScaleUniformCanonizer(), m)
+        instances = _apply_hook(Uniform(factor=2), m)
         try:
             y = m(x)
             R_y = torch.randn_like(y)
@@ -467,9 +473,10 @@ class TestEvaAttentionUnfolded:
         with torch.no_grad():
             y_orig = attn(x, rope=rope)
         unfolded = EvaAttentionUnfolded(attn)
-        instances = BilinearMatmulAlphaBetaCanonizer(
-            alpha=0.5, beta=0.5, epsilon=1e-6,
-        ).apply(unfolded)
+        instances = [
+            AlphaBetaMatmul(alpha=0.5, beta=0.5, epsilon=1e-6).register(sm)
+            for sm in unfolded.modules() if isinstance(sm, BilinearMatmul)
+        ]
         try:
             with torch.no_grad():
                 y_new = unfolded(x, rope=rope)
@@ -612,7 +619,7 @@ class TestTimmAttentionUnfolded:
         attn = synthetic_timm_attention
         with torch.no_grad():
             y_orig = attn(x)
-        from crp.attention_unfolded import TimmAttentionUnfolded
+        from zennit_ext import TimmAttentionUnfolded
         unfolded = TimmAttentionUnfolded(attn)
         with torch.no_grad():
             y_new = unfolded(x)
@@ -628,7 +635,7 @@ class TestTimmAttentionUnfolded:
         g_orig = x_orig.grad.clone()
 
         x_new = timm_attn_input.clone().requires_grad_(True)
-        from crp.attention_unfolded import TimmAttentionUnfolded
+        from zennit_ext import TimmAttentionUnfolded
         unfolded = TimmAttentionUnfolded(attn)
         y_new = unfolded(x_new)
         y_new.backward(go)
@@ -647,11 +654,12 @@ class TestTimmAttentionUnfolded:
         attn = synthetic_timm_attention
         with torch.no_grad():
             y_orig = attn(x)
-        from crp.attention_unfolded import TimmAttentionUnfolded
+        from zennit_ext import TimmAttentionUnfolded
         unfolded = TimmAttentionUnfolded(attn)
-        instances = BilinearMatmulAlphaBetaCanonizer(
-            alpha=0.5, beta=0.5, epsilon=1e-6,
-        ).apply(unfolded)
+        instances = [
+            AlphaBetaMatmul(alpha=0.5, beta=0.5, epsilon=1e-6).register(sm)
+            for sm in unfolded.modules() if isinstance(sm, BilinearMatmul)
+        ]
         try:
             with torch.no_grad():
                 y_new = unfolded(x)
@@ -665,7 +673,7 @@ class TestTimmAttentionUnfolded:
         the concept classes target: q_lrp_probe / k_lrp_probe / v_lrp_probe
         (3D, post qkv split), proj_drop (3D, attention output), context
         (4D, pre-merge), plus qk_scores / softmax for diagnostics."""
-        from crp.attention_unfolded import (
+        from zennit_ext import (
             TimmAttentionUnfolded,
             LRPInspectionLayer,
         )
@@ -697,7 +705,7 @@ class TestTimmAttentionSubstitutionCanonizer:
     def test_apply_substitutes_one_block(self):
         m = self._make_model()
         from timm.models.vision_transformer import Attention as TimmAttention
-        from crp.attention_unfolded import (
+        from zennit_ext import (
             TimmAttentionSubstitutionCanonizer, TimmAttentionUnfolded,
         )
         can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
@@ -713,7 +721,7 @@ class TestTimmAttentionSubstitutionCanonizer:
     def test_remove_restores_original(self):
         m = self._make_model()
         from timm.models.vision_transformer import Attention as TimmAttention
-        from crp.attention_unfolded import TimmAttentionSubstitutionCanonizer
+        from zennit_ext import TimmAttentionSubstitutionCanonizer
         original = m.blocks[0].attn
         can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
         instances = can.apply(m)
@@ -724,7 +732,7 @@ class TestTimmAttentionSubstitutionCanonizer:
 
     def test_round_trip_forward_parity(self):
         """apply → forward → remove → re-apply → forward: outputs match."""
-        from crp.attention_unfolded import TimmAttentionSubstitutionCanonizer
+        from zennit_ext import TimmAttentionSubstitutionCanonizer
         m = self._make_model()
         torch.manual_seed(0)
         img = torch.randn(1, 3, 224, 224)
@@ -753,7 +761,7 @@ class TestTimmAttentionSubstitutionCanonizer:
         """Each substitution canonizer's isinstance filter must skip the
         other backbone's attention class — so both can be bundled into
         one composite without coupling."""
-        from crp.attention_unfolded import TimmAttentionSubstitutionCanonizer
+        from zennit_ext import TimmAttentionSubstitutionCanonizer
         m_eva = timm.create_model(
             "vit_large_patch16_dinov3", pretrained=False, num_classes=10,
         )

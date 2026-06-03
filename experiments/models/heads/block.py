@@ -10,12 +10,12 @@ quite enough — e.g. fine-grained classification where the missing signal
 is in patches the cls aggregator under-weights.
 
 **Vanilla forward.** Atomic submodules
-(:class:`~crp.attention_unfolded.BilinearMatmul`,
-:class:`~crp.attention_unfolded.SoftmaxAlongLastDim`,
-:class:`~crp.attention_unfolded.ScaleByConstant`) and the MLP/LNs are all
+(:class:`~zennit_ext.BilinearMatmul`,
+:class:`~zennit_ext.SoftmaxAlongLastDim`,
+:class:`~zennit_ext.ScaleByConstant`) and the MLP/LNs are all
 plain PyTorch. The head trains with autograd's standard chain-rule
 backward. AttnLRP rules are applied at attribution time by the
-composite's per-rule canonizers (see :mod:`crp.attention_unfolded`).
+composite's per-rule canonizers (see :mod:`zennit_ext`).
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from crp.attention_unfolded import (
+from zennit_ext import (
     BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant,
 )
 

@@ -24,17 +24,17 @@ timm = pytest.importorskip("timm")
 zennit = pytest.importorskip("zennit")
 
 
-from crp.attention_concepts import (
+from crp.concepts import (
     HeadConcept,
     EmbeddingDimConcept,
     TokenConcept,
 )
-from crp.attention_unfolded import (
+from zennit_ext import (
     EvaAttentionUnfolded,
     EvaAttentionSubstitutionCanonizer,
 )
 from crp.attribution import CondAttribution
-from crp.transformer_patches import (
+from zennit_ext import (
     AttnLRPEpsilonComposite,
     AttnLRPGammaComposite,
     AttnLRPCombinedComposite,

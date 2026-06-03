@@ -63,7 +63,7 @@ dev = [
 Homepage = "https://github.com/RationAI/zennit-crp"
 
 [tool.setuptools.packages.find]
-include = ["crp*", "experiments*"]
+include = ["crp*", "experiments*", "zennit_ext*"]
 
 [project.scripts]
 # Console-script entry points so users don't need to remember the file

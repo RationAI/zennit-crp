@@ -509,7 +509,7 @@ def train_cmd(
     # records these so the walkthrough notebook can reconstruct the
     # head with identical layout. LRP rules are NOT a constructor
     # concern — they're applied at attribution time by the composite's
-    # per-rule canonizers (see :mod:`crp.attention_unfolded`), which
+    # per-rule canonizers (see :mod:`zennit_ext`), which
     # rebind the head's ``BilinearMatmul`` / ``SoftmaxAlongLastDim`` /
     # ``ScaleByConstant`` forwards inside the composite context.
     head_kwargs: dict = {}

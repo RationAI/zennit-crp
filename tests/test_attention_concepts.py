@@ -1,4 +1,4 @@
-"""Unit tests for crp.attention_concepts (HeadConcept / EmbeddingDimConcept / TokenConcept).
+"""Unit tests for crp.concepts (HeadConcept / EmbeddingDimConcept / TokenConcept).
 
 All three concepts operate on 3D ``(B, N, embed_dim)`` relevance tensors.
 The mask/attribute/reference_sampling APIs mirror upstream
@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from crp.attention_concepts import HeadConcept, EmbeddingDimConcept, TokenConcept
+from crp.concepts import HeadConcept, EmbeddingDimConcept, TokenConcept
 
 
 # ── shared fixtures ──────────────────────────────────────────────────────────

@@ -50,7 +50,7 @@ import typer
 from timm.models.vision_transformer import Block as TimmBlock
 from zennit.canonizers import AttributeCanonizer
 
-from crp.transformer_patches import AttnLRPCombinedComposite
+from zennit_ext import AttnLRPCombinedComposite
 from crp.attribution import CondAttribution
 from experiments.datasets import load as load_dataset
 from experiments.models import build_probe
@@ -87,7 +87,7 @@ class _CapturingResidualRatio(Function):
     ``_CAPTURES[block_idx][junction + '_grad_branch']``.
 
     Forward + backward are bit-identical to ``_ResidualRatioFn`` in
-    :mod:`crp.transformer_patches`. The capture is a side-effect on
+    :mod:`zennit_ext`. The capture is a side-effect on
     ``backward`` only — no autograd-graph perturbation.
     """
 

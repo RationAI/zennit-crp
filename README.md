@@ -176,32 +176,36 @@ We are open to any improvements (:
 
 ## Vision-Transformer Extensions (RationAI fork)
 
-This fork extends CRP to vision transformers (ViT) with four concept-detector
-granularities, crossing two orthogonal axes — *split by K/Q/V?* (which tap
-to read) and *split by head_dim?* (whether the per-head feature axis is
-kept):
+This fork extends CRP to vision transformers (ViT) with three
+concept-detector granularities. All three operate on the same
+`(B, N, embed_dim)` relevance tensor and can be hooked at any of the
+unfolded-attention probe sites — `q_lrp_probe` / `k_lrp_probe` /
+`v_lrp_probe` (the Q/K/V token sequences just after the `qkv` split) or
+`proj_drop` (the attention block's post-projection output):
 
-| Concept class         | Hook tap         | Granularity                                  | `attribute()` shape            |
-|-----------------------|------------------|----------------------------------------------|--------------------------------|
-| `HeadConcept`         | `attn_out_tap`   | output tokens, per head                      | `(B, num_heads)`               |
-| `HeadDimConcept`      | `attn_out_tap`   | output tokens, per `(head, dim)`             | `(B, num_heads, head_dim)`     |
-| `KQVHeadConcept`      | `qkv_tap`        | K/Q/V projections, per `(part, head)`        | `(B, 3, num_heads)`            |
-| `KQVHeadDimConcept`   | `qkv_tap`        | K/Q/V projections, per `(part, head, dim)`   | `(B, 3, num_heads, head_dim)`  |
+| Concept class         | Selects on  | Granularity                  | `attribute()` shape  |
+|-----------------------|-------------|------------------------------|----------------------|
+| `HeadConcept`         | `embed_dim` | per attention head           | `(B, num_heads)`     |
+| `EmbeddingDimConcept` | `embed_dim` | per embedding dimension      | `(B, embed_dim)`     |
+| `TokenConcept`        | `N`         | per token position           | `(B, N_filtered)`    |
 
-The four classes live in [`crp/attention_concepts.py`](crp/attention_concepts.py).
+The three classes live in [`crp/attention_concepts.py`](crp/attention_concepts.py);
+the probe sites are installed by the attention-substitution canonizers in
+[`crp/attention_unfolded.py`](crp/attention_unfolded.py).
 The recommended entry point is the
 [**walkthrough notebook**](tutorials/vit_crp/walkthrough.ipynb), which
 covers setup, Imagenette download, FeatureVisualization indexing, and a
-side-by-side comparison of the four granularities on a target image.
+side-by-side comparison of the three granularities on a target image.
 Setup and the single-image CLI demo are documented in
 [`tutorials/vit_crp/README.md`](tutorials/vit_crp/README.md). Sweeps,
 audits, and milestone drivers (faithfulness AUC, conservation
 diagnostic, multi-model PA-LRP / residual-LRP comparisons) are separated
 into [`experiments/`](experiments/) — see
 [`experiments/README.md`](experiments/README.md). All generated artefacts
-live under [`data/`](data) (gitignored). Audit findings and the roadmap
-for follow-up work are in [`CURRENT_STATE.md`](CURRENT_STATE.md) and
-[`FUTURE_STATE.md`](FUTURE_STATE.md).
+live under [`data/`](data) (gitignored). For an agent-oriented map of the
+whole toolbox (what to use when), see [`AGENTS.md`](AGENTS.md). Historical
+design notes and audit findings are in [`research/`](research) (note: those
+describe older APIs — trust the code).
 
 Dependencies are managed with [`uv`](https://docs.astral.sh/uv/) — see
 `pyproject.toml` (extras: `vit`, `dev`, `notebook`, `fast_img`). The lockfile

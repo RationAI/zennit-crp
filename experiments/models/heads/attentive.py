@@ -7,26 +7,24 @@ important for tasks where classes are defined by combinations of
 spatially-local parts (FunnyBirds, segmentation-like benchmarks).
 
 **Vanilla forward.** All atomic submodules
-(:class:`~crp.attention_unfolded.BilinearMatmul`,
-:class:`~crp.attention_unfolded.SoftmaxAlongLastDim`,
-:class:`~crp.attention_unfolded.ScaleByConstant`) have plain PyTorch
+(:class:`~zennit_ext.BilinearMatmul`,
+:class:`~zennit_ext.SoftmaxAlongLastDim`,
+:class:`~zennit_ext.ScaleByConstant`) have plain PyTorch
 forwards; autograd's standard backward applies during ``loss.backward()``,
 so this head trains with correct chain-rule gradients.
 
-For attribution, a composite that bundles the per-rule canonizers
-(:class:`~crp.attention_unfolded.BilinearMatmulAlphaBetaCanonizer`,
-:class:`~crp.attention_unfolded.SoftmaxIdentityCanonizer`,
-:class:`~crp.attention_unfolded.ScaleByConstantIdentityCanonizer`)
-will rebind these submodules' forwards inside the composite's context
-manager, applying the AttnLRP rules during the attribution backward
-and restoring vanilla forwards on exit.
+For attribution, a composite (e.g. :class:`~zennit_ext.AttnLRPCombinedComposite`)
+assigns the AttnLRP rules to these submodule types via its ``layer_map`` —
+zennit ``Hook``s (``AlphaBetaMatmul`` on ``BilinearMatmul``, ``Pass`` on
+``SoftmaxAlongLastDim`` / ``ScaleByConstant``) that fire during the
+attribution backward and detach on exit, leaving the forwards vanilla.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from crp.attention_unfolded import (
+from zennit_ext import (
     BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant,
 )
 
