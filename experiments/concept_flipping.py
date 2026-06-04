@@ -42,7 +42,7 @@ from zennit.composites import LayerMapComposite
 from zennit.rules import Gamma, Pass
 
 from crp.attribution import CondAttribution
-from crp.concepts import HeadConcept
+from crp.concepts import HeadConcept, EmbeddingDimConcept
 from zennit_ext import (
     QInspectionLayer, KInspectionLayer, StopGradient,
     SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd, UniformAdd, LayerScaleMul,
@@ -108,14 +108,18 @@ def load_probe(tag: str, device: str):
     return model, ck, str(runs[-1])
 
 
-def select_correct(model, ds, num_classes, n_per_class, device, batch_size=128, seed=0):
+def select_correct(model, ds, num_classes, n_per_class, device, batch_size=128, seed=0,
+                   num_workers=0):
     """Random-order scan (so grouped-by-class datasets like dSprites find
     every class fast). Subset(ds, perm) keeps the running counter mapped to
-    the true dataset index via ``perm``."""
+    the true dataset index via ``perm``. ``num_workers=0`` by default — the
+    scan is GPU-forward-bound and one-shot, so it avoids ~18 s of DataLoader
+    worker (forkserver) spawn."""
     from torch.utils.data import Subset
     g = torch.Generator().manual_seed(seed)
     perm = torch.randperm(len(ds), generator=g).tolist()
-    loader = DataLoader(Subset(ds, perm), batch_size=batch_size, shuffle=False, num_workers=2)
+    loader = DataLoader(Subset(ds, perm), batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers)
     sel = {c: [] for c in range(num_classes)}
     pos, done = 0, set()
     with torch.no_grad():
@@ -149,28 +153,56 @@ class _PerturbHook:
     def __call__(self, module, inp, out):
         if self.mask is None:
             return out
+        # Fused: out' = out * mul + add, with per-(elem,feature) mul/add built
+        # from the per-element method. Avoids three full-tensor torch.where
+        # allocations over (B, N, embed).
         meth = self.method
-        z = (self.mask & (meth == 0).unsqueeze(1)).unsqueeze(1)   # (B,1,embed)
-        mm = (self.mask & (meth == 1).unsqueeze(1)).unsqueeze(1)
-        sf = (self.mask & (meth == 2).unsqueeze(1)).unsqueeze(1)
-        out = torch.where(z, torch.zeros_like(out), out)
-        if self.meanvec is not None:
-            out = torch.where(mm, self.meanvec.view(1, 1, -1).expand_as(out), out)
-        out = torch.where(sf, -out, out)
+        mz = self.mask & (meth == 0).unsqueeze(1)     # zero
+        mm = self.mask & (meth == 1).unsqueeze(1)     # mean-replace
+        ms = self.mask & (meth == 2).unsqueeze(1)     # sign-flip
+        dt = out.dtype
+        mul = 1.0 - (mz | mm).to(dt) - 2.0 * ms.to(dt)          # (B, embed): 1 / 0 / -1
+        out = out * mul.unsqueeze(1)
+        if self.meanvec is not None and bool(mm.any()):
+            out = out + (mm.to(dt) * self.meanvec.to(dt).unsqueeze(0)).unsqueeze(1)
         return out
 
 
-def run_dataset(key, n_images, device, eps_logit=1e-3, max_classes=None):
+def concept_spec(concept_name, num_heads, embed_dim, device):
+    """Return (concept, n_detectors, D, n_grid) for the chosen formulation.
+
+    ``D`` is a (n_detectors, embed_dim) bool matrix mapping each detector to
+    the embed_dim features it owns (head → contiguous head_dim slice;
+    embed_dim → a single index). ``n_grid`` is the set of cumulative-flip
+    counts (all heads for HeadConcept; log-spaced for EmbeddingDimConcept,
+    which has embed_dim detectors)."""
+    head_dim = embed_dim // num_heads
+    if concept_name == "head":
+        concept = HeadConcept(num_heads=num_heads)
+        ndet = num_heads
+        D = torch.zeros(ndet, embed_dim, dtype=torch.bool, device=device)
+        for h in range(num_heads):
+            D[h, h * head_dim:(h + 1) * head_dim] = True
+        n_grid = list(range(1, num_heads + 1))
+    elif concept_name == "embed_dim":
+        concept = EmbeddingDimConcept(num_heads=num_heads)
+        ndet = embed_dim
+        D = torch.eye(embed_dim, dtype=torch.bool, device=device)
+        n_grid = list(range(1, embed_dim + 1))   # one-by-one, no sub-sampling
+    else:
+        raise ValueError(f"unknown concept {concept_name!r}")
+    return concept, ndet, D, n_grid
+
+
+def run_dataset(key, n_images, device, concept_name="head", max_classes=None,
+                chunk_size=None, precision="bf16", methods=("zero",)):
     ds_name, ds_kw, tag = DATASETS[key]
     model, ck, probe_path = load_probe(tag, device)
     num_classes = int(ck["num_classes"])
     num_heads = int(model.backbone.blocks[0].attn.num_heads)
     embed_dim = int(model.backbone.embed_dim)
-    head_dim = embed_dim // num_heads
     n_blocks = len(model.backbone.blocks)
     proj_layers = [f"backbone.blocks.{b}.attn.proj_drop" for b in range(n_blocks)]
-    print(f"[{key}] probe={Path(probe_path).parent.name} classes={num_classes} "
-          f"heads={num_heads} blocks={n_blocks}")
 
     from experiments.datasets import load as load_ds
     tf = create_transform(**resolve_data_config({}, model=model.backbone), is_training=False)
@@ -179,11 +211,16 @@ def run_dataset(key, n_images, device, eps_logit=1e-3, max_classes=None):
     if max_classes is not None:
         sel = {c: v for c, v in sel.items() if c < max_classes}
     counts = {c: len(v) for c, v in sel.items()}
-    print(f"[{key}] images/class min={min(counts.values())} max={max(counts.values())}")
 
     attribution = CondAttribution(model)
     composite = build_lxt_composite()
-    concept = HeadConcept(num_heads=num_heads)
+    concept, ndet, D, n_grid = concept_spec(concept_name, num_heads, embed_dim, device)
+    K = len(n_grid)
+    print(f"[{key}/{concept_name}] probe={Path(probe_path).parent.name} "
+          f"classes={num_classes} heads={num_heads} embed={embed_dim} blocks={n_blocks} "
+          f"detectors={ndet} n_grid={n_grid}")
+    print(f"[{key}/{concept_name}] images/class min={min(counts.values())} "
+          f"max={max(counts.values())}")
 
     # install perturbation hooks (one per block proj_drop)
     proj_mods = [model.backbone.blocks[b].attn.proj_drop for b in range(n_blocks)]
@@ -196,105 +233,145 @@ def run_dataset(key, n_images, device, eps_logit=1e-3, max_classes=None):
         def cap(module, inp, out): captured[b] = out.detach()
         return cap
 
-    methods = ["zero", "mean", "sign_flip"]
+    methods = list(methods)
     orderings = ["most", "least"]
-    rows = []
+    M, O = len(methods), len(orderings)
+    method_ids = np.asarray([METHOD_ID[m] for m in methods])   # absolute ids for the hook
+    B = M * O * n_blocks * K
+    # fixed per-element decode (same every image): e=(((mi*O+oi)*n_blocks)+b)*K+ki
+    e_arr = np.arange(B)
+    ki_arr = e_arr % K
+    rest = e_arr // K
+    b_arr = (rest % n_blocks).astype(np.int16)
+    rest2 = rest // n_blocks
+    oi_arr = rest2 % O
+    mi_arr = rest2 // O
+    n_arr = np.asarray(n_grid, dtype=np.int32)[ki_arr]
+    pert_name = np.asarray(methods)[mi_arr]
+    ord_name = np.asarray(orderings)[oi_arr]
+    layer_arr = np.asarray(proj_layers)[b_arr]
+    method_t = torch.as_tensor(method_ids[mi_arr], device=device, dtype=torch.long)
+    # global config indices per block (each config perturbs exactly one block, so
+    # batching per block keeps only that block's hook active — others fast-path).
+    idx_by_block = [torch.as_tensor(np.where(b_arr == b)[0], device=device)
+                    for b in range(n_blocks)]
+    # baseline (n=0) index arrays (M*O*n_blocks rows)
+    nb = M * O * n_blocks
+    bmi, boi, bb = [], [], []
+    for mi in range(M):
+        for oi in range(O):
+            for b in range(n_blocks):
+                bmi.append(mi); boi.append(oi); bb.append(b)
+    bb = np.asarray(bb, dtype=np.int16)
+    base_pert = np.asarray(methods)[np.asarray(bmi)]
+    base_ord = np.asarray(orderings)[np.asarray(boi)]
+    base_layer = np.asarray(proj_layers)[bb]
+
+    img_dfs = []
     try:
         for c in sorted(sel):
             for image_idx in sel[c]:
                 x = ds[image_idx][0].unsqueeze(0).to(device)
-                # 1) baseline + capture proj_drop outputs
+                amp = torch.autocast("cuda", dtype=torch.bfloat16,
+                                     enabled=(precision == "bf16" and device == "cuda"))
+                # 1) baseline logit + capture proj_drop outputs (mean-replace values)
                 for h in hooks:
                     h.mask = None
                 cap_handles = [pm.register_forward_hook(_mk_cap(b)) for b, pm in enumerate(proj_mods)]
-                with torch.no_grad():
-                    base_logits = model(x)[0]
+                with torch.no_grad(), amp:
+                    base_logits = model(x).float()[0]
                 for ch in cap_handles:
                     ch.remove()
                 y_logit = float(base_logits[c])
                 y_prob = float(torch.softmax(base_logits, -1)[c])
-                meanvecs = [captured[b][0].mean(dim=0) for b in range(n_blocks)]  # (embed_dim,)
+                meanvecs = [captured[b][0].mean(dim=0) for b in range(n_blocks)]
 
-                # 2) relevance ranking (CP-LRP), all blocks from one backward
+                # 2) relevance ranking (CP-LRP), all blocks from one backward;
+                #    build cumulative masks (cummax over ranked detectors) + cum relevance
                 xg = x.clone().requires_grad_(True)
                 res = attribution(xg, [{"y": [c]}], composite, record_layer=proj_layers)
-                # per-block per-head relevance (raw)
-                rank = {}     # block -> (heads_desc, rel_per_head)
-                for b in range(n_blocks):
-                    rel = concept.attribute(res.relevances[proj_layers[b]], abs_norm=False)[0]  # (num_heads,)
-                    order_desc = torch.argsort(rel, descending=True).tolist()
-                    rank[b] = (order_desc, rel.detach().cpu().numpy())
-
-                # 3) perturbed forwards — ALL (method × ordering × block × n)
-                #    configs in ONE batched forward. Element index:
-                #    e = (((mi*O + oi)*n_blocks) + b)*num_heads + (n-1)
-                M, O = len(methods), len(orderings)
-                B = M * O * n_blocks * num_heads
-                xb = x.expand(B, -1, -1, -1).contiguous()
-                method_t = torch.zeros(B, dtype=torch.long, device=device)
                 block_masks = [torch.zeros(B, embed_dim, dtype=torch.bool, device=device)
                                for _ in range(n_blocks)]
-                for mi, method in enumerate(methods):
-                    for oi, ordering in enumerate(orderings):
-                        for b in range(n_blocks):
-                            heads_desc = rank[b][0]
-                            order_heads = heads_desc if ordering == "most" else heads_desc[::-1]
-                            for nn_ in range(1, num_heads + 1):
-                                e = (((mi * O + oi) * n_blocks) + b) * num_heads + (nn_ - 1)
-                                method_t[e] = mi
-                                for h in order_heads[:nn_]:
-                                    block_masks[b][e, h * head_dim:(h + 1) * head_dim] = True
+                cumrel = np.zeros((O, n_blocks, K), dtype=np.float64)
+                rel_total_b = np.zeros(n_blocks)
                 for b in range(n_blocks):
-                    hooks[b].mask = block_masks[b]
-                    hooks[b].method = method_t
-                    hooks[b].meanvec = meanvecs[b]
-                with torch.no_grad():
-                    pert_logits = model(xb)                # (B, num_classes)
-                for h in hooks:
-                    h.mask = None
-                pert_c = pert_logits[:, c]
-                pert_prob = torch.softmax(pert_logits, -1)[:, c]
-                for mi, method in enumerate(methods):
+                    rel = concept.attribute(res.relevances[proj_layers[b]], abs_norm=False)[0]  # (ndet,)
+                    rel_np = rel.detach().cpu().numpy()
+                    rel_total_b[b] = float(np.abs(rel_np).sum())
+                    od = torch.argsort(rel, descending=True)
                     for oi, ordering in enumerate(orderings):
-                        for b in range(n_blocks):
-                            heads_desc, rel = rank[b]
-                            order_heads = heads_desc if ordering == "most" else heads_desc[::-1]
-                            rel_total = float(np.abs(rel).sum())
-                            rows.append(dict(
-                                dataset=key, perturbation=method, ordering=ordering,
-                                block=b, layer=proj_layers[b], **{"class": c},
-                                image_idx=int(image_idx), n=0,
-                                logit_target=y_logit, prob_target=y_prob,
-                                logit_baseline=y_logit, prob_baseline=y_prob,
-                                cum_relevance=0.0, rel_total=rel_total, num_heads=num_heads,
-                            ))
-                            for nn_ in range(1, num_heads + 1):
-                                e = (((mi * O + oi) * n_blocks) + b) * num_heads + (nn_ - 1)
-                                cum_rel = float(rel[order_heads[:nn_]].sum())
-                                rows.append(dict(
-                                    dataset=key, perturbation=method, ordering=ordering,
-                                    block=b, layer=proj_layers[b], **{"class": c},
-                                    image_idx=int(image_idx), n=nn_,
-                                    logit_target=float(pert_c[e]), prob_target=float(pert_prob[e]),
-                                    logit_baseline=y_logit, prob_baseline=y_prob,
-                                    cum_relevance=cum_rel, rel_total=rel_total, num_heads=num_heads,
-                                ))
-            print(f"[{key}] class {c:>2} done ({len(sel[c])} imgs) — rows so far {len(rows)}")
+                        order = od if ordering == "most" else od.flip(0)
+                        cm = torch.cummax(D[order].to(torch.int8), dim=0).values.bool()  # (K, embed)
+                        cumrel[oi, b] = np.cumsum(rel_np[order.cpu().numpy()])
+                        for mi in range(M):
+                            bi = (((mi * O + oi) * n_blocks) + b) * K
+                            block_masks[b][bi:bi + K] = cm
+
+                # 3) perturbed forwards — batched PER BLOCK (chunked), so only the
+                #    target block's proj_drop hook is active (others fast-path None).
+                #    Logits accumulate on-GPU; single host transfer per image.
+                pc = torch.empty(B, device=device); pp = torch.empty(B, device=device)
+                cs = chunk_size or B
+                with torch.no_grad(), amp:
+                    for b in range(n_blocks):
+                        idxb = idx_by_block[b]
+                        for s in range(0, idxb.numel(), cs):
+                            cidx = idxb[s:s + cs]; bs = cidx.numel()
+                            hooks[b].mask = block_masks[b][cidx]
+                            hooks[b].method = method_t[cidx]
+                            hooks[b].meanvec = meanvecs[b]
+                            out = model(x.expand(bs, -1, -1, -1)).float()
+                            hooks[b].mask = None
+                            pc[cidx] = out[:, c]
+                            pp[cidx] = torch.softmax(out, -1)[:, c]
+                pert_c = pc.cpu(); pert_prob = pp.cpu()
+
+                # 4) columnar rows (n>0 then n=0 baselines) — avoid per-row dicts
+                main = pl.DataFrame(dict(
+                    perturbation=pert_name, ordering=ord_name, block=b_arr,
+                    layer=layer_arr, n=n_arr,
+                    image_idx=np.full(B, image_idx, np.int64),
+                    logit_target=pert_c.numpy().astype(np.float32),
+                    prob_target=pert_prob.numpy().astype(np.float32),
+                    cum_relevance=cumrel[oi_arr, b_arr, ki_arr].astype(np.float32),
+                    rel_total=rel_total_b[b_arr].astype(np.float32),
+                ))
+                base = pl.DataFrame(dict(
+                    perturbation=base_pert, ordering=base_ord, block=bb,
+                    layer=base_layer, n=np.zeros(nb, np.int32),
+                    image_idx=np.full(nb, image_idx, np.int64),
+                    logit_target=np.full(nb, y_logit, np.float32),
+                    prob_target=np.full(nb, y_prob, np.float32),
+                    cum_relevance=np.zeros(nb, np.float32),
+                    rel_total=rel_total_b[bb].astype(np.float32),
+                ))
+                df_img = pl.concat([main, base]).with_columns([
+                    pl.lit(c).cast(pl.Int32).alias("class"),
+                    pl.lit(key).alias("dataset"), pl.lit(concept_name).alias("concept"),
+                    pl.lit(ndet).cast(pl.Int32).alias("n_detectors"),
+                    pl.lit(num_heads).cast(pl.Int16).alias("num_heads"),
+                    pl.lit(y_logit).cast(pl.Float32).alias("logit_baseline"),
+                    pl.lit(y_prob).cast(pl.Float32).alias("prob_baseline"),
+                ])
+                img_dfs.append(df_img)
+            print(f"[{key}/{concept_name}] class {c:>2} done ({len(sel[c])} imgs) "
+                  f"— images {sum(len(v) for cc, v in sel.items() if cc <= c)}")
     finally:
         for hd in handles:
             hd.remove()
 
-    df = pl.DataFrame(rows)
+    df = pl.concat(img_dfs)
     df = df.with_columns([
         (pl.col("logit_target") / pl.col("logit_baseline")).alias("delta_logit"),
         (pl.col("prob_target") / pl.col("prob_baseline")).alias("delta_prob"),
     ])
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = OUT_DIR / f"flipping_{key}.parquet"
+    out = OUT_DIR / f"flipping_{concept_name}_{key}.parquet"
     df.write_parquet(out)
-    print(f"[{key}] wrote {len(df)} rows → {out}")
+    print(f"[{key}/{concept_name}] wrote {len(df)} rows → {out}")
     return out, dict(probe=probe_path, num_classes=num_classes, num_heads=num_heads,
-                     n_blocks=n_blocks, n_images=n_images, counts=counts)
+                     n_detectors=ndet, n_grid=n_grid, n_blocks=n_blocks,
+                     n_images=n_images, counts=counts)
 
 
 app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
@@ -303,25 +380,37 @@ app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
 @app.command()
 def main(
     datasets: List[str] = typer.Option(list(DATASETS), "--datasets"),
+    concept: List[str] = typer.Option(["head"], "--concept",
+                                      help="head | embed_dim (repeatable)"),
     n_images: int = typer.Option(50, "--n-images"),
     device: Optional[str] = typer.Option(None, "--device"),
     max_classes: Optional[int] = typer.Option(None, "--max-classes", help="smoke: limit classes"),
+    chunk_size: Optional[int] = typer.Option(4096, "--chunk-size",
+                                             help="configs per forward chunk (GPU batch)"),
+    precision: str = typer.Option("bf16", "--precision", help="bf16 (model-native) | fp32"),
+    perturbation: List[str] = typer.Option(["zero"], "--perturbation",
+                                           help="zero | mean | sign_flip (repeatable)"),
 ):
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={dev}  datasets={datasets}  n_images={n_images}")
-    meta = dict(
-        experiment="concept_flipping", composite="lxt_cplrp",
-        concept="HeadConcept", site="proj_drop",
-        perturbations=["zero", "mean", "sign_flip"],
-        orderings=["most", "least"], split="train-clean",
-        n_images_per_class=n_images, device=dev, datasets={},
-    )
-    for key in datasets:
-        _, dmeta = run_dataset(key, n_images, dev, max_classes=max_classes)
-        meta["datasets"][key] = dmeta
+    print(f"device={dev}  datasets={datasets}  concepts={concept}  n_images={n_images} "
+          f"chunk_size={chunk_size}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "meta.json").write_text(json.dumps(meta, indent=2))
-    print(f"meta → {OUT_DIR / 'meta.json'}")
+    meta_path = OUT_DIR / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    meta.update(dict(experiment="concept_flipping", composite="lxt_cplrp", site="proj_drop",
+                     perturbations=list(perturbation), orderings=["most", "least"],
+                     split="train-clean", n_images_per_class=n_images, device=dev,
+                     precision=precision))
+    meta.setdefault("concepts", {})
+    for cname in concept:
+        meta["concepts"].setdefault(cname, {})
+        for key in datasets:
+            _, dmeta = run_dataset(key, n_images, dev, concept_name=cname,
+                                   max_classes=max_classes, chunk_size=chunk_size,
+                                   precision=precision, methods=perturbation)
+            meta["concepts"][cname][key] = dmeta
+            meta_path.write_text(json.dumps(meta, indent=2))  # checkpoint after each
+    print(f"meta → {meta_path}")
 
 
 if __name__ == "__main__":
