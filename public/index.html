@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SAE-basis CRP — concept-flipping by probe site</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --accent:#7b2d8e; --bg:#fafafa; --card:#fff; --line:#e3e3e3; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+         color:var(--fg); background:var(--bg); }
+  .wrap { max-width:1100px; margin:0 auto; padding:2rem 1.25rem 4rem; }
+  h1 { font-size:1.7rem; margin:0 0 .25rem; }
+  h2 { font-size:1.2rem; margin:2.4rem 0 .6rem; border-bottom:1px solid var(--line); padding-bottom:.3rem; }
+  .sub { color:var(--muted); margin:0 0 1.5rem; }
+  p { margin:.6rem 0; }
+  code { background:#f0eef2; padding:.1em .35em; border-radius:4px; font-size:.9em; }
+  .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:1.4rem; margin-top:1rem; }
+  @media (max-width:760px){ .grid{ grid-template-columns:1fr; } }
+  figure { margin:0; background:var(--card); border:1px solid var(--line); border-radius:10px;
+           overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.05); }
+  figure img { width:100%; display:block; background:#fff; }
+  figcaption { padding:.7rem .9rem; font-size:.88rem; color:var(--fg); }
+  figcaption .tag { display:inline-block; font-weight:600; color:var(--accent); }
+  figcaption a { color:var(--muted); text-decoration:none; border-bottom:1px dotted var(--muted); }
+  .legend { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1rem 1.2rem; }
+  .legend ul { margin:.4rem 0 0; padding-left:1.2rem; }
+  .note { background:#fff7e6; border:1px solid #f0d99b; border-radius:10px; padding:1rem 1.2rem; }
+  .key span { display:inline-block; margin-right:1.2rem; }
+  .dot { display:inline-block; width:.7em; height:.7em; border-radius:50%; vertical-align:middle; margin-right:.35em; }
+  footer { margin-top:3rem; color:var(--muted); font-size:.82rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>SAE-basis CRP &mdash; concept-flipping faithfulness by probe site</h1>
+  <p class="sub">ViT-small (12 blocks, embed-dim 384) &middot; relevance recipe <code>cp_lrp_baseline</code>
+     (LXT value-path AttnLRP) &middot; perturbation = zero-ablation.</p>
+
+  <p>Does decomposing a ViT prediction with CRP onto a <strong>learned sparse-autoencoder (SAE)
+     dictionary</strong> give more faithful concept-relevance than the standard <strong>axis-aligned</strong>
+     basis (one concept = one embedding dimension)? And does the answer depend on <strong>where</strong>
+     we probe? We compare two probe sites &times; two concept bases &mdash; <strong>4 cases</strong>:</p>
+
+  <div class="legend">
+    <strong>Reading each panel.</strong> Every figure stacks the <strong>3 dataset-trained models
+    side by side</strong> (dSprites, ColoredMNIST, FunnyBirds); within each, one panel per transformer
+    <strong>block</strong> (0&ndash;11). A panel is a concept-flipping curve &mdash; we rank that block's
+    detectors by signed LRP relevance for the target class, then cumulatively ablate them:
+    <ul class="key" style="list-style:none;padding-left:0">
+      <li><span class="dot" style="background:#d62728"></span><strong>most-relevant-first (MoRF)</strong> &mdash; ablate the strongest detectors first</li>
+      <li><span class="dot" style="background:#2ca02c"></span><strong>least-relevant-first (LeRF)</strong> &mdash; ablate the weakest first</li>
+    </ul>
+    <ul>
+      <li>y = &Delta; = target-class prob after ablation &divide; baseline prob; x = fraction of detectors ablated <code>n/N</code>.</li>
+      <li>Bands: dark = 95% bootstrap CI of the mean; faint = &plusmn;1 std across images. Dot = sign-crossing n&#9733;.</li>
+      <li><strong>Faithful ranking &rArr; red (MoRF) drops below green (LeRF):</strong> removing the
+          relevance-ranked detectors first collapses the prediction faster. The bigger the red&ndash;green
+          gap (area between curves = AOPC<sub>most</sub>&minus;AOPC<sub>least</sub>), the more concentrated
+          and faithful the relevance.</li>
+    </ul>
+  </div>
+
+  <h2>The 4 cases</h2>
+  <div class="grid">
+
+    <figure>
+      <a href="flip_proj_drop_embed_dim.png"><img src="flip_proj_drop_embed_dim.png" alt="proj_drop, axis-aligned"></a>
+      <figcaption><span class="tag">proj_drop &middot; axis-aligned</span> (embed dims, N=384).
+        The existing CRP baseline: concepts = raw embedding dimensions, read at the attention
+        output-projection site. Reference for whether the SAE basis helps.
+        [<a href="flip_proj_drop_embed_dim.pdf">pdf</a>]</figcaption>
+    </figure>
+
+    <figure>
+      <a href="flip_proj_drop_sae.png"><img src="flip_proj_drop_sae.png" alt="proj_drop, SAE"></a>
+      <figcaption><span class="tag">proj_drop &middot; SAE dictionary</span> (m=3072 latents).
+        Same site, but logit relevance is decomposed onto a trained over-complete SAE basis
+        (&alpha;=8) spliced in as a reconstruction pass-through.
+        [<a href="flip_proj_drop_sae.pdf">pdf</a>]</figcaption>
+    </figure>
+
+    <figure>
+      <a href="flip_residual_embed_dim.png"><img src="flip_residual_embed_dim.png" alt="residual, axis-aligned"></a>
+      <figcaption><span class="tag">residual stream &middot; axis-aligned</span> (embed dims, N=384).
+        Concepts = embedding dimensions of the full block-output residual stream &mdash; the site the
+        SAE-on-ViT literature hooks.
+        [<a href="flip_residual_embed_dim.pdf">pdf</a>]</figcaption>
+    </figure>
+
+    <figure>
+      <a href="flip_residual_sae.png"><img src="flip_residual_sae.png" alt="residual, SAE"></a>
+      <figcaption><span class="tag">residual stream &middot; SAE dictionary</span> (m=3072 latents).
+        The richest combination: SAE basis on the full residual stream. Clearest MoRF collapse on
+        ColoredMNIST and FunnyBirds.
+        [<a href="flip_residual_sae.pdf">pdf</a>]</figcaption>
+    </figure>
+
+  </div>
+
+  <h2>What the figures show</h2>
+  <p><strong>The SAE basis is faithful, most clearly on the residual stream.</strong> On ColoredMNIST and
+     FunnyBirds the SAE-residual panels show a clean, wide MoRF&ndash;LeRF gap across mid/late blocks
+     (red collapses well below green) &mdash; relevance concentrates in a small set of SAE latents whose
+     ablation drives the prediction down fast. The axis-aligned baselines at both sites are also faithful
+     but with generally narrower gaps.</p>
+  <p><strong>dSprites is the flat case</strong> (only 3 shape classes, very sparse codes), so its curves
+     stay near &Delta;=1 with wide CI bands &mdash; little to flip. <strong>FunnyBirds SAE-residual</strong>
+     drew fewer images (the residual SAE's reconstruction error knocked some images below the
+     correctly-classified bar), so its bands are wider there.</p>
+
+  <h2>SAE reconstruction quality</h2>
+  <p>All 72 SAEs (2 sites &times; 3 datasets &times; 12 blocks, &alpha;=8, L1) reconstruct faithfully:
+     <strong>FVU 0.005&ndash;0.044</strong>, sparse codes (L0 ~10&ndash;270), ~0 dead latents. The splice
+     perturbs the forward pass only slightly (per-image recon error ~8%), and &Delta; is measured relative
+     to the spliced baseline, so the residual cancels.</p>
+
+  <div class="note">
+    <strong>Caveat &mdash; relevance conservation onto SAE latents.</strong> These flipping curves are
+    <em>ranking-based</em> (rank latents by relevance, then ablate), and ranking is scale-invariant, so the
+    curves are valid as shown. However, the strict CRP conservation property &mdash;
+    &Sigma;<sub>i</sub> R(latent<sub>i</sub>) &asymp; R(probe) &mdash; currently holds only weakly
+    (&approx;2% of probe relevance lands on the latents). The folded decoder bias equals the mean
+    activation (large), and the &gamma;-rule routes most relevance into that constant bias rather than the
+    latents. The discriminative signal lives in the <em>variable</em> feature part (not the constant
+    mean-offset), so this does not affect the faithfulness ranking &mdash; but a clean conservation claim
+    would need bias-aware handling on the decoder (bias-free rule, or treating the mean offset as a skip).
+  </div>
+
+  <!-- ── DIMSWEEP SECTION ─────────────────────────────────────────────── -->
+  <h2 id="dimsweep">SAE dimensionality sweep</h2>
+  <p>The 4-case study above fixed the SAE at one over-complete size (<code>m=3072</code>, &alpha;=8).
+     Here we <strong>sweep the dictionary size</strong> and ask: <em>how does concept-flipping
+     faithfulness depend on how many SAE latents we decompose onto?</em> Same protocol, same recipe
+     (<code>cp_lrp_baseline</code>), same two probe sites &mdash; <code>proj_drop</code> (attention-branch
+     write, before the residual add) and <code>residual</code> (block output, after the residual add).
+     Two toy datasets: <strong>dSprites</strong> and <strong>FunnyBirds</strong>.</p>
+  <p>We compare five concept bases, selectable below:</p>
+  <ul>
+    <li><strong>no SAE</strong> &mdash; the axis-aligned baseline (one concept = one embedding dim,
+        <code>N=384</code>).</li>
+    <li><strong>SAE m&isin;{154, 384, 768, 1536}</strong> &mdash; 5% / 12.5% / 25% / 50% of the original
+        <code>m=3072</code>. <code>m=384</code> is exactly complete; <code>m=154</code> is
+        <em>undercomplete</em> (fewer latents than dims).</li>
+  </ul>
+  <p>Each SAE is a vanilla L1 autoencoder spliced as a reconstruction pass-through; relevance is
+     decomposed onto its latents <code>f</code>:</p>
+  <p style="text-align:center"><code>f = ReLU(W<sub>enc</sub>(a&minus;b<sub>dec</sub>)+b<sub>enc</sub>)</code>
+     &nbsp;&middot;&nbsp; <code>&acirc; = W<sub>dec</sub>f + b<sub>dec</sub> &asymp; a</code>.
+     &nbsp; Rank latents by signed conditional relevance, cumulatively ablate MoRF/LeRF, track
+     <code>&Delta;(n)=p&prime;<sub>c</sub>/p<sub>c</sub></code>.</p>
+
+  <div class="note">
+    <strong>How to read the sweep.</strong> Curves use the normalised x-axis <code>n/N</code>, so they are
+    on a common scale. But &Delta; is measured relative to each variant's <em>own spliced baseline</em>, and
+    smaller <code>m</code> reconstructs less faithfully (higher FVU), so absolute &Delta; curves are not
+    directly comparable across sizes &mdash; the <strong>integral metric</strong> (area between MoRF and
+    LeRF = <code>AOPC<sub>most</sub>&minus;AOPC<sub>least</sub></code>) is internally relative and
+    <em>is</em> the right cross-size comparison. See the per-dataset metric plot at the end of each block.
+  </div>
+
+  <p style="margin-top:1.4rem">
+    <label for="dimsel"><strong>SAE dimensionality:</strong></label>
+    <select id="dimsel" style="font:inherit;padding:.3em .5em;border:1px solid var(--line);border-radius:6px;margin-left:.4rem">
+      <option value="none">no SAE (axis-aligned, 384)</option>
+      <option value="154">SAE m=154 (5%, undercomplete)</option>
+      <option value="384">SAE m=384 (complete)</option>
+      <option value="768">SAE m=768 (25%)</option>
+      <option value="1536" selected>SAE m=1536 (50%)</option>
+    </select>
+  </p>
+
+  <h3 style="margin-top:1.6rem">dSprites</h3>
+  <div class="grid">
+    <figure>
+      <a class="dimlink" data-ds="dsprites" data-site="proj_drop" href="dimsweep/curves_dsprites_proj_drop_1536.png"><img class="dimimg" data-ds="dsprites" data-site="proj_drop" src="dimsweep/curves_dsprites_proj_drop_1536.png" alt="dSprites proj_drop"></a>
+      <figcaption><span class="tag">dSprites &middot; proj_drop</span> (before residual add). 12-block MoRF/LeRF curves.</figcaption>
+    </figure>
+    <figure>
+      <a class="dimlink" data-ds="dsprites" data-site="residual" href="dimsweep/curves_dsprites_residual_1536.png"><img class="dimimg" data-ds="dsprites" data-site="residual" src="dimsweep/curves_dsprites_residual_1536.png" alt="dSprites residual"></a>
+      <figcaption><span class="tag">dSprites &middot; residual</span> (after residual add). 12-block MoRF/LeRF curves.</figcaption>
+    </figure>
+  </div>
+  <figure style="margin-top:1.2rem">
+    <a href="dimsweep/metric_dsprites.png"><img src="dimsweep/metric_dsprites.png" alt="dSprites metric vs dim"></a>
+    <figcaption><span class="tag">dSprites &middot; integral metric</span> concept-flipping score per block, one line per
+      dimensionality (incl. no-SAE), faceted by site. Higher = more faithful.</figcaption>
+  </figure>
+
+  <h3 style="margin-top:1.8rem">FunnyBirds</h3>
+  <div class="grid">
+    <figure>
+      <a class="dimlink" data-ds="funny_birds" data-site="proj_drop" href="dimsweep/curves_funny_birds_proj_drop_1536.png"><img class="dimimg" data-ds="funny_birds" data-site="proj_drop" src="dimsweep/curves_funny_birds_proj_drop_1536.png" alt="FunnyBirds proj_drop"></a>
+      <figcaption><span class="tag">FunnyBirds &middot; proj_drop</span> (before residual add). 12-block MoRF/LeRF curves.</figcaption>
+    </figure>
+    <figure>
+      <a class="dimlink" data-ds="funny_birds" data-site="residual" href="dimsweep/curves_funny_birds_residual_1536.png"><img class="dimimg" data-ds="funny_birds" data-site="residual" src="dimsweep/curves_funny_birds_residual_1536.png" alt="FunnyBirds residual"></a>
+      <figcaption><span class="tag">FunnyBirds &middot; residual</span> (after residual add). 12-block MoRF/LeRF curves.</figcaption>
+    </figure>
+  </div>
+  <figure style="margin-top:1.2rem">
+    <a href="dimsweep/metric_funny_birds.png"><img src="dimsweep/metric_funny_birds.png" alt="FunnyBirds metric vs dim"></a>
+    <figcaption><span class="tag">FunnyBirds &middot; integral metric</span> concept-flipping score per block, one line per
+      dimensionality (incl. no-SAE), faceted by site. Higher = more faithful.</figcaption>
+  </figure>
+
+  <h3 id="imagenet" style="margin-top:2rem">ImageNet — ViT-B/16 (pretrained)</h3>
+  <p>Does the toy-dataset story hold on a <strong>real, large-scale</strong> model? We repeat the sweep on
+     a stock ImageNet-1k-pretrained <code>vit_base_patch16_224</code> (<code>d=768</code>, 12 blocks, 86 % top-1
+     on the eval subset) over 10 classes. The toy results predicted: <em>avoid undercomplete; faithfulness
+     grows with <code>m</code> at the late blocks</em> — so the interesting range is complete→over-complete.
+     We sweep <code>m&isin;{384, 768, 1536, 3072}</code> (0.5× / 1× / 2× / 4× of <code>d</code>) vs no-SAE
+     (axis-aligned, 768).</p>
+  <div class="note">
+    <strong>Verdict.</strong> The toy story transfers. On the <strong>residual stream</strong> the
+    axis-aligned basis is already strong and smooth across blocks; only the <strong>larger</strong> SAEs
+    (<code>m=1536/3072</code>) match or exceed it, and only at the late blocks, while the
+    <strong>undercomplete <code>m=384</code></strong> is clearly weakest. On <code>proj_drop</code> all bases
+    are flat early and rise sharply at blocks 9–11, where the largest SAE (<code>m=3072</code>) edges ahead.
+    <strong>Best dimensionality ≈ 2–4× over-complete</strong> (m=1536–3072); undercomplete hurts. (Block-0
+    residual with large <code>m</code> is degenerate — few correctly-classified spliced images make its
+    Δ-ratio unstable — and is clipped in the metric plot.)
+  </div>
+
+  <p style="margin-top:1.2rem">
+    <label for="dimsel_in"><strong>SAE dimensionality (ImageNet):</strong></label>
+    <select id="dimsel_in" style="font:inherit;padding:.3em .5em;border:1px solid var(--line);border-radius:6px;margin-left:.4rem">
+      <option value="none">no SAE (axis-aligned, 768)</option>
+      <option value="384">SAE m=384 (0.5×, undercomplete)</option>
+      <option value="768">SAE m=768 (1×, complete)</option>
+      <option value="1536" selected>SAE m=1536 (2×)</option>
+      <option value="3072">SAE m=3072 (4×)</option>
+    </select>
+  </p>
+  <div class="grid">
+    <figure>
+      <a class="dimlink-in" data-ds="imagenet" data-site="proj_drop" href="dimsweep/curves_imagenet_proj_drop_1536.png"><img class="dimimg-in" data-ds="imagenet" data-site="proj_drop" src="dimsweep/curves_imagenet_proj_drop_1536.png" alt="ImageNet proj_drop"></a>
+      <figcaption><span class="tag">ImageNet &middot; proj_drop</span> (before residual add). 12-block MoRF/LeRF curves.</figcaption>
+    </figure>
+    <figure>
+      <a class="dimlink-in" data-ds="imagenet" data-site="residual" href="dimsweep/curves_imagenet_residual_1536.png"><img class="dimimg-in" data-ds="imagenet" data-site="residual" src="dimsweep/curves_imagenet_residual_1536.png" alt="ImageNet residual"></a>
+      <figcaption><span class="tag">ImageNet &middot; residual</span> (after residual add). 12-block MoRF/LeRF curves.</figcaption>
+    </figure>
+  </div>
+  <figure style="margin-top:1.2rem">
+    <a href="dimsweep/metric_imagenet.png"><img src="dimsweep/metric_imagenet.png" alt="ImageNet metric vs dim"></a>
+    <figcaption><span class="tag">ImageNet &middot; integral metric</span> concept-flipping score per block, one line per
+      dimensionality (incl. no-SAE), faceted by site. Higher = more faithful.</figcaption>
+  </figure>
+
+  <script>
+    (function () {
+      var sel = document.getElementById('dimsel_in');
+      function swap() {
+        var v = sel.value;
+        document.querySelectorAll('.dimimg-in').forEach(function (img) {
+          img.src = 'dimsweep/curves_' + img.dataset.ds + '_' + img.dataset.site + '_' + v + '.png';
+        });
+        document.querySelectorAll('.dimlink-in').forEach(function (a) {
+          a.href = 'dimsweep/curves_' + a.dataset.ds + '_' + a.dataset.site + '_' + v + '.png';
+        });
+      }
+      sel.addEventListener('change', swap);
+      swap();
+    })();
+  </script>
+
+  <script>
+    (function () {
+      var sel = document.getElementById('dimsel');
+      function swap() {
+        var v = sel.value;
+        document.querySelectorAll('.dimimg').forEach(function (img) {
+          var src = 'dimsweep/curves_' + img.dataset.ds + '_' + img.dataset.site + '_' + v + '.png';
+          img.src = src;
+        });
+        document.querySelectorAll('.dimlink').forEach(function (a) {
+          a.href = 'dimsweep/curves_' + a.dataset.ds + '_' + a.dataset.site + '_' + v + '.png';
+        });
+      }
+      sel.addEventListener('change', swap);
+      swap();
+    })();
+  </script>
+  <!-- ── /DIMSWEEP SECTION ────────────────────────────────────────────── -->
+
+  <footer>
+    Generated by the zennit-crp dev session &middot; branch <code>transformer-multi-concept</code> &middot;
+    recipe <code>cp_lrp_baseline</code>. Figures also available as PDF (links above).
+  </footer>
+
+</div>
+</body>
+</html>
