@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Related work — LRP × Sparse Autoencoders (for SAE-basis CRP)</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#666; --accent:#7b2d8e; --bg:#fafafa; --card:#fff; --line:#e3e3e3;
+          --green:#1a7f37; --amber:#b8860b; --red:#b22222; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+         color:var(--fg); background:var(--bg); }
+  .wrap { max-width:980px; margin:0 auto; padding:2rem 1.25rem 4rem; }
+  h1 { font-size:1.7rem; margin:0 0 .2rem; }
+  h2 { font-size:1.25rem; margin:2.6rem 0 .7rem; border-bottom:2px solid var(--line); padding-bottom:.3rem; }
+  h3 { font-size:1.05rem; margin:1.4rem 0 .3rem; }
+  .sub { color:var(--muted); margin:0 0 1.4rem; }
+  p { margin:.55rem 0; }
+  a { color:var(--accent); }
+  code { background:#f0eef2; padding:.1em .35em; border-radius:4px; font-size:.88em; }
+  .verdict { background:#eef7ee; border:1px solid #b9dcb9; border-left:5px solid var(--green);
+             border-radius:8px; padding:1rem 1.2rem; margin:1.2rem 0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1.1rem 1.3rem;
+          margin:1rem 0; box-shadow:0 1px 3px rgba(0,0,0,.04); }
+  .card h3 { margin-top:0; }
+  .pill { display:inline-block; font-size:.74rem; font-weight:700; padding:.12em .6em; border-radius:999px;
+          vertical-align:middle; margin-left:.4rem; }
+  .p-close { background:#fdecec; color:var(--red); }
+  .p-adj   { background:#fff5e0; color:var(--amber); }
+  .p-ctx   { background:#eef0f5; color:#566; }
+  .meta { color:var(--muted); font-size:.85rem; margin:.1rem 0 .6rem; }
+  .lbl { font-weight:600; color:var(--accent); }
+  ul { margin:.4rem 0; padding-left:1.25rem; }
+  li { margin:.2rem 0; }
+  table { border-collapse:collapse; width:100%; font-size:.9rem; margin:1rem 0; }
+  th,td { border:1px solid var(--line); padding:.45rem .6rem; text-align:left; vertical-align:top; }
+  th { background:#f4f1f6; }
+  .yes { color:var(--green); font-weight:700; } .no { color:var(--red); font-weight:700; }
+  .part { color:var(--amber); font-weight:700; }
+  footer { margin-top:3rem; color:var(--muted); font-size:.82rem; border-top:1px solid var(--line); padding-top:1rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Related work: LRP &times; Sparse Autoencoders</h1>
+  <p class="sub">Literature scan for the <strong>SAE-basis CRP</strong> project &mdash; does decomposing a ViT
+     prediction's relevance onto a trained SAE dictionary (output&rarr;SAE, with conservation, evaluated by
+     concept-flipping/AOPC vs the axis-aligned basis) already exist? &middot; compiled 2026-06-09.</p>
+
+  <div class="verdict">
+    <strong>Bottom line.</strong> The exact thing we do &mdash; <em>initialise relevance at the output class
+    logit and use LRP/CRP to decompose it onto a trained SAE latent basis (output&rarr;SAE), with a
+    relevance-conservation check and a concept-flipping / AOPC faithfulness comparison against the
+    axis-aligned embedding-dimension basis, on a ViT</em> &mdash; <strong>was not found in any paper.</strong>
+    The closest works each diverge on a load-bearing axis: <strong>CaFE</strong> runs LRP in the opposite
+    direction (SAE feature&rarr;input); <strong>ClassifSAE</strong> goes decision&rarr;SAE-concepts but by
+    ablation, not conservative relevance propagation; <strong>&ldquo;Sparse but not Simpler&rdquo;</strong>
+    measures SAE-features and attribution as two <em>separate</em> axes; <strong>Interpreto</strong> has no
+    LRP and keeps its SAE and attribution modules unlinked (fusing them is listed as future work).
+    Our contribution is intact &mdash; but it must be positioned explicitly against these.
+  </div>
+
+  <h2>Our approach (the baseline for every &ldquo;difference&rdquo; below)</h2>
+  <p>Train an SAE on ViT activations at a probe site (attention <code>proj_drop</code> output <em>or</em>
+     residual stream); splice it in as a reconstruction pass-through exposing the latent codes <code>f</code>
+     as a recordable layer; <strong>initialise relevance at the output class logit</strong> and use LRP/CRP
+     rules to <strong>decompose that output relevance onto the SAE latents</strong> (conditionally maskable
+     per latent); evaluate with <strong>concept-flipping / AOPC</strong> (most- vs least-relevant ablation)
+     &mdash; is the SAE basis more faithful than axis-aligned embedding dims at the same site? &mdash; plus a
+     <strong>conservation</strong> check &Sigma; R(latent<sub>i</sub>) &asymp; R(probe).</p>
+
+  <h2>At a glance</h2>
+  <table>
+    <tr><th>Paper</th><th>LRP /<br>relevance-prop?</th><th>SAE basis?</th><th>Direction</th>
+        <th>Conservation?</th><th>Faithfulness eval</th><th>ViT?</th></tr>
+    <tr><td><strong>Ours</strong></td><td class="yes">yes (CRP)</td><td class="yes">yes</td>
+        <td>output&rarr;SAE</td><td class="part">checked (weak*)</td><td>concept-flip / AOPC, SAE vs axis</td><td class="yes">yes</td></tr>
+    <tr><td>CaFE (2509.00749)</td><td class="yes">yes (AttnLRP)</td><td class="yes">yes</td>
+        <td class="no">SAE&rarr;input</td><td class="no">no</td><td>insertion on feature act</td><td class="yes">yes</td></tr>
+    <tr><td>ClassifSAE (2506.23951)</td><td class="no">no (ablation)</td><td class="yes">yes</td>
+        <td>decision&rarr;SAE</td><td class="no">no</td><td>per-concept ΔAcc/flip/TVD</td><td class="no">LLM</td></tr>
+    <tr><td>Sparse-not-Simpler (2603.15919)</td><td class="part">Chefer attr.</td><td class="yes">yes</td>
+        <td>output&rarr;input (sep.)</td><td class="no">no</td><td>insertion/deletion on pixels</td><td class="yes">yes</td></tr>
+    <tr><td>Interpreto (2512.09730)</td><td class="no">no (gradients)</td><td class="yes">yes</td>
+        <td>(planned in&rarr;concept)</td><td class="no">no</td><td>concept MSE/stability</td><td class="no">NLP</td></tr>
+    <tr><td>LRP-for-AEs (2303.11734)</td><td class="yes">yes (DTD)</td><td class="no">generic AE</td>
+        <td>recon-loss&rarr;input</td><td class="yes">at loss layer</td><td>corruption test</td><td class="part">conv AE</td></tr>
+  </table>
+  <p class="meta">*Conservation in our current implementation is weak (~2% of probe relevance reaches the
+     latents): the folded SAE decoder bias &asymp; mean activation absorbs most relevance under the
+     &gamma;-rule. Ranking-based flipping curves are unaffected; a clean &Sigma;R(f)&asymp;R(probe) claim
+     needs a bias-aware decoder rule (see takeaways).</p>
+
+  <h2>Publication status (venues)</h2>
+  <p>Verified from the arXiv <code>Journal-ref</code>/<code>Comments</code> fields and proceedings pages.
+     <strong>Notable:</strong> the works that are <em>closest</em> to us are the <em>least</em> published &mdash;
+     CaFE is a workshop paper and the two nearest preprints (ClassifSAE, Sparse-but-not-Simpler) have no venue
+     yet. The peer-reviewed papers are all foundations or orthogonal context.</p>
+  <table>
+    <tr><th>Paper</th><th>Venue</th><th>Status</th></tr>
+    <tr><td>CaFE — 2509.00749</td><td>eXCV Workshop (Explainable Computer Vision) @ ICCV 2025</td><td class="part">workshop (not main-track); arXiv lists no venue</td></tr>
+    <tr><td>ClassifSAE — 2506.23951</td><td>—</td><td class="no">arXiv preprint only</td></tr>
+    <tr><td>Sparse but not Simpler — 2603.15919</td><td>—</td><td class="no">arXiv preprint only (Mar 2026)</td></tr>
+    <tr><td>Interpreto — 2512.09730</td><td>ACL 2026 (System Demonstrations)</td><td class="yes">published (demo)</td></tr>
+    <tr><td>LRP for Autoencoders — 2303.11734</td><td>—</td><td class="no">arXiv preprint only</td></tr>
+    <tr><td>CRP — 2206.03208</td><td>Nature Machine Intelligence 5:1006–1019, 2023</td><td class="yes">journal</td></tr>
+    <tr><td>AttnLRP — 2402.05602</td><td>ICML 2024 (PMLR v235)</td><td class="yes">published</td></tr>
+    <tr><td>Sparse Feature Circuits — 2403.19647</td><td>ICLR 2025</td><td class="yes">published</td></tr>
+    <tr><td>Scaling/TopK SAEs — 2406.04093</td><td>ICLR 2025</td><td class="yes">published</td></tr>
+    <tr><td>Pruned-LRP — 2404.14271</td><td>ECML PKDD 2024 (Springer LNCS 14944, 336–351)</td><td class="yes">published</td></tr>
+    <tr><td>VLM monosemantic SAE — 2504.02821</td><td>NeurIPS 2025</td><td class="yes">published</td></tr>
+    <tr><td>saev — 2502.06755</td><td>—</td><td class="no">arXiv preprint only</td></tr>
+    <tr><td>Universal SAEs — 2502.03714</td><td>—</td><td class="no">arXiv preprint only</td></tr>
+    <tr><td>LLEXICORP — 2511.02720</td><td>—</td><td class="no">arXiv preprint only</td></tr>
+    <tr><td>Toy Models of Superposition / Towards Monosemanticity</td><td>Transformer Circuits</td><td class="part">non-archival (industry report)</td></tr>
+  </table>
+
+  <!-- ============================ CLOSEST ============================ -->
+  <h2>Closest prior work (read in full)</h2>
+
+  <div class="card">
+    <h3>CaFE &mdash; Causal Interpretation of Sparse Autoencoder Features in Vision
+        <span class="pill p-close">CLOSEST · same toolkit</span></h3>
+    <p class="meta">Han, Kim, Kwak (Seoul National Univ.), Aug 2025 &middot;
+       <a href="https://arxiv.org/abs/2509.00749">arXiv:2509.00749</a> &middot;
+       <strong>eXCV Workshop @ ICCV 2025</strong> (workshop, not main-track)</p>
+    <p><span class="lbl">What it does.</span> For a single SAE feature on CLIP-ViT-L/14, it finds the
+       &ldquo;effective receptive field&rdquo; &mdash; the input patches that <em>causally</em> drive the
+       feature &mdash; by backpropagating relevance <strong>from that SAE latent through the encoder and the
+       ViT down to input pixels, using AttnLRP</strong>. Motivated by the fact that high-activation patches
+       are merely correlational under global attention.</p>
+    <p><span class="lbl">Why related.</span> It is the one paper that combines <strong>SAE + AttnLRP on a
+       ViT</strong> &mdash; same building blocks as us, and shares the &ldquo;raw activation is not causal,
+       you need relevance&rdquo; motivation.</p>
+    <p><span class="lbl">Key differences.</span></p>
+    <ul>
+      <li><strong>Opposite direction:</strong> feature&rarr;input (latent is the relevance <em>source</em>);
+          ours is output-logit&rarr;SAE (latents are the <em>sinks</em>).</li>
+      <li><strong>Target:</strong> a single SAE latent vs the <strong>class logit</strong>.</li>
+      <li><strong>No conservation check; no axis-aligned-vs-SAE basis comparison; no concept-flipping/AOPC.</strong>
+          Only an insertion test on the feature activation.</li>
+    </ul>
+    <p><span class="lbl">Take from it.</span> Primary citation &mdash; must be the paper we differentiate
+       against (direction + target + conservation + basis comparison). Borrowable: their
+       insertion-test-on-feature as a complementary feature-level faithfulness probe; the &ldquo;non-local
+       feature&rdquo; phenomenon as motivation.</p>
+  </div>
+
+  <div class="card">
+    <h3>ClassifSAE &mdash; Unveiling Decision-Making in LLMs &hellip; with Sparse Autoencoders
+        <span class="pill p-close">CLOSEST · same direction</span></h3>
+    <p class="meta">Le Bail, Dentan, Buscaldi, Vanier, Jun 2025 (rev. Feb 2026) &middot;
+       <a href="https://arxiv.org/abs/2506.23951">arXiv:2506.23951</a> &middot;
+       <strong>arXiv preprint only</strong></p>
+    <p><span class="lbl">What it does.</span> Trains a classification-aware SAE on LLM residual-stream
+       activations (joint reconstruction + a classifier head on a latent subset + an activation-rate sparsity
+       loss), then measures each concept's influence on the decision by <strong>ablation</strong>
+       (&Delta;accuracy, label-flip rate, total-variation distance), global and conditional.</p>
+    <p><span class="lbl">Why related.</span> Same <strong>direction and goal as us</strong> &mdash; attribute a
+       <em>classification decision</em> onto <em>SAE concepts</em>, framed as faithfulness to the model's
+       prediction. The nearest work on intent.</p>
+    <p><span class="lbl">Key differences.</span></p>
+    <ul>
+      <li><strong>Mechanism:</strong> black-box <strong>ablation</strong> (perturb one latent, watch the
+          output) &mdash; causal but heuristic, one concept at a time, off-distribution risk. Ours is a
+          single <strong>conservative LRP/CRP backward pass</strong> giving an additive relevance vector over
+          all latents at once.</li>
+      <li><strong>No conservation;</strong> no ranked MoRF/LeRF AOPC curve (only per-concept effects).</li>
+      <li><strong>Modality:</strong> LLM text classification, not ViT.</li>
+      <li>They modify the <em>SAE</em> (classifier head); ours is attribution-side, SAE-agnostic.</li>
+    </ul>
+    <p><span class="lbl">Take from it.</span> Cite as the closest &ldquo;decision&rarr;SAE-concept&rdquo; work
+       and contrast mechanism (ablation vs conservative relevance). Borrowable: their ablation metrics
+       (&Delta;Acc / flip / TVD) as an <em>independent causal cross-check</em> of our relevance ranking; the
+       conditional-vs-global evaluation split for sparse features.</p>
+  </div>
+
+  <div class="card">
+    <h3>Sparse but not Simpler &mdash; Multi-Level Interpretability Analysis of ViTs
+        <span class="pill p-close">CLOSE · same ingredients, separate</span></h3>
+    <p class="meta">Siyu Zhang (UT Austin), Mar 2026 &middot;
+       <a href="https://arxiv.org/abs/2603.15919">arXiv:2603.15919</a> &middot;
+       <strong>arXiv preprint only</strong></p>
+    <p><span class="lbl">What it does.</span> Asks whether weight pruning makes ViTs more interpretable.
+       Introduces <strong>IMPACT</strong>, a 4-level harness (neurons, layer/<strong>BatchTopK SAE</strong>,
+       circuits, model-level <strong>attribution</strong> via Chefer transformer-attribution with
+       insertion/deletion). Negative result: sparsity shrinks circuits but gives no systematic interpretability
+       gain.</p>
+    <p><span class="lbl">Why related.</span> Combines <strong>SAEs + attribution faithfulness on the same
+       ViT</strong> (DeiT-III B/16) and uses an insertion/deletion protocol close in spirit to our AOPC.</p>
+    <p><span class="lbl">Key differences.</span></p>
+    <ul>
+      <li><strong>SAE and attribution are separate measurement axes</strong> &mdash; relevance is
+          <em>never</em> propagated through the SAE; attribution lands only on input pixels.</li>
+      <li>Independent variable = <strong>pruning level</strong>, not the representation basis. No
+          SAE-vs-embedding-dim faithfulness comparison; no ranked SAE-feature flipping.</li>
+    </ul>
+    <p><span class="lbl">Take from it.</span> Cite for the &ldquo;sparse &ne; more interpretable/faithful&rdquo;
+       framing and for BatchTopK-SAE-on-DeiT-III precedent. Borrowable: their insertion/deletion protocol and
+       four automated SAE-quality metrics as complementary measures. We <em>close the loop they leave
+       open</em> &mdash; attribute output relevance through the SAE onto its latents.</p>
+  </div>
+
+  <!-- ============================ ADJACENT ============================ -->
+  <h2>Adjacent / methodological</h2>
+
+  <div class="card">
+    <h3>Interpreto &mdash; An Explainability Library for Transformers
+        <span class="pill p-adj">ADJACENT · tooling</span></h3>
+    <p class="meta">Poché et&nbsp;al. (IRT Saint Exupéry / IRIT / CentraleSupélec), Dec 2025, ACL 2026 demo &middot;
+       <a href="https://arxiv.org/abs/2512.09730">arXiv:2512.09730</a> &middot;
+       <a href="https://github.com/FOR-sight-ai/interpreto">code</a></p>
+    <p><span class="lbl">Why related &amp; difference.</span> A library bundling attribution methods <em>and</em>
+       a concept pipeline (incl. several SAE variants) for transformers. But it has <strong>no LRP/AttnLRP</strong>
+       (gradient/perturbation only), estimates concept importance by <strong>concept-to-output gradients</strong>
+       (no conservation), keeps the attribution and SAE modules <strong>unlinked</strong> (&ldquo;link the two
+       modules&rdquo; is explicit future work), and is <strong>NLP-only</strong> (ViT on the roadmap).</p>
+    <p><span class="lbl">Take from it.</span> Evidence that combining propagation-attribution with an SAE basis
+       is an acknowledged <em>gap</em> in current tooling &mdash; supports our novelty. Cite as the packaged-
+       concept-pipeline reference and contrast (gradient importance, no conservation, NLP).</p>
+  </div>
+
+  <div class="card">
+    <h3>Unlocking Layer-wise Relevance Propagation for Autoencoders
+        <span class="pill p-adj">ADJACENT · actionable for our bias fix</span></h3>
+    <p class="meta">Kobayashi, Khasanova, Schneuwly, Schmidt, Casserini (Oracle Labs), Mar 2023 &middot;
+       <a href="https://arxiv.org/abs/2303.11734">arXiv:2303.11734</a> &middot;
+       <strong>arXiv preprint only</strong></p>
+    <p><span class="lbl">Why related.</span> LRP through an <em>autoencoder</em>: a Deep-Taylor-derived rule
+       attributes <strong>reconstruction error</strong> back to input features (for anomaly detection), with a
+       conservation guarantee at the loss layer. Generic AEs (not sparse), but the only paper on
+       &ldquo;LRP + autoencoder + conservation.&rdquo;</p>
+    <p><span class="lbl">Take from it &mdash; directly useful.</span> It does <em>not</em> solve our decoder-bias
+       absorption (it uses z&plus;, which simply drops biases; no bottleneck rule), but its
+       <strong>Deep-Taylor root-point recipe</strong> is the principled template for the fix we need: choose a
+       decoder root point that <em>separates</em> the constant mean/bias term from the latent contribution
+       (e.g. root at the mean activation so the residual <code>z&minus;z&tilde;</code> carries the relevance),
+       instead of letting the &gamma;-rule denominator hand ~98% to the bias. Cite + use as the methodological
+       basis for a bias-aware decoder rule.</p>
+  </div>
+
+  <!-- ============================ CONTEXT ============================ -->
+  <h2>Foundations &amp; context (cite, no overlap)</h2>
+  <ul>
+    <li><strong>CRP</strong> &mdash; Achtibat et&nbsp;al., <em>From attribution maps to human-understandable
+        explanations through Concept Relevance Propagation</em>, Nat. Mach. Intell. 2023.
+        <a href="https://arxiv.org/abs/2206.03208">arXiv:2206.03208</a>. <em>Our foundation</em> &mdash; the
+        output&rarr;concept relevance method we extend from an axis-aligned to an SAE basis.</li>
+    <li><strong>AttnLRP</strong> &mdash; Achtibat et&nbsp;al., ICML 2024.
+        <a href="https://arxiv.org/abs/2402.05602">arXiv:2402.05602</a>. The transformer LRP rules we build on;
+        also the attribution backbone CaFE uses.</li>
+    <li><strong>Sparse Feature Circuits</strong> &mdash; Marks et&nbsp;al., ICLR 2025.
+        <a href="https://arxiv.org/abs/2403.19647">arXiv:2403.19647</a>. SAE-feature circuits in LMs via
+        <em>gradient</em> attribution-patching &mdash; SAE attribution but gradient-based, LM, no conservation.</li>
+    <li><strong>Sparse Explanations via Pruned LRP</strong> &mdash; Hatefi et&nbsp;al.,
+        <strong>ECML PKDD 2024</strong> (Springer LNCS 14944, 336&ndash;351).
+        <a href="https://arxiv.org/abs/2404.14271">arXiv:2404.14271</a>. Sparsity <em>within</em> LRP (prune the
+        relevance flow) &mdash; not an SAE basis; tangential.</li>
+    <li><strong>TopK SAEs / Scaling SAEs</strong> &mdash; Gao et&nbsp;al., 2024.
+        <a href="https://arxiv.org/abs/2406.04093">arXiv:2406.04093</a>. SAE training recipe (drop-in if L1
+        shrinkage hurts reconstruction).</li>
+    <li><strong>SAEs on ViT activations</strong> (interpretable but no LRP) &mdash; saev,
+        <a href="https://arxiv.org/abs/2502.06755">2502.06755</a>; Universal SAEs,
+        <a href="https://arxiv.org/abs/2502.03714">2502.03714</a>; monosemantic SAEs in VLMs,
+        <a href="https://arxiv.org/abs/2504.02821">2504.02821</a> (<strong>NeurIPS 2025</strong>). Precedent that
+        SAEs on ViT residual streams yield interpretable features &mdash; the basis we attribute onto.</li>
+    <li><strong>Superposition / Monosemanticity</strong> &mdash; Elhage et&nbsp;al. 2022
+        (<a href="https://arxiv.org/abs/2209.10652">2209.10652</a>); Bricken et&nbsp;al. 2023
+        (<a href="https://transformer-circuits.pub/2023/monosemantic-features">Towards Monosemanticity</a>).
+        The motivation that features are non-axis-aligned &mdash; why an SAE basis should beat embedding dims.</li>
+    <li><strong>LLEXICORP</strong> &mdash; CRP + multimodal-LLM captioning, 2025.
+        <a href="https://arxiv.org/abs/2511.02720">arXiv:2511.02720</a>. Shows CRP being extended, but to LLM
+        labelling of concepts, not an SAE basis.</li>
+  </ul>
+
+  <h2>What this means for us</h2>
+  <ul>
+    <li><strong>Novelty holds.</strong> Frame the contribution precisely as: <em>conservative output&rarr;SAE-
+        basis relevance decomposition (the CRP move) on a ViT, with a concept-flipping/AOPC faithfulness
+        comparison against the axis-aligned basis at the same probe site.</em> Differentiate explicitly from
+        CaFE (direction), ClassifSAE (ablation vs conservation; LLM), and Sparse-but-not-Simpler (separate
+        axes).</li>
+    <li><strong>Fix the conservation story before claiming Q2.</strong> The decoder-bias absorption is the one
+        technical weakness; <a href="https://arxiv.org/abs/2303.11734">2303.11734</a>'s root-point recipe is
+        the principled route to a bias-aware decoder rule.</li>
+    <li><strong>Strengthen evaluation by borrowing:</strong> add an independent ablation cross-check
+        (ClassifSAE's &Delta;Acc/flip/TVD) and report insertion/deletion alongside AOPC (Sparse-but-not-Simpler,
+        CaFE) so reviewers see convergent faithfulness evidence.</li>
+  </ul>
+
+  <footer>
+    Compiled by the zennit-crp dev session &middot; branch <code>transformer-multi-concept</code> &middot;
+    2026-06-09. Companion figures: <a href="https://claude-bajger.dyn.cloud.e-infra.cz/zennit-flip/">SAE-site
+    concept-flipping gallery</a>.
+  </footer>
+
+</div>
+</body>
+</html>
