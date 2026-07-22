@@ -6,7 +6,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import timm
-from timm.data import create_transform, resolve_data_config
+
+from ..transforms import backbone_transforms
 
 
 class Base(nn.Module):
@@ -66,13 +67,10 @@ class Base(nn.Module):
         decoupled from the backbone's training stats: a dataset built
         once can feed both an ImageNet-normalized timm ViT and a
         no-normalize visinf checkpoint.
+
+        Canonical implementation lives in :func:`models.transforms.backbone_transforms`.
         """
-        cfg = resolve_data_config({}, model=self.backbone)
-        # Override mean/std to identity so the timm transform builder
-        # produces a normalize step that's a no-op. crop_pct, interp,
-        # input_size still come from cfg.
-        cfg = {**cfg, "mean": (0.0, 0.0, 0.0), "std": (1.0, 1.0, 1.0)}
-        return create_transform(**cfg, is_training=False)
+        return backbone_transforms(self.backbone)[0]
 
     def get_normalize(self):
         """Return the per-batch normalize callable ``(x - mean) / std``
@@ -82,14 +80,7 @@ class Base(nn.Module):
         For models trained without normalize (e.g. the visinf vit_base
         checkpoint, where the notebook's TRANSFORM_SPEC dispatcher sets
         mean/std to identity), this is a no-op closure.
+
+        Canonical implementation lives in :func:`models.transforms.backbone_transforms`.
         """
-        cfg = resolve_data_config({}, model=self.backbone)
-        mean = torch.tensor(cfg["mean"]).view(1, -1, 1, 1)
-        std = torch.tensor(cfg["std"]).view(1, -1, 1, 1)
-
-        def normalize(x: torch.Tensor) -> torch.Tensor:
-            m = mean.to(device=x.device, dtype=x.dtype)
-            s = std.to(device=x.device, dtype=x.dtype)
-            return (x - m) / s
-
-        return normalize
+        return backbone_transforms(self.backbone)[1]

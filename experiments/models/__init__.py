@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional, Type
 from .bases import Base, ViTBase, ViTSmall, DinoV3
 from .heads import Head, LinearHead, AttentiveHead, BlockHead
 from .probe import Probe
+from .transforms import backbone_transforms
 
 
 # ── Registries ────────────────────────────────────────────────────────────────
@@ -83,4 +84,5 @@ __all__ = [
     "Head", "LinearHead", "AttentiveHead", "BlockHead",
     "Probe",
     "build_base", "build_head", "build_probe",
+    "backbone_transforms",
 ]

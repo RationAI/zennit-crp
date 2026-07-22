@@ -284,7 +284,8 @@ def plot_grid(ref_c: Dict[int, Any], cmap_dim=1, cmap="bwr", vmin=None, vmax=Non
 
                 fig.add_subplot(ax)
                 
-    outer.tight_layout(fig)  
+    outer.tight_layout(fig)
     fig.show()
+    return fig
 
     return fig

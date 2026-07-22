@@ -17,7 +17,7 @@ arXiv:2402.05602) as small, single-responsibility classes that compose:
   the std), :class:`DropoutPassthroughCanonizer`,
   :class:`TimmBlockResidualCanonizer` / :class:`EvaBlockResidualCanonizer`
   (route residual adds + LayerScale muls through ``ResidualAdd`` /
-  ``UniformAdd`` / ``LayerScaleMul`` modules so the rules above attach),
+  ``LayerScaleMul`` modules so the rules above attach),
   :class:`VitPosEmbedPALRPCanonizer` (PA-LRP ``x+pos_embed``). Attention
   itself is substituted to its unfolded form by the canonizers in
   :mod:`zennit_ext.attention_unfolded`. :class:`TimmViTCanonizer` bundles the
@@ -142,6 +142,54 @@ class ResidualRatio(Hook):
         return ResidualRatio(self.epsilon)
 
 
+class ResidualL1(Hook):
+    """Sign-preserving, L1-conserving residual split for ``y = x + branch``.
+
+    Distributes the incoming relevance by *signed* contribution but normalises
+    by the **absolute** sum, keeping each operand's own sign:
+
+    .. code::
+
+        S = |x| + |branch| + eps
+        R_x      = R_y * x      / S
+        R_branch = R_y * branch / S
+
+    Properties (per neuron, element-wise):
+
+    * **bounded** — ``|R_x| <= |R_y|`` (no cancellation blow-up; the |.| denom
+      never collapses when ``x ≈ -branch``);
+    * **continuous** — no pole, no seam (singular only at the removable origin);
+    * **sign-aware** — ``sign(R_x) = sign(x)``: an operand that was negative gets
+      negative relevance, so an opposing branch flips sign.
+
+    Conservation is **L1, not signed-sum**: ``|R_x| + |R_branch| = |R_y|``
+    (absolute mass preserved), whereas the signed sum is
+    ``R_x + R_branch = R_y * (x+branch)/S`` which equals ``R_y`` only when ``x``
+    and ``branch`` share a sign. This trades LRP's global "relevance sums to the
+    logit" guarantee (which needs signed-sum conservation at every node) for a
+    local absolute-mass identity — see RESEARCH note on L1-normalised rules.
+    Select it by mapping :class:`~zennit_ext.attention_unfolded.ResidualAdd` to
+    this hook in the composite ``layer_map``.
+    """
+
+    def __init__(self, epsilon: float = 1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, module, args, kwargs, output):
+        self.stored_tensors["x"] = args[0]
+        self.stored_tensors["branch"] = args[1]
+
+    def backward(self, module, grad_input, grad_output):
+        x, branch = self.stored_tensors["x"], self.stored_tensors["branch"]
+        rel = grad_output[0]
+        denom = x.abs() + branch.abs() + self.epsilon
+        return (rel * x / denom, rel * branch / denom)
+
+    def copy(self):
+        return ResidualL1(self.epsilon)
+
+
 class Uniform(Hook):
     """Uniform allocation rule (AttnLRP Eq. 7): divide the incoming relevance
     equally, ``grad_input / factor``. ``factor=2`` is the per-bilinear default
@@ -194,6 +242,47 @@ class Identity(Hook):
 
     def copy(self):
         return Identity(self.epsilon, self.formula)
+
+
+class SoftmaxAttnLRP(Hook):
+    r"""AttnLRP softmax rule (Achtibat et al. 2024, **Proposition 3.1**) for
+    ``y = softmax(x)`` taken along the last dim.
+
+    .. math::
+        R^{l-1}_i = x_i \,\bigl(R^l_i - s_i \textstyle\sum_j R^l_j\bigr),
+        \qquad s = \mathrm{softmax}(x) = \text{output},\; R^l = \text{grad\_output}
+
+    i.e. the incoming relevance is input-scaled after subtracting ``s_i`` times
+    the *total* incoming relevance — the cross-term ``s_i Σ_j R^l_j`` couples all
+    positions through the softmax denominator. This is the softmax-SPECIFIC rule;
+    it is NOT the generic elementwise identity (:class:`zennit.rules.Pass` /
+    :class:`Identity`), which drops that cross-term and the ``x_i`` factor.
+
+    Select it by mapping :class:`~zennit_ext.attention_unfolded.SoftmaxAlongLastDim`
+    to this hook in a composite ``layer_map`` (replacing the default
+    ``(SoftmaxAlongLastDim, Pass())`` entry). Note it only conducts relevance when
+    the attention weights are differentiable (full AttnLRP, AlphaBeta on the
+    bilinears); under CP-LRP (StopGradient on Q/K) the softmax is a graph constant
+    and this rule never fires.
+
+    Not strictly sum-conserving: ``Σ_i R^{l-1}_i = Σ_i x_i R^l_i −
+    (Σ_i x_i s_i)(Σ_j R^l_j)``, since ``Σ_i x_i s_i`` (the softmax-weighted mean
+    logit) is not 1 — this matches Prop 3.1 as stated; verify conservation
+    empirically against the model before relying on it.
+    """
+
+    def forward(self, module, args, kwargs, output):
+        self.stored_tensors["input"] = args[0]
+        self.stored_tensors["output"] = output
+
+    def backward(self, module, grad_input, grad_output):
+        x = self.stored_tensors["input"]
+        s = self.stored_tensors["output"]
+        rel = grad_output[0]
+        return (x * (rel - s * rel.sum(dim=-1, keepdim=True)),)
+
+    def copy(self):
+        return SoftmaxAttnLRP()
 
 
 # ─── 3. Forward-method replacements (installed per-instance by Canonizers) ──
@@ -259,24 +348,19 @@ def _make_mha_cplrp_forward(original_forward):
 # so concept attribution works on every supported backbone.
 
 
-def _eva_block_forward(
-    self, x, rope=None, attn_mask=None, is_causal=False,
-    *, residual_rule: str = "ratio", layerscale_uniform: bool = False,
-):
-    """``EvaBlock.forward`` replacement applying one of the residual-LRP
-    rules and (optionally) a uniform-rule allocation on the LayerScale γ
-    multiplications.
+def _eva_block_forward(self, x, rope=None, attn_mask=None, is_causal=False):
+    """``EvaBlock.forward`` replacement that routes the residual adds (and,
+    optionally, the LayerScale γ multiplications) through ``nn.Module`` instances
+    so a composite ``layer_map`` can attach an LRP rule to them.
 
-    Parameters bound by the canonizer:
-
-    * ``residual_rule`` — ``'symmetric'`` (factor-2 uniform allocation)
-      or ``'ratio'`` (Otsuki ``|x|``/``|branch|`` proportional split).
-    * ``layerscale_uniform`` — see :func:`_apply_layerscale`.
+    The residual *rule* is NOT chosen here — it is selected by mapping
+    :class:`~zennit_ext.attention_unfolded.ResidualAdd` to a hook in the
+    composite ``layer_map``. The canonizer always installs the same
+    ``ResidualAdd`` type.
     """
-    # Residual adds + LayerScale muls route through ``nn.Module`` instances
-    # (``self._lrp_res{1,2}`` = ResidualAdd/UniformAdd; ``self._lrp_ls{1,2}``
-    # = LayerScaleMul) attached by :class:`EvaBlockResidualCanonizer`, so the
-    # composite ``layer_map`` assigns each its LRP rule as a zennit Hook.
+    # ``self._lrp_res{1,2}`` = ResidualAdd, ``self._lrp_ls{1,2}`` = LayerScaleMul,
+    # attached by :class:`EvaBlockResidualCanonizer`; the composite ``layer_map``
+    # assigns each its LRP rule as a zennit Hook.
     attn_branch = self.attn(
         self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal,
     )
@@ -299,14 +383,12 @@ def _eva_block_forward(
     return x
 
 
-def _timm_block_forward(
-    self, x, attn_mask=None, is_causal=False,
-    *, residual_rule: str = "ratio",
-):
-    """timm ``Block.forward`` replacement with one of the residual-LRP rules.
-    LayerScale on standard timm Blocks is an ``nn.Module`` (``ls1``/``ls2``),
-    not a parameter — handled transparently by its own forward; no
-    layerscale-uniform branch needed here.
+def _timm_block_forward(self, x, attn_mask=None, is_causal=False):
+    """timm ``Block.forward`` replacement that routes the two residual adds
+    through ``self._lrp_res{1,2}`` (:class:`~zennit_ext.attention_unfolded.ResidualAdd`)
+    so a composite ``layer_map`` can attach the chosen residual rule. The rule is
+    a ``layer_map`` decision, not a property of this module. LayerScale on standard
+    timm Blocks is its own ``nn.Module`` (``ls1``/``ls2``), handled transparently.
     """
     branch1 = self.drop_path1(
         self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal))
@@ -332,7 +414,7 @@ def vit_pos_embed_palrp(self, x):
     Implementation: identical to upstream ``_pos_embed`` (timm 1.0.x —
     handles ``cls_token``/``reg_token``, ``no_embed_class`` deit-3 variant,
     ``dynamic_img_size``) except the additive step is routed through a
-    :class:`~zennit_ext.attention_unfolded.UniformAdd` module, which the
+    :class:`~zennit_ext.attention_unfolded.PosEmbedAdd` module, which the
     composite ``layer_map`` gives the :class:`Uniform` (factor-2) rule.
     """
     to_cat = []
@@ -423,25 +505,15 @@ class DropoutPassthroughCanonizer(AttributeCanonizer):
 
 
 class TimmBlockResidualCanonizer(AttributeCanonizer):
-    """Canonizer that swaps ``forward`` on timm ``vision_transformer.Block``
-    to apply a conservative LRP rule at each residual addition.
-
-    Parameters
-    ----------
-    residual_rule : {'symmetric', 'ratio'}
-        ``'symmetric'`` halves gradient at every additive node (uniform
-        allocation, matches ResNet symmetric rule). ``'ratio'``
-        distributes upstream relevance proportionally to ``|x|`` and
-        ``|branch|`` (Otsuki-style ratio split, the closer LRP-ε
-        analogue and reported as superior for ResNets).
+    """Canonizer that swaps ``forward`` on timm ``vision_transformer.Block`` so
+    each residual addition routes through a
+    :class:`~zennit_ext.attention_unfolded.ResidualAdd` module — making the add
+    hookable. The residual *rule* (ratio / symmetric / L1 / none) is then chosen
+    in the composite ``layer_map`` by mapping ``ResidualAdd`` to a hook; this
+    canonizer installs only the (single) module type and takes no rule argument.
     """
 
-    def __init__(self, *, residual_rule: str = "ratio"):
-        if residual_rule not in ("symmetric", "ratio"):
-            raise ValueError(
-                f"residual_rule must be 'symmetric' or 'ratio'; got {residual_rule!r}"
-            )
-        self.residual_rule = residual_rule
+    def __init__(self):
         super().__init__(self._attribute_map)
 
     def _attribute_map(self, _name, module):
@@ -451,8 +523,7 @@ class TimmBlockResidualCanonizer(AttributeCanonizer):
                   "norm2", "attn", "mlp")
         if not all(hasattr(module, a) for a in needed):
             return None
-        from zennit_ext.attention_unfolded import ResidualAdd, UniformAdd
-        ResMod = ResidualAdd if self.residual_rule == "ratio" else UniformAdd
+        from zennit_ext.attention_unfolded import ResidualAdd
 
         def fwd(self, x, attn_mask=None, is_causal=False):
             return _timm_block_forward(
@@ -460,12 +531,12 @@ class TimmBlockResidualCanonizer(AttributeCanonizer):
             )
 
         attrs = _bind_forward(module, fwd)
-        attrs["_lrp_res1"] = ResMod()
-        attrs["_lrp_res2"] = ResMod()
+        attrs["_lrp_res1"] = ResidualAdd()
+        attrs["_lrp_res2"] = ResidualAdd()
         return attrs
 
     def copy(self):
-        return type(self)(residual_rule=self.residual_rule)
+        return type(self)()
 
 
 class EvaBlockResidualCanonizer(AttributeCanonizer):
@@ -476,23 +547,18 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
 
     Parameters
     ----------
-    residual_rule : {'symmetric', 'ratio'}
-        Same as :class:`TimmBlockResidualCanonizer`.
     layerscale_uniform : bool
         When True, route the LayerScale γ multiplications through
         :class:`~zennit_ext.attention_unfolded.LayerScaleMul` modules, which
         the composite ``layer_map`` gives the :class:`Uniform` (factor-2)
         rule (AttnLRP Eq. 7, treating γ as a constant operand). Default False.
+
+    The residual *rule* is chosen in the composite ``layer_map`` (map
+    ``ResidualAdd`` to a hook), not here — this canonizer always installs the
+    single ``ResidualAdd`` type.
     """
 
-    def __init__(
-        self, *, residual_rule: str = "ratio", layerscale_uniform: bool = False,
-    ):
-        if residual_rule not in ("symmetric", "ratio"):
-            raise ValueError(
-                f"residual_rule must be 'symmetric' or 'ratio'; got {residual_rule!r}"
-            )
-        self.residual_rule = residual_rule
+    def __init__(self, *, layerscale_uniform: bool = False):
         self.layerscale_uniform = layerscale_uniform
         super().__init__(self._attribute_map)
 
@@ -503,10 +569,7 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
                   "gamma_1", "gamma_2")
         if not all(hasattr(module, a) for a in needed):
             return None
-        from zennit_ext.attention_unfolded import (
-            ResidualAdd, UniformAdd, LayerScaleMul,
-        )
-        ResMod = ResidualAdd if self.residual_rule == "ratio" else UniformAdd
+        from zennit_ext.attention_unfolded import ResidualAdd, LayerScaleMul
 
         def fwd(self, x, rope=None, attn_mask=None, is_causal=False):
             return _eva_block_forward(
@@ -514,8 +577,8 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
             )
 
         attrs = _bind_forward(module, fwd)
-        attrs["_lrp_res1"] = ResMod()
-        attrs["_lrp_res2"] = ResMod()
+        attrs["_lrp_res1"] = ResidualAdd()
+        attrs["_lrp_res2"] = ResidualAdd()
         if self.layerscale_uniform:
             # LayerScale γ·branch → uniform rule (γ a param, absorbs half).
             if module.gamma_1 is not None:
@@ -525,10 +588,7 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
         return attrs
 
     def copy(self):
-        return type(self)(
-            residual_rule=self.residual_rule,
-            layerscale_uniform=self.layerscale_uniform,
-        )
+        return type(self)(layerscale_uniform=self.layerscale_uniform)
 
 
 class TorchvisionMHACPLRPCanonizer(AttributeCanonizer):
@@ -579,9 +639,9 @@ class VitPosEmbedPALRPCanonizer(AttributeCanonizer):
     def _attribute_map(self, _name, module):
         if not isinstance(module, VisionTransformer) or not hasattr(module, "_pos_embed"):
             return None
-        from zennit_ext.attention_unfolded import UniformAdd
+        from zennit_ext.attention_unfolded import PosEmbedAdd
         attrs = _bind_forward(module, vit_pos_embed_palrp, attr="_pos_embed")
-        attrs["_lrp_posadd"] = UniformAdd()  # x + pos_embed → uniform rule via layer_map
+        attrs["_lrp_posadd"] = PosEmbedAdd()  # x + pos_embed → its own rule via layer_map
         return attrs
 
     def copy(self):
@@ -599,8 +659,9 @@ class TimmViTCanonizer(CompositeCanonizer):
     * :class:`VitPosEmbedPALRPCanonizer` (when ``palrp=True``) — PA-LRP on
       the ``x + pos_embed`` step (Bakish et al. 2025).
     * :class:`TimmBlockResidualCanonizer` and
-      :class:`EvaBlockResidualCanonizer` (when ``residual_lrp`` is set) —
-      ratio or symmetric residual rule.
+      :class:`EvaBlockResidualCanonizer` (when ``residual`` is True) — route the
+      residual adds through ``ResidualAdd`` so the composite ``layer_map`` can
+      apply a residual rule. The rule itself is a ``layer_map`` choice.
 
     Attention itself is NOT handled here. It is substituted to its
     unfolded form (:class:`TimmAttentionUnfolded` /
@@ -617,10 +678,11 @@ class TimmViTCanonizer(CompositeCanonizer):
         Enable PA-LRP on the absolute pos_embed addition. Only relevant
         for ViTs with ``self.pos_embed`` (vit_base etc.); no-op for
         DINOv3 (RoPE only).
-    residual_lrp : {None, 'symmetric', 'ratio'}
-        Block-level residual rule. ``'ratio'`` is the recommended
-        default for transformers; ``'symmetric'`` matches the ResNet
-        AttnLRP paper baseline.
+    residual : bool
+        Route the block residual adds through ``ResidualAdd`` modules so the
+        composite ``layer_map`` can apply a residual rule. The rule itself
+        (ratio / symmetric / L1 / none) is selected in the ``layer_map``, not
+        here.
     layerscale_uniform : bool
         Apply the uniform allocation rule to LayerScale γ
         multiplications (CaiT / Eva blocks only).
@@ -632,7 +694,7 @@ class TimmViTCanonizer(CompositeCanonizer):
         self,
         *,
         palrp: bool = False,
-        residual_lrp: Optional[str] = None,
+        residual: bool = False,
         layerscale_uniform: bool = False,
         epsilon: float = 1e-6,
     ):
@@ -642,19 +704,15 @@ class TimmViTCanonizer(CompositeCanonizer):
         ]
         if palrp:
             canonizers.append(VitPosEmbedPALRPCanonizer())
-        if residual_lrp is not None:
-            canonizers.append(TimmBlockResidualCanonizer(residual_rule=residual_lrp))
+        if residual:
+            canonizers.append(TimmBlockResidualCanonizer())
             canonizers.append(EvaBlockResidualCanonizer(
-                residual_rule=residual_lrp,
                 layerscale_uniform=layerscale_uniform,
             ))
         elif layerscale_uniform:
-            # User asked for layerscale_uniform but didn't pick a residual
-            # rule; default to ratio so the EvaBlock forward gets installed
-            # (the layerscale_uniform wrapper lives inside that forward).
-            canonizers.append(EvaBlockResidualCanonizer(
-                residual_rule="ratio", layerscale_uniform=True,
-            ))
+            # LayerScale-uniform wants the EvaBlock forward installed (the
+            # wrapper lives inside that forward) even without a residual rule.
+            canonizers.append(EvaBlockResidualCanonizer(layerscale_uniform=True))
         super().__init__(canonizers)
 
 
@@ -671,7 +729,8 @@ class TimmViTCanonizer(CompositeCanonizer):
 
 __all__ = [
     # LRP rules as zennit Hook subclasses
-    "AlphaBetaMatmul", "ResidualRatio", "Uniform", "Identity",
+    "AlphaBetaMatmul", "ResidualRatio", "ResidualL1", "Uniform", "Identity",
+    "SoftmaxAttnLRP",
     "stop_gradient",
     "layer_norm_forward", "dropout_passthrough_forward", "vit_pos_embed_palrp",
     "LayerNormForwardCanonizer", "DropoutPassthroughCanonizer",

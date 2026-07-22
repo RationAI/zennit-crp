@@ -4,10 +4,10 @@ Every module here is a plain PyTorch op with autograd's standard backward.
 LRP behaviour (custom backward = relevance flow, not Jacobian-vector
 product) is injected EXCLUSIVELY at attribution time by the zennit ``Hook``
 rules in :mod:`zennit_ext.attnlrp_rules` (``AlphaBetaMatmul`` on
-:class:`BilinearMatmul`, ``ResidualRatio`` on :class:`ResidualAdd`,
-``Uniform`` on :class:`UniformAdd` / :class:`LayerScaleMul`, ``Pass`` on
-:class:`SoftmaxAlongLastDim` / :class:`ScaleByConstant`), assigned by module
-type through the composite's ``layer_map``. zennit hooks fire in the single
+:class:`BilinearMatmul`, a selectable residual rule on :class:`ResidualAdd`
+(and its :class:`PosEmbedAdd` alias), ``Uniform`` on :class:`LayerScaleMul`,
+``Pass`` on :class:`SoftmaxAlongLastDim` / :class:`ScaleByConstant`), assigned
+by module type through the composite's ``layer_map``. zennit hooks fire in the single
 backward pass and detach on ``composite.context()`` exit, so these modules
 stay vanilla outside attribution.
 
@@ -117,28 +117,29 @@ class AddBias(nn.Module):
 
 
 class ResidualAdd(nn.Module):
-    """``y = x + branch``. Vanilla addition.
+    """``y = x + branch``. Vanilla addition — the **single** module type for a
+    residual skip merge.
 
-    For the LRP residual-ratio rule (Otsuki split: distribute ``R_y``
-    proportionally to ``|x|`` and ``|branch|``), assign the
-    :class:`~zennit_ext.attnlrp_rules.ResidualRatio` hook to this type via a
-    composite ``layer_map``.
+    The LRP behaviour is **not** encoded in the module: pick the residual rule
+    in the composite ``layer_map`` by mapping this type to the desired hook —
+    :class:`~zennit_ext.attnlrp_rules.ResidualRatio` (Otsuki ``|x|``/``|branch|``
+    split), :class:`~zennit_ext.attnlrp_rules.Uniform` (½ each, symmetric), or
+    :class:`~zennit_ext.attnlrp_rules.ResidualL1` (sign-preserving, L1-conserving).
+    Mapping it to nothing leaves the plain (non-conservative) add. Do NOT create
+    a separate module type per rule — one module, many selectable rules.
     """
 
     def forward(self, x: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
         return x + branch
 
 
-class UniformAdd(nn.Module):
-    """``y = x + branch``. Vanilla addition; distinct type from
-    :class:`ResidualAdd` so a composite ``layer_map`` can give it the uniform
-    allocation rule (each operand gets ``R/2``) while ``ResidualAdd`` gets the
-    Otsuki ratio rule. Used for the symmetric residual variant and the PA-LRP
-    ``x + pos_embed`` step.
-    """
-
-    def forward(self, x: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
-        return x + branch
+class PosEmbedAdd(ResidualAdd):
+    """Alias of :class:`ResidualAdd` (same ``x + branch`` op) kept as a distinct
+    dispatch type *only* so the ``x + pos_embed`` PA-LRP merge can take its own
+    ``layer_map`` rule (the uniform ½ split) independently of the residual skips.
+    Different graph role, not a different rule for the same module. Order it
+    BEFORE ``ResidualAdd`` in a ``layer_map`` (zennit matches by ``isinstance``,
+    first hit wins)."""
 
 
 class SoftmaxAlongLastDim(nn.Module):
@@ -951,7 +952,7 @@ __all__ = [
     "BilinearMatmul",
     "AddBias",
     "ResidualAdd",
-    "UniformAdd",
+    "PosEmbedAdd",
     "SoftmaxAlongLastDim",
     "RotaryEmbedding",
     "ScaleByConstant",
