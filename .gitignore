@@ -122,7 +122,7 @@ downloads/
 eggs/
 env.bak/
 env/
-figures/
+figures/comparison.png
 htmlcov/
 instance/
 ipython_config.py
@@ -146,3 +146,8 @@ venv/
 wheels/
 # Scratch / dev artifacts
 tmp/
+# CRP web gallery: track scaffold (html/js/css) + jobs.jsonl recompute specs only;
+# regenerable figures + derived manifest stay out of git (data/ already ignored
+# covers the FV index cache under data/crp_gallery_cache/).
+webapp/crp_gallery/figures/
+webapp/crp_gallery/manifest.json

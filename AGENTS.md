@@ -36,9 +36,26 @@ record and contain stale API names — do not copy APIs from them.
   | `AttnLRPGammaComposite(gamma=0.25, *, palrp=…, residual_lrp=…)` | paper γ default |
   | `AttnLRPCombinedComposite(*, alpha=.5, beta=.5, layerscale_uniform=False, linear_gamma=None, palrp=False, residual_lrp=None)` | **canonical recipe-builder** — used by the walkthrough |
 
-  Kwargs `palrp` (pos-embed PA-LRP) and `residual_lrp ∈ {None,'symmetric','ratio'}`
+  Kwargs `palrp` (pos-embed PA-LRP) and `residual_lrp ∈ {None,'symmetric','ratio','l1'}`
   are opt-in remedies (AUC trade-offs documented in `research/CURRENT_STATE.md`). All
   rules/canonizers are scoped to `composite.context(model)` — no global mutation.
+
+**Design rules for LRP rule wiring (read before adding modules/rules):**
+- **One module type, many rules — pick the rule in the `layer_map`, never via a
+  module-per-rule.** If a module can take different LRP rules (e.g. a residual
+  `x+branch`), define it ONCE (`ResidualAdd`) and select the rule in the composite
+  `layer_map`: `(ResidualAdd, ResidualRatio | Uniform | ResidualL1)`. Do NOT create
+  a separate module class per rule (the old `UniformAdd`/`L1ResidualAdd` were removed
+  for exactly this anti-pattern). A canonizer installs the single module type so the
+  add is hookable; it does NOT choose the rule.
+- **A different graph ROLE that needs its own rule → alias, not a re-defined module.**
+  e.g. the `x+pos_embed` merge is `PosEmbedAdd(ResidualAdd): pass` (subclass alias, no
+  re-defined `forward`), ordered BEFORE `ResidualAdd` in the `layer_map` (zennit matches
+  by `isinstance`, first hit wins). A genuinely different op (e.g. `LayerScaleMul`, a
+  multiply) is its own module.
+- **Never predefine Composite variants unprompted.** Do not ship new `lrp_configs/*`
+  recipes or composite presets unless explicitly asked — expose the knob (a rule in the
+  `layer_map`, or a composite kwarg) and let the user assemble their own recipe.
 
 ---
 
@@ -133,6 +150,34 @@ grid · `vis_img_heatmap` / `vis_opaque_img` the two `plot_fn`s · `get_crop_ran
 
 ---
 
+## Figures — output convention (paper evidence)
+
+When you plot or show a result, treat the figure as durable evidence for the
+paper, not a throwaway:
+
+- **Always write BOTH `.png` and `.pdf`.** PNG for quick viewing / sharing; PDF
+  (vector) is the paper-ready artefact that must survive even if the source data
+  are deleted. Generate the PDF *while you are already plotting* — never defer it
+  ("regenerate later" loses the data).
+- **Store under the committed, top-level `figures/` tree — NOT under `data/`.**
+  `figures/` is git-tracked (only `figures/comparison.png`, the demo throwaway, is
+  ignored) so a figure is committed paper evidence. `data/` is gitignored — durable
+  (it sits on the persistent storage root, survives pod bounces) but *not* in git,
+  so a figure left only there is not part of the paper record. Organise by
+  experiment then run: `figures/<experiment>/<config>_<concept>/<plot>_<dataset>.{png,pdf}`.
+- **Overwrite stale figures; clean up when data are invalidated or superseded.**
+  Generators should wipe their output subdir before re-rendering (see
+  `experiments/scripts/export_flipping_figures.py`, which `shutil.rmtree`s its
+  `<config>_<concept>` dir first) so removed datasets leave no orphans.
+- **Make figures self-explanatory**: descriptive title (what / config / concept /
+  dataset / n), axis labels with units, a labelled legend, and the metric/band
+  meaning in the title or subtitle — a reader should not need a notebook caption
+  to understand the figure.
+- Notebooks are for interactive exploration; the committed export *script* is the
+  reproducible generator that writes the png+pdf pair.
+
+---
+
 ## What-to-use-when
 
 | Goal | Tool |
@@ -146,6 +191,37 @@ grid · `vis_img_heatmap` / `vis_opaque_img` the two `plot_fn`s · `get_crop_ran
 | Concept↔class atlas | `compute_stats` / `get_stats_reference` |
 | Zoom to the neuron's receptive field | `rf=True` |
 | ViT instead of CNN | swap composite → `AttnLRP*Composite`, concept → `HeadConcept`/…, layer → a `*_probe`/`proj_drop` site, `mask_map=concept.mask` |
+
+## Storage & persistence
+
+Persist experiment results systematically. The pod's local disk is **ephemeral**
+(wiped on bounce); durable storage is a separate configured location. Which is
+which is **declared per-deployment, never detected at runtime** — two env knobs in
+`.env` (see `.env.example`), read by `experiments/storage.py`:
+
+- `ZENNIT_PERSIST_ROOT` — durable storage that survives a bounce (this deployment:
+  the NFS/GPFS workspace; default `<repo>/data`).
+- `ZENNIT_SCRATCH_ROOT` — fast, ephemeral scratch, wiped on bounce (this
+  deployment: node-local overlay; default `~/.cache/zennit-crp`).
+
+Rules:
+- **Durable outputs** — results, checkpoints, figures, and anything a web page
+  references (parquet, SAE `.pt`, `figures/`, `webapp/*/figures/`, `public/`) — go
+  under the persistent root / repo. Web presentations reference that copy. **Never
+  leave the only copy of a result on scratch.** (The repo tree is already the
+  persistent root here, so writing repo-relative is correct by default.)
+- **Expensive regenerable caches** (FeatureVisualization indices, activation
+  dumps) — build under `SCRATCH_ROOT` (fast, and it avoids the small-file wedge
+  that thousands of tiny writes cause on network storage), then mirror to the
+  persistent root with `storage.persist(...)`; refill scratch on startup with
+  `storage.hydrate(...)` so a post-bounce run reuses the index instead of
+  recomputing. See the FV cache wiring in `experiments/crp_gallery.py` (`CACHE_ROOT`
+  = scratch, `CACHE_MIRROR` = persistent; `storage.sync` around `fv.run`).
+- **venv** is ephemeral (local overlay): after a bounce, `UV_PROJECT_ENVIRONMENT=
+  /home/claude/venvs/zennit-crp UV_LINK_MODE=copy uv sync`, then invoke the
+  interpreter directly (`.../bin/python`; `uv run` deadlocks on this venv).
+- Do **not** add filesystem-type probing (`findmnt`, mount parsing) to choose
+  locations — the roots are configuration, not something to discover.
 
 ## Pointers & gotchas
 - Start from `tutorials/attributions.ipynb` then `feature_visualization.ipynb` (CNN
