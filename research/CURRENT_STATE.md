@@ -388,7 +388,7 @@ is `AttnLRPEpsilonComposite(residual_lrp='ratio')` — strict improvement.
 
 ## Outstanding work
 
-See `FUTURE_STATE.md`. Milestone A is **investigated, not closed**;
+Roadmap moved to YouTrack **XAI-21** (paper plan; see `scout_novelty_crp_vit.md` for the novelty verdict). `FUTURE_STATE.md` is retired. Milestone A is **investigated, not closed**;
 Milestone D is **closed** (PA-LRP shipped, AUC-inert). Milestone G is
 **closed** (ratio rule shipped opt-in; partial AUC fix; open questions
 above). Next: methodology check (Milestone H — pixel-rank Petsiuk and

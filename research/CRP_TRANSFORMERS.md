@@ -1,5 +1,8 @@
 # Project: Transformer CRP
 
+> **Historical assignment (project kickoff).** Current plan lives in YouTrack
+> XAI-21; state in `CURRENT_STATE.md`; experiment registry in `EXPERIMENTS.md`.
+
 This is an initial, high-level assignment for research project exploring concept-based XAI approaches for transformer models. The high-level descriptions are interlaced with occasional implementation details, which are necessary fro smooth progress.
 The basis for the XAI is CRP (Concept Relevance Propagation) - originally developed for CNNs, but we will adapt it to vision transformers. CRP paper provides implementation for CNNs, papers exist that adapt it to language transformers. The goal is to implement CRP for vision transformers, and then explore how the explanations can be used for debugging and improving the model.
 
