@@ -79,3 +79,25 @@ caveats in one clause.>
 - Terse throughout; the Conclusion is 1–3 sentences.
 - One experiment = one entry; a multi-part study is multiple entries.
 - Failed/negative experiments get entries too — same rigor.
+
+## Presentation conventions (Adam, 2026-07-24 review)
+
+- **Tables for numbers**: whenever multiple numbers are compared, present
+  them as a booktabs table, not inline prose.
+- **Conclusions are bare answers**: separate short sentences containing ONLY
+  the final answer to the hypothesis/question. All explanation and reasoning
+  belongs in the Results body BEFORE the conclusion, never inside it.
+- **Saliency-map provenance**: every figure showing saliency/relevance maps
+  carries a note stating exactly where they come from — method, site/layer,
+  composite/config name, conditioning (class? concept?), key params — placed
+  UNDER the figure as a description (never overlaid on the visual).
+- **Figure descriptions**: every figure gets a `\noindent Figure: ...`
+  description paragraph explaining axes, color encoding, and what to look at.
+- **Clickable navigation**: hyperref labels everywhere — `\label{exp:...}` on
+  every entry section, `\label{model:...}` on model records,
+  `\label{fig:...}` on figures where referenced; cross-reference with `\ref`
+  so the PDF is navigable by clicking.
+- **Statistical terms**: name the test and correction explicitly and add a
+  half-sentence plain-language gloss at first use in an entry (e.g.
+  "Holm–Bonferroni step-down correction across the 196 positions"); report
+  underflowed p-values as bounds, never as 0.
