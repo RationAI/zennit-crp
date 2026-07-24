@@ -19,7 +19,13 @@ patch (r, c) -> pixels [16r:16r+16, 16c:16c+16].
 
 Usage (idempotent, CPU only):
     python -m experiments.scripts.registers_step1_figures \
-        [--data-dir data/results/registers] [--out-dir figures/registers/step1_detect]
+        [--data-dir data/results/registers] [--out-dir figures/registers/step1_detect] \
+        [--colocation-npz colocation_vit_base_imagenet.npz]
+
+``--colocation-npz`` (path relative to --data-dir, or absolute) swaps in a
+different masks/metrics file with the same key structure — used by the step-1c
+redo (``step1c_colocation_vit_base_imagenet.npz``, per-sample any-block masks)
+to regenerate the two pages with identical layout/labels.
 """
 from __future__ import annotations
 
@@ -95,12 +101,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data-dir", type=Path, default=DEFAULT_DATA)
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--colocation-npz", type=Path,
+                    default=Path("colocation_vit_base_imagenet.npz"),
+                    help="masks/metrics npz (relative to --data-dir unless absolute)")
     args = ap.parse_args()
 
     g = np.load(args.data_dir / "gallery_samples_vit_base_imagenet.npz",
                 allow_pickle=False)
-    c = np.load(args.data_dir / "colocation_vit_base_imagenet.npz",
-                allow_pickle=True)
+    c = np.load(args.colocation_npz if args.colocation_npz.is_absolute()
+                else args.data_dir / args.colocation_npz, allow_pickle=True)
     keys = [str(k) for k in g["keys"]]
     assert keys == [str(k) for k in c["keys"]], "sample order mismatch"
 
