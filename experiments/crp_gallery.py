@@ -601,6 +601,12 @@ def rebuild_manifest() -> dict:
             samples_dir = config_dir.parent / "_samples"
             sample_imgs = ({p.stem: str(p.relative_to(GALLERY_DIR)) for p in samples_dir.glob("*.png")}
                            if samples_dir.exists() else {})
+            # Per-sample per-block token-norm maps with flagged register outliers
+            # (md-level, composite-independent; produced by
+            # experiments/scripts/registers_position_freq.py).
+            norm_dir = config_dir.parent / "_normmaps"
+            sample_norms = ({p.stem: str(p.relative_to(GALLERY_DIR)) for p in norm_dir.glob("*.png")}
+                            if norm_dir.exists() else {})
             # Per-instance (concept_kind) sample relevance heatmaps: _sample_heat/<ck>/<key>.png
             heat_root = config_dir / "_sample_heat"
             sample_heats: Dict[str, Dict[str, str]] = {}
@@ -620,7 +626,8 @@ def rebuild_manifest() -> dict:
                 srec = inst["samples"].setdefault(sample, {
                     "label": meta.get("sample_label") or ("Aggregate" if sample == "aggregate" else sample),
                     "image": sample_imgs.get(sample),
-                    "heat": sample_heats.get(ck, {}).get(sample), "layers": {}})
+                    "heat": sample_heats.get(ck, {}).get(sample),
+                    "normmap": sample_norms.get(sample), "layers": {}})
                 lrec = srec["layers"].setdefault(layer, {
                     "site": meta["site"], "block": meta["block"], "concept_kind": ck,
                     "entries": []})

@@ -59,10 +59,15 @@ function onSampleChange() {
   const heatFig = $("sample-heat-fig");
   const heat = $("sample-heat");
   const snote = $("sample-note");
+  const normFig = $("sample-norm-fig");
+  const norm = $("sample-norm");
+  const normLink = $("sample-norm-link");
   if (s && s.image) {
     thumb.src = s.image;
     if (s.heat) { heat.src = s.heat; heatFig.hidden = false; }
     else { heatFig.hidden = true; heat.removeAttribute("src"); }
+    if (s.normmap) { norm.src = s.normmap; normLink.href = s.normmap; normFig.hidden = false; }
+    else { normFig.hidden = true; norm.removeAttribute("src"); }
     figs.hidden = false;
     snote.textContent = "Local analysis: detectors ranked by relevance to THIS input. "
       + "Per figure, column 1 = the query input, columns 2.. = that detector's dataset "
