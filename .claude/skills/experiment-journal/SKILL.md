@@ -96,7 +96,14 @@ caveats in one clause.>
 - **Clickable navigation**: hyperref labels everywhere — `\label{exp:...}` on
   every entry section, `\label{model:...}` on model records,
   `\label{fig:...}` on figures where referenced; cross-reference with `\ref`
-  so the PDF is navigable by clicking.
+  so the PDF is navigable by clicking. **EVERY textual mention of another
+  experiment carries a `\ref{exp:...}`** — at minimum to the entry section;
+  never name-drop an experiment without a clickable reference.
+- **Simplicity**: one experiment answers ONE clearly articulated question,
+  ideally yes/no. Hypotheses in simple plain-English sentences. If a study
+  does multiple things at once, split it into multiple entries. Results
+  comparable across models/conditions by construction (same rule, same
+  metric, same sampling).
 - **Statistical terms**: name the test and correction explicitly and add a
   half-sentence plain-language gloss at first use in an entry (e.g.
   "Holm–Bonferroni step-down correction across the 196 positions"); report
