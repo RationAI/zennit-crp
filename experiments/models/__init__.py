@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Type
 
-from .bases import Base, ViTBase, ViTSmall, DinoV3
+from .bases import Base, ViTBase, ViTSmall, DinoV3, DinoV3Small, DinoV3Base
 from .heads import Head, LinearHead, AttentiveHead, BlockHead
 from .probe import Probe
 from .transforms import backbone_transforms
@@ -29,6 +29,8 @@ BASES: Dict[str, Type[Base]] = {
     "vit_base":   ViTBase,
     "vit_small":  ViTSmall,
     "vit_dinov3": DinoV3,
+    "vit_dinov3_small": DinoV3Small,
+    "vit_dinov3_base":  DinoV3Base,
 }
 
 HEADS: Dict[str, Type[Head]] = {
