@@ -130,3 +130,11 @@ caveats in one clause.>
   half-sentence plain-language gloss at first use in an entry (e.g.
   "Holm–Bonferroni step-down correction across the 196 positions"); report
   underflowed p-values as bounds, never as 0.
+- **Formal metric definitions (Adam, 2026-07-26 — CRITICAL)**: every
+  measure, metric, and plotted quantity gets an exact mathematical
+  definition as an equation, with EVERY symbol in it explicitly defined
+  (domain, index ranges, what population the statistics are over, what is
+  excluded). No vague word-descriptions in place of definitions — the reader
+  must know exactly what is being presented and evaluated. Applies to axes
+  of every figure and columns of every table; if a quantity appears in two
+  entries, define it in one and `\ref` it from the other.
