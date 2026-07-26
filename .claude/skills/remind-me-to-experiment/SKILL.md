@@ -37,29 +37,37 @@ bugfixes, figure regeneration of existing results.
    ```
 
 2. **Triage by what the user gave you:**
-   - Request already implies H and spec → fill the card yourself from context,
-     show it, proceed immediately. The card is a restatement, not a quiz.
+   - Request already implies H and spec → fill the card yourself from context.
    - H is clear but underspecified inputs → fill gaps with repo defaults
      (EXPERIMENTS.md registry, lrp_configs, existing N conventions), note the
-     defaults on the card, proceed.
+     defaults on the card.
    - No falsifiable H exists (pure exploration) → say so explicitly, reframe
-     as a QUESTION card ("RQ + what observation would settle it"), and ask the
-     user ONLY if the reframing changes what to compute. Exploratory work is
-     allowed — it just must be labeled exploratory and still ends with
-     documented inputs + findings.
+     as a QUESTION card ("RQ + what observation would settle it"). Exploratory
+     work must be labeled exploratory.
    - The ask would produce an unfalsifiable claim ("make the maps nicer") →
      push back once with a measurable proxy proposal (e.g. localisation mass,
      flipping score), then follow the user's call.
 
-3. **While running**: keep the card's inputs binding — if any input changes
-   mid-run (N, config, model), update the card in the next message and say
-   why.
+3. **STOP — pre-register, do not run (Adam, 2026-07-26).** The default
+   endpoint of this skill is a DESIGN, not a result. Write the experiment as
+   a **suggested entry** in the journal's "Suggested — awaiting confirmation"
+   part (see the `experiment-journal` skill: full Hypothesis / Design &
+   rationale / Planned metrics & evaluation subsections; Conclusion =
+   `\todo[inline]{Not performed yet, awaiting confirmation.}`), commit+push
+   the journal, tell the user which entry to review, and END. No compute is
+   spent on the experiment itself. ONLY proceed to execution when (a) the
+   user explicitly approves that entry, or (b) the user's request itself
+   explicitly ordered immediate execution ("run it now", "no approval
+   needed") — in which case still record the entry first, then run.
 
-4. **After the run**: report against the card — verdict per H1
-   (supported / falsified / inconclusive + the number that decided it), then
-   invoke the `experiment-journal` skill to append the entry. A falsified
-   hypothesis is a full-value result; never soften it into "partially
-   confirmed".
+4. **While running** (post-approval): the entry's inputs are binding — if any
+   input changes mid-run (N, config, model), update the entry and say why.
+
+5. **After the run**: move the entry from the Suggested part to the Performed
+   part (end, chronological), fill Results + a bare-answer Conclusion, report
+   the verdict per H1 (supported / falsified / inconclusive + the number that
+   decided it). A falsified hypothesis is a full-value result; never soften
+   it into "partially confirmed".
 
 ## Rules
 

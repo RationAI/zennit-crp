@@ -132,5 +132,15 @@ Cost estimate: ...
 ```
 
 Plus a suite header: goal, RQ list, staging order, total compute estimate.
-Each executed experiment then flows through `remind-me-to-experiment` (card)
-and lands in the journal (`experiment-journal`).
+
+## Endpoint: designs only, never execution (Adam, 2026-07-26)
+
+This skill ALWAYS ends with pre-registered designs, never with running
+anything. Each proposed experiment is written as a **suggested entry** in
+the experiment journal's "Suggested — awaiting confirmation" part
+(`experiment-journal` skill: Hypothesis / Design & rationale / Planned
+metrics & evaluation; Conclusion =
+`\todo[inline]{Not performed yet, awaiting confirmation.}`), committed and
+pushed for Adam's rigorous review. Execution of any entry starts only after
+Adam approves it (then it flows through `remind-me-to-experiment` step 4+
+and moves to the Performed part on completion).

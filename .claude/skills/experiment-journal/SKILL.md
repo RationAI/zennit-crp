@@ -10,6 +10,28 @@ The journal is `/home/claude/workspaces/crp-paper/iclr2026/experiment-journal.te
 every finding revisitable, every experiment reproducible from the entry alone.
 Web links are auxiliary (temporary); results live in the document body.
 
+## Two-part structure (Adam, 2026-07-26)
+
+The document has exactly two `\part`s, and the table of contents shows only
+these two groups:
+- **`\part{Performed}`** — model records + executed experiments,
+  chronological. Append new performed entries above the marked line at its
+  end.
+- **`\part{Suggested --- awaiting confirmation}`** — pre-registered designs.
+  Every planned experiment is FIRST written here, fully specified:
+  Hypothesis / Design & rationale (pinned inputs as usual) / **Planned
+  metrics & evaluation** (every metric, decision rule, table/figure to be
+  produced) / Conclusion containing exactly
+  `\todo[inline]{Not performed yet, awaiting confirmation.}`. Labels
+  `\label{exp:s<n>-...}`.
+
+Lifecycle: suggested entry → Adam reviews → on approval the experiment runs
+→ the section MOVES to the end of Part Performed (keep its label; adjust
+the title date to execution date) and Results + bare-answer Conclusion are
+filled. No experiment consumes compute while its entry sits in Suggested.
+Rejected/obsolete suggestions get a one-line strikethrough note or are
+removed on Adam's instruction (his call, not yours).
+
 ## Entry procedure
 
 1. **Gather the pinned inputs** (all mandatory; dig them out of the run, do
