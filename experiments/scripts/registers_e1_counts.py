@@ -228,8 +228,21 @@ def cmd_collect(args):
     else:
         import timm
         backbone = timm.create_model(spec["timm_name"], pretrained=True)
-        backbone.eval().to(device).requires_grad_(False)
         label = spec["label"]
+        # E3 extension: optionally swap in a fine-tuned backbone state
+        # (best.pt from train_probe finetune; Probe.backbone IS the timm
+        # module, so the state dict loads directly).
+        ckpt_path = getattr(args, "checkpoint", None)
+        if ckpt_path:
+            ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            missing, unexpected = backbone.load_state_dict(
+                ck["backbone_state_dict"], strict=False)
+            assert not missing, f"missing keys loading {ckpt_path}: {missing}"
+            assert not unexpected, f"unexpected keys loading {ckpt_path}: {unexpected}"
+            label = f"{label} [finetuned: {Path(ckpt_path).parent.name}]"
+            print(f"loaded finetuned backbone from {ckpt_path} "
+                  f"(val_acc={ck.get('val_acc', float('nan')):.4f})")
+        backbone.eval().to(device).requires_grad_(False)
         # no head needed for detection — token norms only, so skip any classifier
         forward_fn = lambda x: backbone.forward_features(x)    # noqa: E731
         n_prefix = int(backbone.num_prefix_tokens)             # 1 CLS + 4 registers
@@ -239,7 +252,16 @@ def cmd_collect(args):
     assert len(backbone.blocks) == DEPTH
     transform, normalize = backbone_transforms(backbone)
     ds = load_eval_dataset(spec["dataset"], transform, extra_kwargs=spec["extra"])
-    indices = pick_class_diverse(ds, args.n, seed=args.seed)
+    indices_from = getattr(args, "indices_from", None)
+    if indices_from:
+        # E3 extension: reuse the exact persisted image selection of a
+        # previous run instead of re-deriving it (belt-and-braces — the
+        # derivation is deterministic in (labels, seed) anyway).
+        indices = [int(i) for i in
+                   np.load(indices_from, allow_pickle=True)["ds_indices"]]
+        print(f"reusing {len(indices)} indices from {indices_from}")
+    else:
+        indices = pick_class_diverse(ds, args.n, seed=args.seed)
     labels = np.array([_ds_labels(ds)[i] for i in indices])
     print(f"{label}: N={len(indices)} of {len(ds)}")
 
@@ -261,8 +283,9 @@ def cmd_collect(args):
 
     norms = np.concatenate(chunks, axis=1).astype(np.float32)  # (24, N, T)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = Path(args.out) if getattr(args, "out", None) else counts_path(args.model)
     np.savez_compressed(
-        counts_path(args.model),
+        out_path,
         norms=norms,
         ds_indices=np.array(indices, dtype=np.int64),
         labels=labels,
@@ -279,12 +302,14 @@ def cmd_collect(args):
             "criterion: per sample AND site, mu/sd over PATCH-token norms only "
             f"(CLS + registers excluded); outlier iff norm > mu + {SD_K}*sd",
             "DINOv3 models run headless (forward_features): detection needs token norms only",
-            f"selection=round-robin class-diverse seed={args.seed}, N={len(indices)}",
+            f"selection=round-robin class-diverse seed={args.seed}, N={len(indices)}"
+            + (f" (indices reused from {indices_from})" if indices_from else ""),
             f"dataset_kwargs={spec['extra']}",
+            f"checkpoint={getattr(args, 'checkpoint', None)}",
             f"collected={_now()}",
         ]),
     )
-    print(f"saved {counts_path(args.model)}")
+    print(f"saved {out_path}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -560,6 +585,13 @@ def main():
     pc.add_argument("--seed", type=int, default=SEED)
     pc.add_argument("--batch-size", type=int, default=32)
     pc.add_argument("--device", default="cuda")
+    pc.add_argument("--checkpoint", default=None,
+                    help="(timm models) best.pt from train_probe finetune — "
+                         "load its backbone_state_dict before collecting (E3)")
+    pc.add_argument("--indices-from", default=None,
+                    help="npz whose ds_indices to reuse verbatim (E3)")
+    pc.add_argument("--out", default=None,
+                    help="output npz path override (default: e1_counts_<model>.npz)")
     pc.set_defaults(fn=cmd_collect)
     sub.add_parser("analyze").set_defaults(fn=cmd_analyze)
     sub.add_parser("figures").set_defaults(fn=cmd_figures)

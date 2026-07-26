@@ -202,8 +202,12 @@ def cache_cmd(
     kind: str = typer.Option(
         "cls", "--kind",
         help="Feature kind to cache: 'cls' (~hundreds of MB; required by "
-             "LinearHead) or 'tokens' (full sequence, ~20 GB on funny_birds; "
-             "required by AttentiveHead).",
+             "LinearHead — NOTE: timm applies the model's global_pool, so "
+             "for DINOv3/Eva models with global_pool='avg' this is the "
+             "patch MEAN-POOL, not the cls token), 'cls_token' (the actual "
+             "post-norm CLS token, forward_features(x)[:, 0] — what the "
+             "official DINOv3 linear probes use), or 'tokens' (full "
+             "sequence, ~20 GB on funny_birds; required by AttentiveHead).",
     ),
     batch_size: int = typer.Option(
         32, "--batch-size",
@@ -233,8 +237,9 @@ def cache_cmd(
     """
     if base not in BASES:
         raise typer.BadParameter(f"unknown base {base!r}; choose from {sorted(BASES)}")
-    if kind not in ("cls", "tokens"):
-        raise typer.BadParameter(f"unknown kind {kind!r}; choose 'cls' or 'tokens'")
+    if kind not in ("cls", "cls_token", "tokens"):
+        raise typer.BadParameter(
+            f"unknown kind {kind!r}; choose 'cls', 'cls_token' or 'tokens'")
     dataset_name, dataset_kwargs = _resolve_train_ds(
         train_ds, dsprites_target=dsprites_target,
         dsprites_n_per_class=dsprites_n_per_class,
@@ -268,9 +273,16 @@ def cache_cmd(
     # Dataset yields unnormalized [0,1] tensors. Normalize at the forward
     # boundary so the model sees its expected input distribution while
     # the dataset stays display-ready and reusable.
-    _extract = base_obj.extract_cls if kind == "cls" else base_obj.extract_tokens
+    if kind == "cls":
+        _extract = base_obj.extract_cls
+    elif kind == "cls_token":
+        # True post-norm CLS token — bypasses forward_head/global_pool
+        # (which is 'avg' on timm DINOv3/Eva, i.e. patch mean-pool).
+        _extract = lambda x: base_obj.backbone.forward_features(x)[:, 0]
+    else:
+        _extract = base_obj.extract_tokens
     extract = lambda x: _extract(normalize(x))
-    out_dtype = torch.float32 if kind == "cls" else torch.float16
+    out_dtype = torch.float16 if kind == "tokens" else torch.float32
 
     print(f"\nextracting features ({kind}, dtype={out_dtype})", flush=True)
     loader_kwargs = dict(
@@ -442,6 +454,14 @@ def train_cmd(
         4.0, "--mlp-ratio",
         help="(block only) MLP hidden-dim multiplier (ViT default 4.0).",
     ),
+    feature_kind: Optional[str] = typer.Option(
+        None, "--feature-kind",
+        help="Override the cached feature kind to train on (default: the "
+             "head's input_kind). E.g. 'cls_token' trains a linear head on "
+             "the true CLS token instead of timm's global_pool ('avg' → "
+             "patch mean-pool on DINOv3/Eva). Must be shape-compatible "
+             "with the head ((N, D) kinds for 'linear').",
+    ),
     scheduler: str = typer.Option(
         "none", "--scheduler",
         help="LR schedule. 'none' (default — constant LR) or 'cosine' "
@@ -474,7 +494,13 @@ def train_cmd(
     L.seed_everything(seed, workers=True)
 
     head_cls = HEADS[head]
-    kind = head_cls.input_kind
+    kind = head_cls.input_kind if feature_kind is None else feature_kind
+    if feature_kind is not None:
+        flat_kinds = ("cls", "cls_token")
+        if head_cls.input_kind in flat_kinds and kind not in flat_kinds:
+            raise typer.BadParameter(
+                f"--feature-kind {feature_kind!r} is not shape-compatible "
+                f"with head {head!r} (needs one of {flat_kinds})")
     cache = cache_path(base, train_ds, kind)
     if not cache.exists():
         raise typer.Exit(
@@ -485,6 +511,9 @@ def train_cmd(
 
     if out is None:
         out = probe_path(base, head, train_ds)
+        if feature_kind is not None:
+            # Don't collide with the default-kind probe file.
+            out = out.with_name(f"{out.stem}_{kind}.pt")
     out.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"base     : {base}")
@@ -572,6 +601,7 @@ def train_cmd(
         "train_ds": train_ds,
         "dataset": d.get("dataset"),       # bare dataset name from cache
         "dataset_kwargs": d.get("dataset_kwargs"),
+        "feature_kind": kind,              # which cached features the head saw
         "head_state_dict": lm.head.state_dict(),
         "val_acc": float(metrics["val_acc"]),
         "val_acc5": float(metrics["val_acc5"]),
@@ -1139,16 +1169,19 @@ def finetune_cmd(
     perm = torch.randperm(n, generator=gen).tolist()
     val_idx = perm[:n_val]
     train_idx = perm[n_val:]
-    train_ds = Subset(ds_train, train_idx)
+    # NB: keep the `train_ds` *string* intact — it goes into the best.pt
+    # payload below. (Previously this line shadowed it with the Subset
+    # object, so checkpoints pickled the whole dataset into "train_ds".)
+    train_subset = Subset(ds_train, train_idx)
     val_ds = Subset(ds_val, val_idx)
-    print(f"  split: train={len(train_ds)}, val={len(val_ds)}")
+    print(f"  split: train={len(train_subset)}, val={len(val_ds)}")
     print(f"  train transform: {train_tfm}")
 
     loader_kwargs = dict(num_workers=num_workers, pin_memory=True)
     if num_workers > 0:
         loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs,
+        train_subset, batch_size=batch_size, shuffle=True, **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs,
