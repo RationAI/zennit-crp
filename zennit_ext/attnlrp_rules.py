@@ -95,22 +95,22 @@ class AlphaBetaMatmul(Hook):
     def backward(self, module, grad_input, grad_output):
         a, b = self.stored_tensors["a"], self.stored_tensors["b"]
         rel = grad_output[0]
-        eps, al, be = self.epsilon, self.alpha, self.beta
+        # eps, al, be = self.epsilon, self.alpha, self.beta
         a_pos, a_neg = a.clamp(min=0), a.clamp(max=0)
         b_pos, b_neg = b.clamp(min=0), b.clamp(max=0)
         y_pos = a_pos @ b_pos + a_neg @ b_neg
         y_neg = a_pos @ b_neg + a_neg @ b_pos
-        f = rel / (y_pos + eps)
-        g = rel / (y_neg - eps)
+        f = rel / (y_pos + self.epsilon)
+        g = rel / (y_neg - self.epsilon)
         bpT, bnT = b_pos.transpose(-1, -2), b_neg.transpose(-1, -2)
         grad_a = 0.5 * (
-            a_pos * (al * (f @ bpT) + be * (g @ bnT))
-            + a_neg * (al * (f @ bnT) + be * (g @ bpT))
+            a_pos * (self.alpha * (f @ bpT) + self.beta * (g @ bnT))
+            + a_neg * (self.alpha * (f @ bnT) + self.beta * (g @ bpT))
         )
         apT, anT = a_pos.transpose(-1, -2), a_neg.transpose(-1, -2)
         grad_b = 0.5 * (
-            b_pos * (al * (apT @ f) + be * (anT @ g))
-            + b_neg * (al * (anT @ f) + be * (apT @ g))
+            b_pos * (self.alpha * (apT @ f) + self.beta * (anT @ g))
+            + b_neg * (self.alpha * (anT @ f) + self.beta * (apT @ g))
         )
         return (grad_a, grad_b)
 

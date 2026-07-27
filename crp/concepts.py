@@ -158,9 +158,7 @@ class ChannelConcept(Concept):
 # installed by the attention-substitution canonizers; see the LRP-primitive
 # package). They subclass :class:`Concept` exactly like :class:`ChannelConcept`,
 # so the FeatureVisualization / Maximization / CondAttribution machinery treats
-# them identically. The legacy POC ``AttentionHeadConcept`` (iter-1/2, hooked
-# the post-``proj`` output where ``Linear(D, D)`` mixes heads) was removed in
-# iter-5 in favour of ``HeadConcept``.
+# them identically.
 
 class HeadConcept(Concept):
     """Per-head attribution on a 3D ``(B, N, embed_dim)`` relevance tensor.
