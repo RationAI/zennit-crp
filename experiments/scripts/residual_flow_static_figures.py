@@ -16,7 +16,13 @@ branch and skip paths) and renders two publication PDFs/PNGs:
 
 Usage (idempotent, CPU only):
     python -m experiments.scripts.residual_flow_static_figures \
-        [--npz PATH] [--out-dir figures/residual_flow]
+        [--npz PATH] [--out-dir figures/residual_flow] [--stem-prefix TAG_]
+
+Cross-model comparison (mass-weighted total branch share per site, one line
+per model):
+    python -m experiments.scripts.residual_flow_static_figures \
+        --compare "M1 label=path1.npz" "M2 label=path2.npz" ... \
+        [--out-dir figures/residual_flow]
 """
 from __future__ import annotations
 
@@ -47,11 +53,66 @@ def _save(fig, out_dir: Path, stem: str) -> None:
     print(f"wrote {out_dir}/{stem}.{{pdf,png}}")
 
 
+# Validated categorical order (dataviz reference palette, light mode,
+# adjacent-pairlist CVD-safe): blue, green, magenta, yellow.
+COMPARE_COLORS = ["#2a78d6", "#008300", "#e87ba4", "#eda100"]
+COMPARE_MARKERS = ["o", "s", "^", "D"]
+
+
+def _mass_share_and_labels(npz: Path):
+    z = np.load(npz, allow_pickle=False)
+    ba, sa = z["branch_abs"], z["skip_abs"]
+    tot_share = (ba.sum(axis=2)
+                 / (ba.sum(axis=2) + sa.sum(axis=2) + 1e-12)).mean(axis=1)
+    labels = [f"blk {b} {k}" for b, k in zip(z["site_block"], z["site_kind"])]
+    return tot_share, labels
+
+
+def compare(pairs: list[str], out_dir: Path) -> None:
+    """``pairs`` = ["<label>=<npz path>", ...] → one line per model of the
+    per-site mass-weighted total branch share."""
+    plt.rcParams.update({
+        "font.size": 9, "axes.labelsize": 9, "xtick.labelsize": 8,
+        "ytick.labelsize": 8, "legend.fontsize": 8,
+        "axes.spines.top": False, "axes.spines.right": False,
+    })
+    fig, ax = plt.subplots(figsize=(6.8, 3.4))
+    labels_ref = None
+    for i, pair in enumerate(pairs):
+        label, _, path = pair.partition("=")
+        share, labels = _mass_share_and_labels(Path(path))
+        if labels_ref is None:
+            labels_ref = labels
+        assert len(labels) == len(labels_ref), (label, len(labels))
+        x = np.arange(len(share))
+        ax.plot(x, share, color=COMPARE_COLORS[i], lw=1.6, zorder=3,
+                marker=COMPARE_MARKERS[i], ms=4, label=label)
+    ax.axhline(0.5, color="0.55", lw=0.8, ls=(0, (4, 3)), zorder=1)
+    ax.set_xticks(np.arange(len(labels_ref)))
+    ax.set_xticklabels(labels_ref, rotation=90)
+    ax.set_ylabel("total branch share (mass-weighted)")
+    ax.set_ylim(0, 1)
+    ax.yaxis.grid(True, color="0.9", lw=0.7)
+    ax.set_axisbelow(True)
+    ax.legend(loc="upper left", frameon=False, ncols=2)
+    _save(fig, out_dir, "rf_compare_models")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--npz", type=Path, default=DEFAULT_NPZ)
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--stem-prefix", default="",
+                    help="prefix for output stems, e.g. 'm1_vit_small_fb_'")
+    ap.add_argument("--compare", nargs="+", default=None,
+                    metavar="LABEL=NPZ",
+                    help="cross-model mode: per-site mass-weighted branch "
+                         "share, one line per model → rf_compare_models")
     args = ap.parse_args()
+
+    if args.compare:
+        compare(args.compare, args.out_dir)
+        return
 
     z = np.load(args.npz, allow_pickle=False)
     ba, sa = z["branch_abs"], z["skip_abs"]          # (24, S, 384)
@@ -88,7 +149,7 @@ def main() -> None:
     cb.set_label(r"mean branch fraction  $f=\frac{|R_\mathrm{branch}|}"
                  r"{|R_\mathrm{branch}|+|R_\mathrm{skip}|}$", fontsize=9)
     cb.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
-    _save(fig, args.out_dir, "branch_fraction_by_dim")
+    _save(fig, args.out_dir, f"{args.stem_prefix}branch_fraction_by_dim")
 
     # ---- Figure 2: per-site distribution + mass-weighted total ---------
     fig, ax = plt.subplots(figsize=(6.8, 3.4))
@@ -114,7 +175,7 @@ def main() -> None:
     handles.append(bp["boxes"][0])
     lab.append("per-dim median $f$ (IQR box, 5–95% whiskers)")
     ax.legend(handles, lab, loc="upper left", frameon=False)
-    _save(fig, args.out_dir, "site_summary")
+    _save(fig, args.out_dir, f"{args.stem_prefix}site_summary")
 
     print(f"n_sites={n_sites} n_samples={n_samples} n_dim={n_dim}")
 

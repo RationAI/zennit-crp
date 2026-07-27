@@ -212,16 +212,26 @@ def _verify_sites(blocks, x_in, forward_fn) -> float:
 
 def cmd_collect(args):
     import torch
-    from experiments.crp_gallery import load_eval_dataset, load_model
+    from experiments.crp_gallery import load_eval_dataset
     from experiments.models import backbone_transforms
 
     spec = MODELS[args.model]
     device = args.device
     if spec["kind"] == "probe":
-        model, _, _, label = load_model(
-            spec["base"], spec["dataset"], model_source="checkpoint",
-            checkpoint=spec["checkpoint"], head="linear", num_classes=None,
-            head_kwargs={}, device=device)
+        # v2: --checkpoint overrides the spec default; the loaded path is
+        # asserted so a stale spec default can never silently win.
+        ckpt = getattr(args, "checkpoint", None) or spec["checkpoint"]
+        from experiments.crp_gallery import DATASETS
+        from experiments.model_io import load_probe
+        tag = DATASETS[spec["dataset"]][2]
+        model, ck, loaded_path = load_probe(tag, device, base=spec["base"],
+                                            path=Path(ckpt) if ckpt else None)
+        if ckpt:
+            assert Path(loaded_path).resolve() == Path(ckpt).resolve(), (
+                f"loaded {loaded_path} != requested {ckpt}")
+            print(f"loaded probe checkpoint {loaded_path} "
+                  f"(val_acc={ck.get('val_acc', float('nan')):.4f})")
+        label = f"{ck['base']} · {ck['head']} · {spec['dataset']}"
         backbone = model.backbone
         forward_fn = lambda x: model(x)                        # noqa: E731
         n_prefix, n_reg = 1, 0
@@ -575,6 +585,403 @@ def cmd_report(args):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# V2 (reviewer revision): tagged model set M1-M4 + statistical tests.
+# Replaces the visual "plateau within factor ~2" criterion with Mann-Whitney U
+# tests on per-image normalized outlier rates. No plateau numbers anywhere.
+# ─────────────────────────────────────────────────────────────────────────────
+
+V2_MODELS: Dict[str, dict] = {
+    "m1": dict(npz="e1_counts_m1_vit_small_fb.npz",
+               short="M1 ViT-S/16 (std) · FunnyBirds",
+               color=COLORS["vit_small_funny_birds"],
+               provenance="RECOMPUTED: finetuned probe "
+                          "finetune_vit_small_funny-birds-train-clean/2026-07-26_160337"),
+    "m2": dict(npz="e1_counts_vit_base_imagenet.npz",
+               short="M2 ViT-B/16 (std) · ImageNet",
+               color=COLORS["vit_base_imagenet"],
+               provenance="REUSED: timm ImageNet classifier unchanged"),
+    "m3": dict(npz="e1_counts_m3_dinov3s_fb.npz",
+               short="M3 DINOv3-S (+reg, finetuned) · FunnyBirds",
+               color=COLORS["dinov3_small_funny_birds"],
+               provenance="RECOMPUTED: finetuned DINOv3-S classifier backbone "
+                          "finetune_vit_dinov3_small_funny-birds-train-clean/2026-07-25_200008"),
+    "m4": dict(npz="e1_counts_dinov3_base_imagenet.npz",
+               short="M4 DINOv3-B (+reg, frozen bb) · ImageNet",
+               color=COLORS["dinov3_base_imagenet"],
+               provenance="REUSED: M4's frozen-head classifier uses the pretrained "
+                          "vit_base_patch16_dinov3 backbone verbatim — identical to the "
+                          "backbone these norms were recorded from (a frozen linear head "
+                          "cannot alter backbone activations)"),
+}
+
+STATS_JSON = OUT_DIR / "e1_stats_v2.json"
+BOOT_N = 10_000
+ALPHA = 0.05
+
+
+def _v2_load(tag: str):
+    """npz -> (d, flags(24,N,P), tau, patch, T, r_i(N,), s_i(N,)).
+
+    r_i = |union over the 24 sites of flagged patch tokens of image i| / T
+    (T = number of patch tokens; normalization makes 196- and 256-patch
+    architectures comparable). s_i = mean over sites of per-site rate =
+    flags[:, i, :].mean() — the secondary per-image variable."""
+    d = np.load(OUT_DIR / V2_MODELS[tag]["npz"], allow_pickle=True)
+    flags, tau, patch = per_sample_flags(d["norms"], int(d["n_prefix"]))
+    T = patch.shape[-1]
+    r = flags.any(0).sum(1) / T
+    s = flags.mean(axis=(0, 2))
+    return d, flags, tau, patch, T, r, s
+
+
+def _boot_median_diff_ci(a: np.ndarray, b: np.ndarray, n: int = BOOT_N,
+                         seed: int = 0):
+    rng = np.random.default_rng(seed)
+    da = np.median(a[rng.integers(0, len(a), (n, len(a)))], axis=1)
+    db = np.median(b[rng.integers(0, len(b), (n, len(b)))], axis=1)
+    diffs = da - db
+    return float(np.quantile(diffs, 0.025)), float(np.quantile(diffs, 0.975))
+
+
+def _mwu(name: str, ta: str, tb: str, a: np.ndarray, b: np.ndarray,
+         alternative: str, h1: str) -> dict:
+    from scipy import stats
+    res = stats.mannwhitneyu(a, b, alternative=alternative, method="asymptotic")
+    n1, n2 = len(a), len(b)
+    lo, hi = _boot_median_diff_ci(a, b)
+    return dict(
+        test=name, groups=[ta, tb], n=[n1, n2], alternative=alternative, h1=h1,
+        method=("Mann-Whitney U, asymptotic normal approximation with tie "
+                "correction (exact p infeasible: n=256 per group with heavy ties)"),
+        U=float(res.statistic), p=float(res.pvalue),
+        median=[float(np.median(a)), float(np.median(b))],
+        median_diff=float(np.median(a) - np.median(b)),
+        median_diff_ci95=[lo, hi],
+        median_diff_ci95_method=f"bootstrap, {BOOT_N} resamples, percentile, seed 0",
+        cliffs_delta=float(2.0 * res.statistic / (n1 * n2) - 1.0),
+        reject=bool(res.pvalue < ALPHA),
+    )
+
+
+def _ks(a: np.ndarray, b: np.ndarray) -> dict:
+    """KS robustness check. one_sided uses alternative='less' (scipy semantics:
+    H1 is CDF(a) < CDF(b) somewhere, i.e. a stochastically LARGER)."""
+    from scipy import stats
+    two = stats.ks_2samp(a, b, alternative="two-sided")
+    one = stats.ks_2samp(a, b, alternative="less")
+    return dict(
+        two_sided=dict(D=float(two.statistic), p=float(two.pvalue)),
+        one_sided=dict(D=float(one.statistic), p=float(one.pvalue),
+                       h1="first group stochastically larger "
+                          "(scipy alternative='less': CDF(a) < CDF(b))"))
+
+
+def cmd_analyze_stats(args):
+    data = {t: _v2_load(t) for t in V2_MODELS}
+
+    # per-site table v2 (24 x 4, objective per-site outlier percentages)
+    csv_path = OUT_DIR / "e1_per_site_table_v2.csv"
+    with open(csv_path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["site"] + [f"pct_{t}" for t in V2_MODELS])
+        for si, name in enumerate(SITE_NAMES):
+            w.writerow([name] + [f"{100 * data[t][1][si].mean():.4f}"
+                                 for t in V2_MODELS])
+    print(f"saved {csv_path}")
+
+    per_model = {}
+    for t, (d, flags, tau, patch, T, r, s) in data.items():
+        cnt = flags.any(0).sum(1)
+        rep = dict(
+            npz=V2_MODELS[t]["npz"], short=V2_MODELS[t]["short"],
+            provenance=V2_MODELS[t]["provenance"],
+            model_meta=str(d["meta"][0]), N=int(r.shape[0]), T=int(T),
+            union_rate=dict(median=float(np.median(r)), mean=float(r.mean()),
+                            q25=float(np.quantile(r, 0.25)),
+                            q75=float(np.quantile(r, 0.75))),
+            per_image_union_count=dict(mean=float(cnt.mean()),
+                                       median=float(np.median(cnt)),
+                                       min=int(cnt.min()), max=int(cnt.max()),
+                                       frac_images_flagged=float((cnt > 0).mean())),
+            mean_site_rate=dict(median=float(np.median(s)), mean=float(s.mean())),
+            frac_per_site=[float(f) for f in flags.mean(axis=(1, 2))],
+            r_i=[float(x) for x in r],
+            s_i=[float(x) for x in s],
+        )
+        n_reg = int(d["n_reg"])
+        if n_reg > 0:
+            reg = d["norms"][:, :, 1:1 + n_reg]
+            over = reg > tau[:, :, None]
+            rep["registers"] = dict(
+                n_reg=n_reg,
+                median_reg_norm_per_site=[float(x) for x in np.median(reg, axis=(1, 2))],
+                median_patch_norm_per_site=[float(x) for x in np.median(patch, axis=(1, 2))],
+                median_tau_per_site=[float(x) for x in np.median(tau, axis=1)],
+                frac_reg_tokens_over_tau=float(over.mean()),
+                frac_samples_any_reg_over_tau_per_site=[float(x) for x in
+                                                        over.any(-1).mean(-1)],
+            )
+        per_model[t] = rep
+
+    r = {t: np.asarray(per_model[t]["r_i"]) for t in V2_MODELS}
+    s = {t: np.asarray(per_model[t]["s_i"]) for t in V2_MODELS}
+
+    tests = {
+        "T1": _mwu("T1: M1 vs M2 (standard pair, cross-dataset)", "m1", "m2",
+                   r["m1"], r["m2"], "two-sided", "rates differ"),
+        "T2": _mwu("T2: M3 vs M4 (DINOv3 pair, cross-dataset)", "m3", "m4",
+                   r["m3"], r["m4"], "two-sided", "rates differ"),
+        "T3": _mwu("T3: M1 vs M3 (FunnyBirds pair, within-dataset)", "m1", "m3",
+                   r["m1"], r["m3"], "greater",
+                   "standard rates stochastically larger than DINOv3 rates"),
+        "T4": _mwu("T4: M2 vs M4 (ImageNet pair, within-dataset)", "m2", "m4",
+                   r["m2"], r["m4"], "greater",
+                   "standard rates stochastically larger than DINOv3 rates"),
+    }
+    tests["T3"]["ks"] = _ks(r["m1"], r["m3"])
+    tests["T4"]["ks"] = _ks(r["m2"], r["m4"])
+    # secondary variable robustness (same one-sided direction as T3/T4)
+    secondary = {
+        "T3s": _mwu("T3 on secondary variable s_i (mean per-site rate)", "m1", "m3",
+                    s["m1"], s["m3"], "greater",
+                    "standard rates stochastically larger"),
+        "T4s": _mwu("T4 on secondary variable s_i (mean per-site rate)", "m2", "m4",
+                    s["m2"], s["m4"], "greater",
+                    "standard rates stochastically larger"),
+    }
+
+    supported = bool(
+        tests["T3"]["reject"] and tests["T3"]["median_diff"] > 0
+        and tests["T4"]["reject"] and tests["T4"]["median_diff"] > 0)
+
+    out = dict(
+        generated=_now(),
+        definitions=dict(
+            r_i="per-image normalized outlier rate: |union over the 24 sites of "
+                "patch tokens flagged (norm > mu_sample,site + 4*sd_sample,site)| "
+                "/ T, T = number of patch tokens (196 std @224, 256 DINOv3 @256)",
+            s_i="secondary per-image variable: mean over the 24 sites of the "
+                "per-site flagged fraction",
+            alpha=ALPHA,
+        ),
+        caveats=[
+            "T1/T2 are CROSS-DATASET comparisons: dataset and architecture scale "
+            "are confounded; failure to reject is NOT evidence of equality.",
+            "T3/T4 are the clean within-dataset architecture comparisons and "
+            "carry the H1 decision.",
+        ],
+        decision_rule="'registers reduce outlier tokens' is supported iff BOTH "
+                      "T3 and T4 reject at alpha=0.05 with positive median "
+                      "difference",
+        decision_supported=supported,
+        per_model=per_model,
+        tests=tests,
+        secondary_tests=secondary,
+    )
+    STATS_JSON.write_text(json.dumps(out, indent=2))
+    print(f"saved {STATS_JSON}")
+
+    for k, tst in {**tests, **secondary}.items():
+        print(f"{k}: U={tst['U']:.0f} p={tst['p']:.3g} "
+              f"med_diff={tst['median_diff']:.4f} "
+              f"CI[{tst['median_diff_ci95'][0]:.4f},{tst['median_diff_ci95'][1]:.4f}] "
+              f"delta={tst['cliffs_delta']:.3f} reject={tst['reject']}")
+    print(f"decision (T3 AND T4, alpha={ALPHA}): "
+          f"{'SUPPORTED' if supported else 'NOT SUPPORTED'}")
+
+
+def cmd_figures_v2(args):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    data = {t: _v2_load(t) for t in V2_MODELS}
+    x = np.arange(2 * DEPTH)
+
+    # 1) outlier fraction per site — visual cue only, no threshold/reference lines
+    fig, ax = plt.subplots(figsize=(9.2, 4.0))
+    for t, (d, flags, *_rest) in data.items():
+        ax.plot(x, 100 * flags.mean(axis=(1, 2)), lw=2, marker="o", ms=4,
+                color=V2_MODELS[t]["color"], label=V2_MODELS[t]["short"])
+    ax.set_xticks(x[::2], [str(b) for b in range(DEPTH)])
+    ax.set_xlabel("site in network order (tick = post-attn half of block; "
+                  "next point = post-MLP half)")
+    ax.set_ylabel("patch-token outliers (%)")
+    ax.set_title("E1 — outlier fraction per half-block site "
+                 f"(per-sample criterion: norm > μ + {SD_K:g}σ, "
+                 "CLS/registers excluded; N=256/model)")
+    _style(ax)
+    ax.legend(frameon=False, loc="upper left", fontsize=8)
+    _save(fig, "e1_fraction_per_site_v2")
+    plt.close(fig)
+
+    # 2) DINOv3 (M3 finetuned + M4): register vs patch norms across sites
+    dkeys = [t for t in V2_MODELS if int(data[t][0]["n_reg"]) > 0]
+    fig, axes = plt.subplots(1, len(dkeys), figsize=(6.0 * len(dkeys), 4.0),
+                             sharex=True)
+    axes = np.atleast_1d(axes)
+    for ax, t in zip(axes, dkeys):
+        d, flags, tau, patch, T, _r, _s = data[t]
+        n_reg = int(d["n_reg"])
+        reg = d["norms"][:, :, 1:1 + n_reg]
+        cls = d["norms"][:, :, 0]
+        c = V2_MODELS[t]["color"]
+        for k in range(n_reg):
+            ax.plot(x, np.median(reg[:, :, k], axis=1), lw=1.2, color=c,
+                    alpha=0.8, label=f"register tokens ({n_reg})" if k == 0 else None)
+        ax.plot(x, np.median(patch, axis=(1, 2)), lw=2, color="#52514e",
+                label="patch tokens (median)")
+        ax.plot(x, np.median(tau, axis=1), lw=2, ls="--", color="#0b0b0b",
+                label=f"patch outlier threshold μ+{SD_K:g}σ (median)")
+        ax.plot(x, np.median(cls, axis=1), lw=1.4, ls=":", color="#52514e",
+                label="CLS token")
+        ax.set_yscale("log")
+        ax.set_xticks(x[::2], [str(b) for b in range(DEPTH)])
+        ax.set_xlabel("site (block; attn/MLP halves interleaved)")
+        ax.set_title(V2_MODELS[t]["short"])
+        _style(ax)
+    axes[0].set_ylabel("token L2 norm (median over N=256)")
+    axes[0].legend(frameon=False, fontsize=8, loc="upper left")
+    fig.suptitle("E1 — DINOv3: register tokens carry the high norms "
+                 "(M3 finetuned on FunnyBirds; M4 pretrained backbone)", y=1.02)
+    _save(fig, "e1_dinov3_registers_v2")
+    plt.close(fig)
+
+
+def _test_row_md(k: str, t: dict) -> str:
+    lo, hi = t["median_diff_ci95"]
+    ks = t.get("ks")
+    ks_cell = (f"one-sided D={ks['one_sided']['D']:.3f}, p={ks['one_sided']['p']:.2e}; "
+               f"two-sided D={ks['two_sided']['D']:.3f}, p={ks['two_sided']['p']:.2e}"
+               if ks else "—")
+    return (f"| {k} | {t['groups'][0]} vs {t['groups'][1]} | {t['alternative']} | "
+            f"{t['U']:.0f} | {t['p']:.3g} | {t['median_diff']:.4f} | "
+            f"[{lo:.4f}, {hi:.4f}] | {t['cliffs_delta']:.3f} | "
+            f"{'yes' if t['reject'] else 'no'} | {ks_cell} |")
+
+
+def cmd_report_v2(args):
+    st = json.loads(STATS_JSON.read_text())
+    md = REPO_ROOT / "research" / "registers" / "e1_outlier_counts_v2.md"
+    pm = st["per_model"]
+
+    model_rows = ["| tag | model | N | T (patches) | union rate median | "
+                  "union rate mean | per-image union count mean | provenance |",
+                  "|---|---|---|---|---|---|---|---|"]
+    for t, rep in pm.items():
+        model_rows.append(
+            f"| {t} | {rep['short']} | {rep['N']} | {rep['T']} | "
+            f"{rep['union_rate']['median']:.4f} | {rep['union_rate']['mean']:.4f} | "
+            f"{rep['per_image_union_count']['mean']:.1f} | {rep['provenance']} |")
+
+    test_rows = ["| test | pair | alternative | U | p | median diff | "
+                 "95% CI (bootstrap) | Cliff's δ | reject | KS check |",
+                 "|---|---|---|---|---|---|---|---|---|---|"]
+    for k in ("T1", "T2", "T3", "T4"):
+        test_rows.append(_test_row_md(k, st["tests"][k]))
+    sec_rows = [_test_row_md(k, st["secondary_tests"][k]) for k in ("T3s", "T4s")]
+
+    reg_lines = []
+    for t in ("m3", "m4"):
+        rg = pm[t].get("registers")
+        if rg:
+            reg_lines.append(
+                f"- **{t}** ({pm[t]['short']}): site-max median register norm "
+                f"{max(rg['median_reg_norm_per_site']):.0f} vs site-max median patch "
+                f"norm {max(rg['median_patch_norm_per_site']):.0f}; register tokens "
+                f"exceed the patch outlier threshold τ in "
+                f"{100 * rg['frac_reg_tokens_over_tau']:.0f}% of (site, sample, "
+                "register) triples.")
+
+    verdict = st["decision_supported"]
+    parts = [
+        "# E1 v2 — register-outlier detection: statistical tests "
+        "(reviewer revision)",
+        f"_Generated {_now()} by `experiments/scripts/registers_e1_counts.py` "
+        "(analyze-stats / figures-v2 / report-v2). Supersedes the 'plateau "
+        "within factor ~2' criterion of `e1_outlier_counts.md`; no plateau "
+        "numbers are used anywhere below._",
+        "",
+        "## What was recomputed vs reused",
+        "- **M1 recomputed** — the ViT-S/16 FunnyBirds probe changed to checkpoint "
+        "`data/runs/finetune_vit_small_funny-birds-train-clean/2026-07-26_160337/best.pt` "
+        "(loaded path asserted). Same N=256 FunnyBirds test indices as v1 "
+        "(reused verbatim from the old npz, seed 0). → `e1_counts_m1_vit_small_fb.npz`.",
+        "- **M2 reused** — `e1_counts_vit_base_imagenet.npz` unchanged (timm "
+        "ImageNet classifier did not change).",
+        "- **M3 recomputed** — now the FINETUNED DINOv3-S classifier backbone "
+        "(`data/runs/finetune_vit_dinov3_small_funny-birds-train-clean/2026-07-25_200008/best.pt`), "
+        "replacing the old pretrained-backbone row. Same FunnyBirds indices. "
+        "→ `e1_counts_m3_dinov3s_fb.npz`.",
+        "- **M4 reused** — `e1_counts_dinov3_base_imagenet.npz`. Justification: the "
+        "old dinov3_base row recorded token norms of the pretrained "
+        "`vit_base_patch16_dinov3` backbone, which is exactly M4's backbone (M4 "
+        "adds only a frozen linear head, which cannot alter backbone "
+        "activations). The arrays are therefore identical by construction.",
+        "- Old v1 npz files are untouched.",
+        "",
+        "## Definitions",
+        "- Criterion (unchanged): per sample and per site, μ/σ over that sample's "
+        f"patch-token L2 norms; outlier iff norm > μ + {SD_K:g}σ. CLS excluded; "
+        "DINOv3 register tokens excluded from patch statistics, tracked "
+        "separately. 24 sites = 12 blocks × (post-attn-add, post-mlp-add).",
+        "- Unit of analysis: per-image normalized union outlier rate "
+        "**r_i = |{patch tokens of image i flagged at ANY of the 24 sites}| / T**, "
+        "T = number of patch tokens (196 standard @224², 256 DINOv3 @256²). "
+        "Normalization by T makes the architectures comparable.",
+        "- Secondary variable: s_i = mean over the 24 sites of the per-site "
+        "flagged fraction of image i.",
+        "- Tests: two-sided / one-sided Mann-Whitney U (asymptotic, "
+        "tie-corrected; exact p infeasible at n=256 with ties), α=0.05; effect "
+        "sizes: group medians, median difference with 95% bootstrap CI "
+        f"({BOOT_N} resamples), Cliff's δ; KS as robustness check for T3/T4.",
+        "",
+        "## Per-model summary",
+        "\n".join(model_rows),
+        "",
+        "Full objective per-site table (24 sites × 4 models): "
+        "`data/results/registers/e1_per_site_table_v2.csv`. The per-site figure "
+        "`e1_fraction_per_site_v2` is a visual cue only — no numbers are "
+        "derived from it.",
+        "",
+        "## Test table (primary variable r_i)",
+        "\n".join(test_rows),
+        "",
+        "Secondary variable s_i (robustness, same one-sided direction):",
+        "\n".join(test_rows[:2] + sec_rows),
+        "",
+        "## Caveats",
+        "- " + "\n- ".join(st["caveats"]),
+        "",
+        "## Verdict",
+        f"- Decision rule: {st['decision_rule']}.",
+        f"- T3 reject={st['tests']['T3']['reject']} "
+        f"(p={st['tests']['T3']['p']:.3g}, median diff "
+        f"{st['tests']['T3']['median_diff']:.4f}); "
+        f"T4 reject={st['tests']['T4']['reject']} "
+        f"(p={st['tests']['T4']['p']:.3g}, median diff "
+        f"{st['tests']['T4']['median_diff']:.4f}).",
+        f"- **'Registers reduce outlier tokens' is "
+        f"{'SUPPORTED' if verdict else 'NOT SUPPORTED'}** under the new rule.",
+        "",
+        "## Register tokens (DINOv3)",
+        "\n".join(reg_lines),
+        "",
+        "## Files",
+        "- Arrays: `data/results/registers/e1_counts_m1_vit_small_fb.npz`, "
+        "`e1_counts_vit_base_imagenet.npz` (reused), "
+        "`e1_counts_m3_dinov3s_fb.npz`, `e1_counts_dinov3_base_imagenet.npz` "
+        "(reused); stats `e1_stats_v2.json`; table `e1_per_site_table_v2.csv`.",
+        "- Figures: `figures/registers/e1_counts/e1_fraction_per_site_v2.{png,pdf}`, "
+        "`e1_dinov3_registers_v2.{png,pdf}` (pdf copies in the paper's "
+        "journal-figures).",
+    ]
+    md.parent.mkdir(parents=True, exist_ok=True)
+    md.write_text("\n".join(parts) + "\n")
+    print(f"saved {md}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -586,8 +993,10 @@ def main():
     pc.add_argument("--batch-size", type=int, default=32)
     pc.add_argument("--device", default="cuda")
     pc.add_argument("--checkpoint", default=None,
-                    help="(timm models) best.pt from train_probe finetune — "
-                         "load its backbone_state_dict before collecting (E3)")
+                    help="best.pt from train_probe finetune. timm models: load "
+                         "its backbone_state_dict before collecting (E3). probe "
+                         "models: overrides the spec default checkpoint (v2; "
+                         "loaded path is asserted)")
     pc.add_argument("--indices-from", default=None,
                     help="npz whose ds_indices to reuse verbatim (E3)")
     pc.add_argument("--out", default=None,
@@ -596,6 +1005,9 @@ def main():
     sub.add_parser("analyze").set_defaults(fn=cmd_analyze)
     sub.add_parser("figures").set_defaults(fn=cmd_figures)
     sub.add_parser("report").set_defaults(fn=cmd_report)
+    sub.add_parser("analyze-stats").set_defaults(fn=cmd_analyze_stats)
+    sub.add_parser("figures-v2").set_defaults(fn=cmd_figures_v2)
+    sub.add_parser("report-v2").set_defaults(fn=cmd_report_v2)
     args = p.parse_args()
     args.fn(args)
 

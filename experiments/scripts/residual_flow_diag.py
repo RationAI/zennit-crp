@@ -58,8 +58,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def npz_path(base: str, dataset: str, config: str, out_dir: Path) -> Path:
-    return out_dir / f"residual_flow_{base}_{dataset}_{config}.npz"
+def npz_path(base: str, dataset: str, config: str, out_dir: Path,
+             tag: str | None = None) -> Path:
+    tag = tag or f"{base}_{dataset}"
+    return out_dir / f"residual_flow_{tag}_{config}.npz"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,16 +92,87 @@ def pick_class_diverse(ds, n: int, seed: int = 0) -> List[int]:
     return out
 
 
+def load_model_for_args(args, device):
+    """Resolve the eval model for (base, dataset, checkpoint).
+
+    * ``base == "vit_dinov3_base_in1k"`` — special assembly: timm DINOv3-B/16
+      backbone (``num_classes=0``, ``img_size=256``) + the public canvit IN1k
+      linear head on the (final-norm) CLS token, wrapped in one module so
+      ``CondAttribution`` sees a single classifier (M4 of the 4-model redo).
+    * otherwise — :func:`experiments.model_io.load_probe`; ``--checkpoint``
+      (when given) pins the exact run instead of the newest-glob default.
+    """
+    import torch.nn as nn
+    from experiments.model_io import DATASETS, load_probe
+
+    if args.base == "vit_dinov3_base_in1k":
+        import timm
+        from experiments.scripts.eval_dinov3_in1k_probe import (
+            HEAD_REPOS, load_in1k_linear_head)
+        timm_name = "vit_base_patch16_dinov3.lvd1689m"
+
+        class _DinoV3CLSFullProbe(nn.Module):
+            """DINOv3 backbone features → final-norm CLS token → linear head."""
+
+            def __init__(self, backbone: nn.Module, head: nn.Module):
+                super().__init__()
+                self.backbone = backbone
+                self.head = head
+
+            def forward(self, x):
+                return self.head(self.backbone.forward_features(x)[:, 0])
+
+        backbone = timm.create_model(timm_name, pretrained=True,
+                                     num_classes=0, img_size=256)
+        head = load_in1k_linear_head(timm_name, device)
+        model = _DinoV3CLSFullProbe(backbone, head).eval().to(device)
+        model.requires_grad_(False)
+        ck = {"base": args.base, "head": "canvit_in1k_linear_cls",
+              "num_classes": 1000, "dataset": "imagenet_val_hf"}
+        return model, ck, Path(f"timm:{timm_name} + hf:{HEAD_REPOS[timm_name]}")
+
+    tag = DATASETS[args.dataset][2]
+    ckpt = Path(args.checkpoint) if getattr(args, "checkpoint", None) else None
+    model, ck, ck_path = load_probe(tag, device, base=args.base, path=ckpt)
+    if ckpt is not None:
+        assert Path(ck_path).resolve() == ckpt.resolve(), (ck_path, ckpt)
+    return model, ck, ck_path
+
+
+def pick_correct_class_diverse(model, ds, idx_order, n: int, normalize, device,
+                               batch: int = 64) -> List[int]:
+    """Filter a class-diverse candidate ordering down to the first ``n``
+    correctly-classified images (round-robin order preserved, so the result
+    stays class-diverse)."""
+    import torch
+    sel: List[int] = []
+    scanned = 0
+    with torch.no_grad():
+        for i0 in range(0, len(idx_order), batch):
+            chunk = idx_order[i0:i0 + batch]
+            x = torch.stack([ds[i][0] for i in chunk]).to(device)
+            y = [int(ds[i][1]) for i in chunk]
+            pred = model(normalize(x)).argmax(-1).cpu()
+            sel.extend(i for i, p, t in zip(chunk, pred.tolist(), y) if p == t)
+            scanned += len(chunk)
+            if len(sel) >= n:
+                break
+    print(f"  correct-classified selection: scanned {scanned} candidates "
+          f"→ kept {min(len(sel), n)}")
+    if len(sel) < n:
+        raise RuntimeError(f"only {len(sel)} correctly-classified images found")
+    return sel[:n]
+
+
 def compute(args) -> Path:
     import torch
     import lrp_configs
     from crp.attribution import CondAttribution
-    from experiments.model_io import DATASETS, load_probe, backbone_transforms
-    from experiments.datasets import load as load_dataset
+    from experiments.model_io import DATASETS, backbone_transforms
 
     device = args.device
-    tag = DATASETS[args.dataset][2]
-    model, ck, ck_path = load_probe(tag, device, base=args.base)
+    model, ck, ck_path = load_model_for_args(args, device)
+    print(f"checkpoint/model source: {ck_path}")
     n_blocks = len(model.backbone.blocks)
     embed_dim = int(model.backbone.embed_dim)
     transform, normalize = backbone_transforms(model.backbone)
@@ -109,23 +182,52 @@ def compute(args) -> Path:
     ds_kw = dict(ds_kw)
     if args.dataset == "funny_birds":
         ds_kw = {"split": "test"}
+    from experiments.datasets import load as load_dataset
     ds = load_dataset(ds_name, root=REPO_ROOT / "data", transform=transform, **ds_kw)
-    idxs = pick_class_diverse(ds, args.n_samples, seed=args.seed)
-    print(f"{len(idxs)} class-diverse samples (round-robin), "
-          f"model={ck['base']}·{ck['head']}, D={embed_dim}")
+    cand = pick_class_diverse(ds, len(ds), seed=args.seed)
+    idxs = pick_correct_class_diverse(model, ds, cand, args.n_samples,
+                                      normalize, device)
+    print(f"{len(idxs)} class-diverse correctly-classified samples "
+          f"(round-robin), model={ck['base']}·{ck['head']}, D={embed_dim}")
 
     cfg = lrp_configs.get(args.config)
     attribution = CondAttribution(model)
+
+    # Prefix rows (cls + register tokens) are EXCLUDED from the per-dim token
+    # sums — patch tokens only. Totals for the conservation drift keep all rows.
+    n_prefix = int(getattr(model.backbone, "num_prefix_tokens", 1))
+
+    # Architecture-dependent branch endpoints. timm ``Block``: ls1/ls2 are
+    # Identity, so ``attn.proj_drop`` / ``mlp.drop2`` ARE the add's branch
+    # summands. timm ``EvaBlock`` (DINOv3): LayerScale gamma_1/gamma_2 sit
+    # between those modules and the add, routed through ``LayerScaleMul``
+    # (Uniform rule, absorbs half) by the canonizer — the branch summand is the
+    # LayerScaleMul OUTPUT, i.e. ``_lrp_ls1`` / ``_lrp_ls2``.
+    blk0 = model.backbone.blocks[0]
+    is_eva = hasattr(blk0, "gamma_1")
+    if is_eva:
+        assert blk0.gamma_1 is not None and blk0.gamma_2 is not None, \
+            "EvaBlock without LayerScale: endpoint choice unhandled"
+        ep_attn, ep_mlp = "._lrp_ls1", "._lrp_ls2"
+        check_pairs = [(f"backbone.blocks.{b}.drop_path{i}",
+                        f"backbone.blocks.{b}._lrp_ls{i}")
+                       for b in (0, n_blocks - 1) for i in (1, 2)]
+    else:
+        ep_attn, ep_mlp = ".attn.proj_drop", ".mlp.drop2"
+        check_pairs = [(f"backbone.blocks.{b}.attn.proj_drop",
+                        f"backbone.blocks.{b}.ls1") for b in (0, n_blocks - 1)]
+        check_pairs += [(f"backbone.blocks.{b}.mlp.drop2",
+                         f"backbone.blocks.{b}.ls2") for b in (0, n_blocks - 1)]
 
     # (block, kind) → (add layer, branch layer); network order: attn then mlp.
     sites = []
     for b in range(n_blocks):
         sites.append((b, "attn", f"backbone.blocks.{b}._lrp_res1",
-                      f"backbone.blocks.{b}.attn.proj_drop"))
+                      f"backbone.blocks.{b}{ep_attn}"))
         sites.append((b, "mlp", f"backbone.blocks.{b}._lrp_res2",
-                      f"backbone.blocks.{b}.mlp.drop2"))
+                      f"backbone.blocks.{b}{ep_mlp}"))
     record = sorted({l for _, _, a, br in sites for l in (a, br)})
-    check_layers = ["backbone.blocks.0.ls1", f"backbone.blocks.{n_blocks - 1}.ls1"]
+    check_layers = sorted({l for pair in check_pairs for l in pair})
 
     S, n_sites = len(idxs), len(sites)
     branch_signed = np.zeros((n_sites, S, embed_dim), np.float32)
@@ -151,11 +253,11 @@ def compute(args) -> Path:
         if missing:
             raise RuntimeError(f"recording failed for layers: {missing}")
         if i0 == 0:
-            e1 = (res.relevances["backbone.blocks.0.attn.proj_drop"]
-                  - res.relevances["backbone.blocks.0.ls1"]).abs().max()
-            e2 = (res.relevances[f"backbone.blocks.{n_blocks-1}.attn.proj_drop"]
-                  - res.relevances[f"backbone.blocks.{n_blocks-1}.ls1"]).abs().max()
-            endpoint_err = float(torch.maximum(e1, e2))
+            errs = [(res.relevances[a] - res.relevances[b]).abs().max()
+                    for a, b in check_pairs]
+            endpoint_err = float(torch.stack(errs).max())
+            print(f"  endpoint-identity check over {len(check_pairs)} pairs: "
+                  f"max err = {endpoint_err:.3e}")
         pred = res.prediction.detach()
         for j, y in enumerate(ys):
             k = i0 + j
@@ -166,10 +268,11 @@ def compute(args) -> Path:
             r_add = res.relevances[add_l]                  # (B, N, D)
             r_br = res.relevances[br_l]
             r_skip = r_add - r_br                          # exact elementwise split
-            branch_signed[si, i0:i0 + len(chunk)] = r_br.sum(1).cpu().numpy()
-            skip_signed[si, i0:i0 + len(chunk)] = r_skip.sum(1).cpu().numpy()
-            branch_abs[si, i0:i0 + len(chunk)] = r_br.abs().sum(1).cpu().numpy()
-            skip_abs[si, i0:i0 + len(chunk)] = r_skip.abs().sum(1).cpu().numpy()
+            p = r_br[:, n_prefix:], r_skip[:, n_prefix:]   # patch-token rows only
+            branch_signed[si, i0:i0 + len(chunk)] = p[0].sum(1).cpu().numpy()
+            skip_signed[si, i0:i0 + len(chunk)] = p[1].sum(1).cpu().numpy()
+            branch_abs[si, i0:i0 + len(chunk)] = p[0].abs().sum(1).cpu().numpy()
+            skip_abs[si, i0:i0 + len(chunk)] = p[1].abs().sum(1).cpu().numpy()
             tot_add[si, i0:i0 + len(chunk)] = r_add.sum((1, 2)).cpu().numpy()
         print(f"  batch {i0 // bs + 1}/{(S + bs - 1) // bs} done", flush=True)
 
@@ -183,10 +286,18 @@ def compute(args) -> Path:
     drift_attn = np.abs(t2[:-1] - t1[1:]) / ref            # across blocks
     meta = {
         "base": args.base, "dataset": args.dataset, "config": args.config,
+        "model_tag": args.model_tag,
         "split": "test" if args.dataset == "funny_birds" else str(ds_kw),
         "checkpoint": str(ck_path), "n_samples": S, "n_blocks": n_blocks,
         "embed_dim": embed_dim, "seed": args.seed,
         "composite_desc": cfg.description,
+        "block_type": "EvaBlock" if is_eva else "Block",
+        "branch_endpoints": [ep_attn, ep_mlp],
+        "num_prefix_tokens_excluded": n_prefix,
+        "token_rows": f"patch tokens only (prefix rows 0..{n_prefix - 1} = cls"
+                      f"{'+register' if n_prefix > 1 else ''} excluded from "
+                      "per-dim sums; tot_add keeps all rows)",
+        "selection": "class-diverse round-robin, correctly-classified only",
         "endpoint_identity_err": endpoint_err,
         "accuracy_on_sample": float((sample_pred == sample_target).mean()),
         "drift_mlp_median": float(np.median(drift_mlp)),
@@ -195,7 +306,8 @@ def compute(args) -> Path:
         "drift_attn_max": float(drift_attn.max()),
         "generated": _now(),
     }
-    out = npz_path(args.base, args.dataset, args.config, Path(args.out_dir))
+    out = npz_path(args.base, args.dataset, args.config, Path(args.out_dir),
+                   tag=args.model_tag)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out,
@@ -264,7 +376,8 @@ def render(args) -> Path:
     from bokeh.plotting import figure
     from bokeh.resources import INLINE
 
-    src_npz = npz_path(args.base, args.dataset, args.config, Path(args.out_dir))
+    src_npz = npz_path(args.base, args.dataset, args.config, Path(args.out_dir),
+                       tag=args.model_tag)
     z = np.load(src_npz, allow_pickle=False)
     meta = json.loads(str(z["meta"]))
     ba, sa = z["branch_abs"], z["skip_abs"]                # (24, S, D)
@@ -422,23 +535,28 @@ def render(args) -> Path:
       Attribution: <code>crp.CondAttribution</code> conditioned on the true class
       (<code>{{"y": [target]}}</code>), composite <code>{meta['config']}</code>
       ("{meta['composite_desc']}").</p>
-      <p><b>Recording.</b> The <code>TimmBlockResidualCanonizer</code> routes both
-      residual additions of every block through recordable <code>ResidualAdd</code>
-      modules. Per block b the recorded layers are the add outputs
-      <code>backbone.blocks.b._lrp_res1</code> (attn) and
+      <p><b>Recording.</b> The block residual canonizer
+      (<code>TimmBlockResidualCanonizer</code> /
+      <code>EvaBlockResidualCanonizer</code> for {meta.get('block_type', 'Block')})
+      routes both residual additions of every block through recordable
+      <code>ResidualAdd</code> modules. Per block b the recorded layers are the
+      add outputs <code>backbone.blocks.b._lrp_res1</code> (attn) and
       <code>backbone.blocks.b._lrp_res2</code> (MLP), and the branch endpoints
-      <code>backbone.blocks.b.attn.proj_drop</code> and
-      <code>backbone.blocks.b.mlp.drop2</code>. Between each endpoint and the add's
-      branch input sit only Identity (<code>ls*</code>, <code>drop_path*</code>) and
-      eval-mode Dropout modules, so the endpoint gradient equals the branch summand
+      <code>backbone.blocks.b{meta.get('branch_endpoints', ['.attn.proj_drop', '.mlp.drop2'])[0]}</code> and
+      <code>backbone.blocks.b{meta.get('branch_endpoints', ['.attn.proj_drop', '.mlp.drop2'])[1]}</code>.
+      Between each endpoint and the add's branch input sit only Identity
+      (<code>drop_path*</code>) and eval-mode Dropout modules — for Eva blocks the
+      endpoint is the <code>LayerScaleMul</code> output, i.e. already ABOVE the
+      Uniform LayerScale rule — so the endpoint gradient equals the branch summand
       of the residual rule's elementwise split — verified numerically:
-      max |R(proj_drop) − R(ls1)| = {meta['endpoint_identity_err']:.2e}.</p>
+      max endpoint-identity error = {meta['endpoint_identity_err']:.2e}.</p>
       <p><b>Skip derivation.</b> The composite's residual rule
       (<code>ResidualRatio</code>) splits the relevance at the add output
       elementwise: R<sub>add</sub> = R<sub>skip</sub> + R<sub>branch</sub> per token
       per dimension. R<sub>skip</sub> is therefore derived exactly as
       R<sub>add</sub> − R<sub>branch</sub> (no approximation in the decomposition
-      itself). Per dimension we sum over the 197 tokens — signed sums and
+      itself). Per dimension we sum over tokens
+      ({meta.get('token_rows', 'all token rows')}) — signed sums and
       absolute-value sums are both stored; f uses the absolute sums.</p>
       <p><b>Conservation.</b> The decomposition at each add is exact by construction;
       the residual (propagation) error is the drift of <i>total</i> relevance between
@@ -461,7 +579,7 @@ def render(args) -> Path:
                      title="Residual skip vs branch — LRP relevance flow")
     out_dir = Path(args.webapp_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / "index.html"
+    out = out_dir / (args.page_name or "index.html")
     out.write_text(html)
     print(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
     return out
@@ -481,13 +599,19 @@ def main():
         for k, v in common.items():
             p.add_argument(f"--{k}", default=v)
         p.add_argument("--out-dir", default=str(DEFAULT_NPZ_DIR))
+        p.add_argument("--model-tag", default=None,
+                       help="output naming tag (npz + page); default <base>_<dataset>")
         if name in ("compute", "all"):
+            p.add_argument("--checkpoint", default=None,
+                           help="explicit best.pt path (overrides newest-run glob)")
             p.add_argument("--n-samples", type=int, default=96)
             p.add_argument("--batch-size", type=int, default=8)
             p.add_argument("--device", default="cuda")
             p.add_argument("--seed", type=int, default=0)
         if name in ("render", "all"):
             p.add_argument("--webapp-dir", default=str(DEFAULT_WEB_DIR))
+            p.add_argument("--page-name", default=None,
+                           help="output html filename (default index.html)")
     args = ap.parse_args()
     if args.cmd in ("compute", "all"):
         compute(args)
