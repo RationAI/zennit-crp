@@ -16,6 +16,14 @@
     #sample-figs img { max-width: 160px; height: auto; border: 1px solid var(--pico-muted-border-color);
                        border-radius: 6px; display: block; }
     #sample-figs figcaption { font-size: 0.75rem; color: var(--pico-muted-color); margin-top: 0.2rem; }
+    #xai-block { margin: 0.4rem 0 0.6rem; }
+    #xai-row { display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: flex-start; }
+    #xai-row figure { margin: 0; width: 150px; }
+    #xai-row img { width: 150px; height: 150px; object-fit: cover; border: 1px solid var(--pico-muted-border-color);
+                   border-radius: 6px; display: block; }
+    #xai-row figcaption { font-size: 0.72rem; margin-top: 0.2rem; }
+    #xai-row .m { font-weight: 600; }
+    #xai-row .prov { color: var(--pico-muted-color); font-size: 0.68rem; display: block; }
     #composite { margin: 1rem 0; }
     #composite pre { white-space: pre-wrap; font-size: 0.8rem; max-height: 16rem; overflow: auto; }
     .meta-line { font-size: 0.85rem; color: var(--pico-muted-color); }
@@ -65,7 +73,15 @@
     <figure><img id="sample-thumb" alt="selected input image"><figcaption>input</figcaption></figure>
     <figure id="sample-heat-fig"><img id="sample-heat" alt="input relevance heatmap"><figcaption>relevance heatmap</figcaption></figure>
     <figure id="sample-norm-fig" hidden><a id="sample-norm-link" target="_blank"><img id="sample-norm" alt="per-block token norms with flagged register outliers"></a>
-      <figcaption>token norms per block, flagged register outliers (magenta) — click to enlarge</figcaption></figure>
+      <figcaption>dual-site token norms per block, flagged outliers (magenta) — click to enlarge<br>
+        <span id="sample-ood" class="pill"></span></figcaption></figure>
+  </div>
+
+  <div id="xai-block" hidden>
+    <p class="meta-line"><strong>Competing input-saliency methods</strong> for this image, class-conditional on the
+      model's <strong>predicted</strong> class — patch-aggregated to the model's 16×16 grid, same percentile-clip
+      normalization. Compare against the LRP/CRP baseline on the left.</p>
+    <div id="xai-row"></div>
   </div>
   <p id="sample-note" class="meta-line" hidden></p>
 

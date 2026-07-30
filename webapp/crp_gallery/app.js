@@ -68,6 +68,10 @@ function onSampleChange() {
     else { heatFig.hidden = true; heat.removeAttribute("src"); }
     if (s.normmap) { norm.src = s.normmap; normLink.href = s.normmap; normFig.hidden = false; }
     else { normFig.hidden = true; norm.removeAttribute("src"); }
+    const oodBadge = $("sample-ood");
+    if (s.ood_tokens != null) { oodBadge.textContent = `OOD patch tokens: ${s.ood_tokens}`; oodBadge.hidden = false; }
+    else { oodBadge.textContent = ""; oodBadge.hidden = true; }
+    renderXai(s);
     figs.hidden = false;
     snote.textContent = "Local analysis: detectors ranked by relevance to THIS input. "
       + "Per figure, column 1 = the query input, columns 2.. = that detector's dataset "
@@ -77,6 +81,7 @@ function onSampleChange() {
   } else {
     figs.hidden = true; thumb.removeAttribute("src"); heat.removeAttribute("src");
     snote.hidden = true;
+    $("xai-block").hidden = true;
   }
   // Layers under this (instance, sample), ordered by block.
   const layers = s ? Object.keys(s.layers) : [];
@@ -86,6 +91,31 @@ function onSampleChange() {
     return `block ${L.block} · ${L.site}`;
   });
   onLayerChange();
+}
+
+const XAI_LABELS = { lrp: "LRP / CRP", chefer: "Chefer", rollout: "Rollout", occlusion: "Occlusion Δp⁺" };
+
+// Labelled competing-saliency row: input | LRP | Chefer | rollout | occlusion.
+function renderXai(s) {
+  const block = $("xai-block");
+  const row = $("xai-row");
+  row.innerHTML = "";
+  if (!s || !s.xai) { block.hidden = true; return; }
+  const order = (MANIFEST.xai_order || ["lrp", "chefer", "rollout", "occlusion"]).filter((m) => s.xai[m]);
+  if (!order.length) { block.hidden = true; return; }
+  const caps = MANIFEST.xai_captions || {};
+  const cell = (src, label, prov) => {
+    const fig = document.createElement("figure");
+    const img = document.createElement("img");
+    img.src = src; img.alt = label; img.loading = "lazy";
+    const cap = document.createElement("figcaption");
+    cap.innerHTML = `<span class="m">${label}</span>` + (prov ? `<span class="prov">${prov}</span>` : "");
+    fig.appendChild(img); fig.appendChild(cap);
+    return fig;
+  };
+  if (s.image) row.appendChild(cell(s.image, "input", "the query image"));
+  for (const m of order) row.appendChild(cell(s.xai[m], XAI_LABELS[m] || m, caps[m] || ""));
+  block.hidden = false;
 }
 
 function renderComposite(inst) {

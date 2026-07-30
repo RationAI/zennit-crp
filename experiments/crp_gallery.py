@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 import shutil
 from datetime import datetime, timezone
@@ -101,6 +102,31 @@ def load_model(base: str, dataset: str, *, model_source: str, checkpoint: Option
     * ``fresh`` source — ImageNet-pretrained backbone + (untrained) head from the
       registries, for inspecting raw pretrained features.
     """
+    if model_source == "dinov3_in1k":
+        # M4: DINOv3-B/16 backbone (img 256, num_classes=0) + the public canvit
+        # ImageNet-1k linear head on the final-norm CLS token, wrapped as ONE
+        # classifier module so CondAttribution / the gallery see a single model
+        # (mirrors experiments/scripts/residual_flow_diag.load_model_for_args).
+        import timm
+        import torch.nn as nn
+        from experiments.scripts.eval_dinov3_in1k_probe import HEAD_REPOS, load_in1k_linear_head
+        timm_name = "vit_base_patch16_dinov3.lvd1689m"
+
+        class _DinoV3CLSFullProbe(nn.Module):
+            """DINOv3 backbone features → final-norm CLS token → linear head."""
+            def __init__(self, backbone: nn.Module, head: nn.Module):
+                super().__init__()
+                self.backbone = backbone
+                self.head = head
+            def forward(self, x):
+                return self.head(self.backbone.forward_features(x)[:, 0])
+
+        backbone = timm.create_model(timm_name, pretrained=True, num_classes=0, img_size=256)
+        head = load_in1k_linear_head(timm_name, device)
+        model = _DinoV3CLSFullProbe(backbone, head).eval().to(device)
+        model.requires_grad_(False)
+        label = f"{base} · canvit_in1k_linear_cls · {dataset}"
+        return model, 1000, "canvit_in1k_linear_cls", label
     if model_source == "checkpoint":
         tag = DATASETS[dataset][2]
         model, ck, _ = load_probe(tag, device, base=base,
@@ -394,6 +420,140 @@ def save_sample_heat(attribution, x, target: int, *, composite, normalize, devic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Competing XAI saliency (Chefer / rollout / occlusion) next to LRP, per sample.
+# Model-level (composite-independent) → stored once at md level under _sample_xai/
+# <method>/<key>.png. All maps are class-conditional on the PREDICTED class and
+# patch-aggregated to the model's patch grid (see experiments.xai_methods).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_sample_xai(model, attribution, x, *, composite, normalize, device: str,
+                    out_root: Path, key: str) -> int:
+    """Render the competing input-saliency maps for one image next to the LRP
+    baseline: ``_sample_xai/{lrp,chefer,rollout,occlusion}/<key>.png``. Every map
+    is conditioned on the model's OWN predicted class (what it actually used).
+    Idempotent-friendly (always rewritten). Returns the predicted class."""
+    import experiments.xai_methods as xm
+    x = x.detach()
+    with torch.no_grad():
+        pred = int(model(normalize(x[None].to(device))).argmax(-1))
+    n_prefix, grid, patch = xm.model_geometry(model, x[None])
+    xn = normalize(x[None].to(device))
+    res = int(x.shape[-1])
+    maps = {"lrp": xm.lrp_patch(attribution, xn, pred, composite, grid=grid, patch=patch)}
+    _, attns = xm.capture_attention(model, xn)                 # detached (rollout)
+    maps["rollout"] = xm.attention_rollout(attns, n_prefix, grid)[0]
+    maps["chefer"] = xm.chefer_relevance(model, xn, [pred], n_prefix=n_prefix, grid=grid)[0]
+    maps["occlusion"] = xm.occlusion_deltap(model, normalize, x, pred, grid=grid, patch=patch)
+    for method, pm in maps.items():
+        xm.render_patch_map(pm, out_root / method / f"{key}.png", res=res)
+    return pred
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OOD (outlier) token maps: dual-site (proj_drop + residual) per-block token L2
+# norms with per-sample μ+4σ outlier flags, DINOv3-aware (patch stats exclude
+# cls+registers; register tokens shown distinctly). Renders _normmaps/<key>.png
+# and returns the OOD patch-token count (union over sites). Class-agnostic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _DualSiteNormRecorder:
+    """Forward hooks capturing per-token L2 norms at both concept sites for all
+    blocks in one pass: block output (residual stream) and ``attn.proj_drop``."""
+
+    def __init__(self, backbone):
+        self.norms: Dict[str, Dict[int, np.ndarray]] = {"residual": {}, "proj_drop": {}}
+        self.handles = []
+        for b, blk in enumerate(backbone.blocks):
+            def hook_res(mod, args, out, b=b):
+                self.norms["residual"][b] = out.detach().norm(dim=-1).float().cpu().numpy()
+            def hook_proj(mod, args, out, b=b):
+                self.norms["proj_drop"][b] = out.detach().norm(dim=-1).float().cpu().numpy()
+            self.handles.append(blk.register_forward_hook(hook_res))
+            self.handles.append(blk.attn.proj_drop.register_forward_hook(hook_proj))
+
+    def stack(self, site: str) -> np.ndarray:                  # (n_blocks, B, T)
+        d = self.norms[site]
+        return np.stack([d[b] for b in sorted(d)])
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+
+
+def save_sample_ood(model, x, *, normalize, device: str, out_path: Path,
+                    n_prefix: int, n_reg: int, k: float = 4.0) -> int:
+    """Dual-site token-norm map for one image + OOD flag overlay; returns the
+    number of OOD patch tokens (union over sites of tokens flagged at any block).
+
+    Patch statistics (μ+kσ) exclude the ``n_prefix`` prefix tokens (cls +
+    registers); register tokens (indices ``1..n_reg``) are drawn distinctly in a
+    small strip so the reader can tell them apart from spatial patches."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    rec = _DualSiteNormRecorder(model.backbone)
+    try:
+        with torch.no_grad():
+            model(normalize(x[None].to(device)))
+        norms = {s: rec.stack(s)[:, 0] for s in ("residual", "proj_drop")}  # (nblk, T)
+    finally:
+        rec.remove()
+
+    n_blk = norms["residual"].shape[0]
+    grid = int(round(math.sqrt(norms["residual"].shape[1] - n_prefix)))
+    site_desc = {"residual": "residual stream (block output)",
+                 "proj_drop": "attention output projection (proj_drop)"}
+    union = np.zeros(grid * grid, dtype=bool)
+    fig = plt.figure(figsize=(13.5, 10.2))
+    subfigs = fig.subfigures(2, 1, hspace=0.04)
+    for sf, site in zip(subfigs, ("residual", "proj_drop")):
+        sf.suptitle(site_desc[site], fontsize=11, fontweight="bold")
+        axes = sf.subplots(2, (n_blk + 1) // 2)
+        for b, ax in enumerate(axes.ravel()):
+            if b >= n_blk:
+                ax.axis("off"); continue
+            row = norms[site][b]
+            patch = row[n_prefix:n_prefix + grid * grid]
+            mu, sd = patch.mean(), patch.std()
+            flags = patch > mu + k * sd
+            union |= flags
+            v = patch.reshape(grid, grid)
+            vn = (v - v.min()) / (v.max() - v.min() + 1e-12)
+            ax.imshow(vn, cmap="viridis", vmin=0, vmax=1)
+            for r, c in zip(*np.nonzero(flags.reshape(grid, grid))):
+                ax.add_patch(mpatches.Rectangle((c - 0.5, r - 0.5), 1, 1, fill=False,
+                                                edgecolor="magenta", linewidth=1.6))
+            # Register tokens (DINOv3): distinct strip below the patch grid.
+            reg_note = ""
+            if n_reg > 0:
+                reg = row[1:1 + n_reg]
+                reg_out = int((reg > mu + k * sd).sum())
+                strip = ax.inset_axes([0.0, -0.20, 1.0, 0.12])
+                strip.imshow(reg[None] / (patch.max() + 1e-12), cmap="magma",
+                             vmin=0, vmax=1, aspect="auto")
+                for j in range(n_reg):
+                    strip.add_patch(mpatches.Rectangle((j - 0.5, -0.5), 1, 1, fill=False,
+                                                       edgecolor="cyan", linewidth=1.4))
+                strip.set_xticks([]); strip.set_yticks([])
+                strip.set_ylabel("reg", fontsize=6, rotation=0, labelpad=8, va="center")
+                reg_note = f" · reg×{reg_out}"
+            ax.set_title(f"block {b} · {int(flags.sum())} flagged{reg_note}", fontsize=8)
+            ax.set_xticks([]); ax.set_yticks([])
+    prefix_desc = "cls" + (f"+{n_reg} registers" if n_reg else "")
+    fig.suptitle(f"Per-block token L2 norms, normalized to [0,1] per block/site (viridis); "
+                 f"magenta = patch flagged (norm > mean + {k:g}·sd over this sample's "
+                 f"{grid * grid} patch tokens; {prefix_desc} excluded from the stats"
+                 + (". Cyan strip = register-token norms (magma)." if n_reg else "."),
+                 fontsize=10, y=1.045)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return int(union.sum())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Instance = (config, concept basis). SAE vs axis-aligned is an *instance*, not a
 # layer — so the layer dropdown lists each block exactly once per instance.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -601,12 +761,27 @@ def rebuild_manifest() -> dict:
             samples_dir = config_dir.parent / "_samples"
             sample_imgs = ({p.stem: str(p.relative_to(GALLERY_DIR)) for p in samples_dir.glob("*.png")}
                            if samples_dir.exists() else {})
-            # Per-sample per-block token-norm maps with flagged register outliers
-            # (md-level, composite-independent; produced by
-            # experiments/scripts/registers_position_freq.py).
+            # Per-sample dual-site (proj_drop+residual) token-norm maps with
+            # per-sample μ+4σ outlier flags (md-level, composite-independent;
+            # produced by generate_sample_extras / save_sample_ood).
             norm_dir = config_dir.parent / "_normmaps"
             sample_norms = ({p.stem: str(p.relative_to(GALLERY_DIR)) for p in norm_dir.glob("*.png")}
                             if norm_dir.exists() else {})
+            # Per-sample OOD patch-token counts (union over sites): _ood.json.
+            ood_path = config_dir.parent / "_ood.json"
+            ood_counts: Dict[str, dict] = {}
+            if ood_path.exists():
+                try:
+                    ood_counts = json.loads(ood_path.read_text())
+                except json.JSONDecodeError:
+                    ood_counts = {}
+            # Competing-XAI saliency maps per sample (md-level, composite-independent):
+            # _sample_xai/<method>/<key>.png → {key: {method: relpath}}.
+            xai_root = config_dir.parent / "_sample_xai"
+            sample_xai: Dict[str, Dict[str, str]] = {}
+            if xai_root.exists():
+                for p in xai_root.glob("*/*.png"):
+                    sample_xai.setdefault(p.stem, {})[p.parent.name] = str(p.relative_to(GALLERY_DIR))
             # Per-instance (concept_kind) sample relevance heatmaps: _sample_heat/<ck>/<key>.png
             heat_root = config_dir / "_sample_heat"
             sample_heats: Dict[str, Dict[str, str]] = {}
@@ -627,7 +802,10 @@ def rebuild_manifest() -> dict:
                     "label": meta.get("sample_label") or ("Aggregate" if sample == "aggregate" else sample),
                     "image": sample_imgs.get(sample),
                     "heat": sample_heats.get(ck, {}).get(sample),
-                    "normmap": sample_norms.get(sample), "layers": {}})
+                    "normmap": sample_norms.get(sample),
+                    "xai": sample_xai.get(sample),
+                    "ood_tokens": (ood_counts.get(sample) or {}).get("ood_tokens"),
+                    "layers": {}})
                 lrec = srec["layers"].setdefault(layer, {
                     "site": meta["site"], "block": meta["block"], "concept_kind": ck,
                     "entries": []})
@@ -639,10 +817,65 @@ def rebuild_manifest() -> dict:
                 for srec in inst["samples"].values():
                     for lrec in srec["layers"].values():
                         lrec["entries"].sort(key=lambda e: (e["rank"] is None, e["rank"]))
-    manifest = {"generated": _now(), "models": models}
+    from experiments.xai_methods import METHODS, METHOD_CAPTIONS
+    manifest = {"generated": _now(), "models": models,
+                "xai_order": list(METHODS), "xai_captions": METHOD_CAPTIONS}
     MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2))
     return manifest
+
+
+def _model_prefix_reg(model) -> Tuple[int, int]:
+    """``(n_prefix, n_reg)`` for a ViT backbone: ``n_prefix`` non-patch tokens
+    (1 cls + registers); ``n_reg`` register tokens (0 for a standard ViT, 4 for
+    DINOv3). Assumes exactly one cls token, which holds for M1–M4."""
+    n_prefix = int(getattr(model.backbone, "num_prefix_tokens", 1))
+    return n_prefix, max(n_prefix - 1, 0)
+
+
+def generate_sample_extras(model, attribution, ds, samples, *, composite, normalize,
+                           device: str, md_dir: Path, force: bool = False) -> None:
+    """Model-level per-sample sub-figures shared across every instance of a model:
+    the competing-XAI saliency row (``_sample_xai/<method>/<key>.png``: LRP,
+    Chefer, rollout, occlusion) and the dual-site OOD token-norm map
+    (``_normmaps/<key>.png``) plus the OOD patch-token count (``_ood.json``).
+
+    Idempotent: skips a sample whose outputs already exist unless ``force``.
+    Defensive — a failure here is logged but never aborts the core CRP build."""
+    if not samples:
+        return
+    from experiments.xai_methods import METHODS
+    n_prefix, n_reg = _model_prefix_reg(model)
+    xai_root, norm_dir, ood_path = md_dir / "_sample_xai", md_dir / "_normmaps", md_dir / "_ood.json"
+    ood: Dict[str, dict] = {}
+    if ood_path.exists():
+        try:
+            ood = json.loads(ood_path.read_text())
+        except json.JSONDecodeError:
+            ood = {}
+    for s in samples:
+        key = s["key"]
+        x = ds[s["ds_index"]][0]
+        xai_done = all((xai_root / m / f"{key}.png").exists() for m in METHODS)
+        ood_done = (norm_dir / f"{key}.png").exists() and key in ood
+        if not force and xai_done and ood_done:
+            continue
+        try:
+            if force or not xai_done:
+                pred = save_sample_xai(model, attribution, x, composite=composite,
+                                       normalize=normalize, device=device,
+                                       out_root=xai_root, key=key)
+                print(f"    xai[{key}] pred={pred}")
+            if force or not ood_done:
+                n_ood = save_sample_ood(model, x, normalize=normalize, device=device,
+                                        out_path=norm_dir / f"{key}.png",
+                                        n_prefix=n_prefix, n_reg=n_reg)
+                ood[key] = {"ood_tokens": int(n_ood)}
+                print(f"    ood[{key}] ood_tokens={n_ood}")
+        except Exception as e:                       # never break the build over an extra
+            print(f"    [warn] sample extras for {key!r} failed: {type(e).__name__}: {e}")
+    if ood:
+        ood_path.write_text(json.dumps(ood, indent=2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -702,8 +935,9 @@ def run_spec(spec: dict, device: str) -> None:
     # index — the local view needs representatives too.
     only_samples = bool(spec.get("only_samples", False))
     want_samples = bool(spec.get("samples", True))
+    only_extras = bool(spec.get("only_extras", False))
     need_fv = ((not only_samples) or rank_mode == "fv_index" or want_samples) \
-        and not spec.get("only_heat", False)
+        and not spec.get("only_heat", False) and not only_extras
     fv = None
     if need_fv:
         # Build on scratch, mirror to the persistent root. Refill scratch from the
@@ -724,7 +958,7 @@ def run_spec(spec: dict, device: str) -> None:
     # Correctly-classified sample for class-conditional ranking.
     target_classes = sorted(set(classes) & set(range(num_classes))) if classes else list(range(num_classes))
     sel = select_correct(model, ds, target_classes, n_rank, device, normalize=normalize) \
-        if rank_mode == "class_conditional" else {}
+        if rank_mode == "class_conditional" and not only_extras else {}
 
     config_dir = FIG_DIR / md / config
     config_dir.mkdir(parents=True, exist_ok=True)
@@ -746,6 +980,18 @@ def run_spec(spec: dict, device: str) -> None:
               f"{[s['key'] for s in samples]}")
     if spec.get("only_heat"):
         return   # sample relevance heatmaps only — skip FV + entry rendering
+
+    # Model-level competing-XAI saliency row + dual-site OOD token-norm maps,
+    # shared across every instance of this model (composite-independent). Written
+    # once at md level; idempotent for normal jobs, force-refreshed by sample-xai.
+    try:
+        generate_sample_extras(model, attribution, ds, samples, composite=cfg.composite(),
+                               normalize=normalize, device=device, md_dir=config_dir.parent,
+                               force=only_extras)
+    except Exception as e:                       # extras must never block the CRP render
+        print(f"[{md}/{config}] [warn] sample-extras step failed: {type(e).__name__}: {e}")
+    if only_extras:
+        return   # extras backfill only — skip FV + entry rendering
 
     for b, layer in layers:
         scores = rank_scores(rank_mode, attribution=attribution, ds=ds, sel=sel, layer=layer,
@@ -910,6 +1156,40 @@ def sample_heat(
     print(f"sample-heat backfill for {len(sel)}/{len(jobs)} job(s)")
     for j in sel:
         run_spec({**j, "only_heat": True, "samples": True}, device)
+    rebuild_manifest()
+    print(f"done · manifest → {MANIFEST_PATH}")
+
+
+@app.command("sample-xai")
+def sample_xai(
+    dataset: Optional[str] = typer.Option(None, "--dataset", help="filter jobs by dataset"),
+    config: Optional[str] = typer.Option(None, "--config", help="filter jobs by config"),
+    base: Optional[str] = typer.Option(None, "--base", help="filter jobs by base"),
+    device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", "--device"),
+):
+    """(Re)generate the model-level per-sample extras — competing-XAI saliency row
+    (LRP · Chefer · rollout · occlusion) and dual-site OOD token-norm maps + counts
+    — for EXISTING tracked jobs. Deduped per model (base,dataset): these figures are
+    composite-independent, so they are computed once per model, not per instance."""
+    if not JOBS_PATH.exists():
+        print("no jobs.jsonl — nothing to do")
+        return
+    jobs = [json.loads(l) for l in JOBS_PATH.read_text().splitlines() if l.strip()]
+    sel = [j for j in jobs
+           if (dataset is None or j["dataset"] == dataset)
+           and (config is None or j["config"] == config)
+           and (base is None or j["base"] == base)]
+    seen = set()
+    uniq = []
+    for j in sel:                                    # one job per model (extras are md-level)
+        key = (j["base"], j["dataset"], j.get("model_source"), j.get("checkpoint"))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(j)
+    print(f"sample-xai backfill for {len(uniq)} model(s) (from {len(sel)}/{len(jobs)} job(s))")
+    for j in uniq:                                   # embed_dim/proj_drop: no SAE splice, no FV
+        run_spec({**j, "concept": "embed_dim", "sae_m": 0, "site": "proj_drop",
+                  "only_extras": True, "samples": True}, device)
     rebuild_manifest()
     print(f"done · manifest → {MANIFEST_PATH}")
 
