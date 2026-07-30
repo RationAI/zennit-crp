@@ -1,33 +1,33 @@
-"""Static (matplotlib) journal figures for the residual skip-vs-branch LRP flow.
+"""Static (matplotlib) journal figures for the residual skip-vs-branch flow.
 
-Reads the npz written by ``experiments/scripts/residual_flow_diag.py compute``
-(per residual site x sample x embedding dim absolute/signed relevance for the
-branch and skip paths) and renders two publication PDFs/PNGs:
+Reads npz files written by ``experiments/scripts/residual_flow_diag.py
+compute`` (per residual site x sample x embedding dim absolute/signed
+relevance for the branch and skip paths) and renders publication figures:
 
-1. ``branch_fraction_by_dim`` — 24-row heatmap: rows = residual sites in
-   network order (blk b attn / blk b mlp), x = embedding dim index (0..383),
-   color = mean over samples of the branch fraction
-   f = |R_branch| / (|R_branch| + |R_skip|), diverging around 0.5.
-2. ``site_summary`` — per site, the distribution over dims of the per-dim
-   median f (median over samples; box = IQR, whiskers = 5-95%), overlaid with
-   the site's mass-weighted total branch share
-   F = sum_d |R_branch| / (sum_d |R_branch| + sum_d |R_skip|), averaged over
-   samples.
+* per model — every row/slot comes from the site list stored in that model's
+  own npz, so each figure shows exactly the layers the model has:
+  1. ``<stem>branch_fraction_by_dim`` — heatmap of the sample-mean branch
+     fraction f = |R_branch| / (|R_branch| + |R_skip|) per site x dim,
+     diverging around 0.5;
+  2. ``<stem>site_summary`` — per-site distribution over dims of the per-dim
+     median f (IQR box, 5–95% whiskers), overlaid with the mass-weighted
+     total branch share;
+* ``--compare LABEL=NPZ ...`` — ``rf_compare_models``: the total branch share
+  per site, one line per model, on the residual sites ALL compared models
+  share — a model's line never lands on a slot for a layer it does not have.
 
-Usage (idempotent, CPU only):
+Usage (idempotent, CPU only)::
+
     python -m experiments.scripts.residual_flow_static_figures \
         [--npz PATH] [--out-dir figures/residual_flow] [--stem-prefix TAG_]
-
-Cross-model comparison (mass-weighted total branch share per site, one line
-per model):
     python -m experiments.scripts.residual_flow_static_figures \
-        --compare "M1 label=path1.npz" "M2 label=path2.npz" ... \
-        [--out-dir figures/residual_flow]
+        --compare "M1 label=path1.npz" "M2 label=path2.npz" ...
 """
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Dict, List, NamedTuple, Tuple
 
 import matplotlib
 
@@ -37,12 +37,82 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_NPZ = (REPO / "data/results/residual_flow/"
-               "residual_flow_vit_small_funny_birds_cp_lrp_baseline.npz")
+               "residual_flow_m1_vit_small_fb_cp_lrp_baseline.npz")
 DEFAULT_OUT = REPO / "figures/residual_flow"
 
 # Diverging: blue = skip-dominated (f<0.5), red = branch-dominated (f>0.5),
-# neutral light gray-white at the 0.5 midpoint.
+# neutral at the 0.5 midpoint.
 CMAP = "RdBu_r"
+# Validated categorical order (dataviz reference palette, light mode,
+# adjacent-pairlist CVD-safe): blue, green, magenta, yellow.
+COMPARE_COLORS = ["#2a78d6", "#008300", "#e87ba4", "#eda100"]
+COMPARE_MARKERS = ["o", "s", "^", "D"]
+
+SiteKey = Tuple[int, str]  # (block, "attn" | "mlp")
+
+
+def site_label(key: SiteKey) -> str:
+    return f"blk {key[0]} {key[1]}"
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — per-model statistics, always keyed by the model's own site list
+# ---------------------------------------------------------------------------
+
+class SiteStats(NamedTuple):
+    """Per-site branch-fraction summaries of ONE model (npz site order)."""
+    keys: List[SiteKey]      # this model's residual sites, in network order
+    mean_f: np.ndarray       # (n_sites, n_dims) sample-mean of f
+    median_f: np.ndarray     # (n_sites, n_dims) sample-median of f
+    total_share: np.ndarray  # (n_sites,) mass-weighted branch share
+
+    @property
+    def labels(self) -> List[str]:
+        return [site_label(k) for k in self.keys]
+
+
+def branch_fraction(z) -> np.ndarray:
+    """f = |R_branch| / (|R_branch| + |R_skip|) per site x sample x dim."""
+    branch, skip = z["branch_abs"], z["skip_abs"]
+    return branch / (branch + skip + 1e-12)
+
+
+def total_branch_share(z) -> np.ndarray:
+    """Per-site mass-weighted share F = sum|R_branch| / (sum|R_branch| +
+    sum|R_skip|) over dims, averaged over samples."""
+    branch, skip = z["branch_abs"], z["skip_abs"]
+    return (branch.sum(2) / (branch.sum(2) + skip.sum(2) + 1e-12)).mean(1)
+
+
+def site_keys(z) -> List[SiteKey]:
+    """The model's residual sites, straight from its npz."""
+    return [(int(b), str(k)) for b, k in zip(z["site_block"], z["site_kind"])]
+
+
+def load_site_stats(npz: Path) -> SiteStats:
+    z = np.load(npz, allow_pickle=False)
+    f = branch_fraction(z)
+    return SiteStats(site_keys(z), f.mean(axis=1), np.median(f, axis=1),
+                     total_branch_share(z))
+
+
+def load_branch_share_by_site(npz: Path) -> Dict[SiteKey, float]:
+    """{(block, kind): mass-weighted total branch share} for one model."""
+    z = np.load(npz, allow_pickle=False)
+    share = total_branch_share(z)
+    return {key: float(share[i]) for i, key in enumerate(site_keys(z))}
+
+
+# ---------------------------------------------------------------------------
+# Step 2 — figure plumbing
+# ---------------------------------------------------------------------------
+
+def _journal_style() -> None:
+    plt.rcParams.update({
+        "font.size": 9, "axes.labelsize": 9, "xtick.labelsize": 8,
+        "ytick.labelsize": 8, "legend.fontsize": 8,
+        "axes.spines.top": False, "axes.spines.right": False,
+    })
 
 
 def _save(fig, out_dir: Path, stem: str) -> None:
@@ -53,43 +123,115 @@ def _save(fig, out_dir: Path, stem: str) -> None:
     print(f"wrote {out_dir}/{stem}.{{pdf,png}}")
 
 
-# Validated categorical order (dataviz reference palette, light mode,
-# adjacent-pairlist CVD-safe): blue, green, magenta, yellow.
-COMPARE_COLORS = ["#2a78d6", "#008300", "#e87ba4", "#eda100"]
-COMPARE_MARKERS = ["o", "s", "^", "D"]
+def _label_site_axis_rows(ax, stats: SiteStats) -> None:
+    """One y-tick per residual site of this model."""
+    ax.set_yticks(np.arange(len(stats.keys)))
+    ax.set_yticklabels(stats.labels)
 
 
-def _mass_share_and_labels(npz: Path):
-    z = np.load(npz, allow_pickle=False)
-    ba, sa = z["branch_abs"], z["skip_abs"]
-    tot_share = (ba.sum(axis=2)
-                 / (ba.sum(axis=2) + sa.sum(axis=2) + 1e-12)).mean(axis=1)
-    labels = [f"blk {b} {k}" for b, k in zip(z["site_block"], z["site_kind"])]
-    return tot_share, labels
+def _draw_block_separators(ax, stats: SiteStats) -> None:
+    """Light white separator wherever the block index increments."""
+    blocks = [k[0] for k in stats.keys]
+    for i in range(1, len(blocks)):
+        if blocks[i] != blocks[i - 1]:
+            ax.axhline(i - 0.5, color="white", lw=0.5, alpha=0.6)
 
 
-def compare(pairs: list[str], out_dir: Path) -> None:
-    """``pairs`` = ["<label>=<npz path>", ...] → one line per model of the
-    per-site mass-weighted total branch share."""
-    plt.rcParams.update({
-        "font.size": 9, "axes.labelsize": 9, "xtick.labelsize": 8,
-        "ytick.labelsize": 8, "legend.fontsize": 8,
-        "axes.spines.top": False, "axes.spines.right": False,
-    })
+# ---------------------------------------------------------------------------
+# Step 3 — the per-model figures
+# ---------------------------------------------------------------------------
+
+def plot_branch_fraction_by_dim(stats: SiteStats, out_dir: Path,
+                                stem: str) -> None:
+    """Heatmap: one row per residual site of this model, x = embedding dim."""
+    n_dim = stats.mean_f.shape[1]
+    fig, ax = plt.subplots(figsize=(6.8, 4.6))
+    im = ax.imshow(stats.mean_f, aspect="auto", cmap=CMAP, vmin=0.0, vmax=1.0,
+                   interpolation="nearest")
+    _label_site_axis_rows(ax, stats)
+    ax.set_xlabel("embedding dimension index")
+    ax.set_xticks(list(np.arange(0, n_dim - 1, 64)) + [n_dim - 1])
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(True)
+    _draw_block_separators(ax, stats)
+    cb = fig.colorbar(im, ax=ax, pad=0.015, fraction=0.04)
+    cb.set_label(r"mean branch fraction  $f=\frac{|R_\mathrm{branch}|}"
+                 r"{|R_\mathrm{branch}|+|R_\mathrm{skip}|}$", fontsize=9)
+    cb.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
+    _save(fig, out_dir, f"{stem}branch_fraction_by_dim")
+
+
+def plot_site_summary(stats: SiteStats, out_dir: Path, stem: str) -> None:
+    """Per site: distribution over dims of the per-dim median f (IQR box,
+    5–95% whiskers) + the mass-weighted total branch share."""
+    n_sites = len(stats.keys)
     fig, ax = plt.subplots(figsize=(6.8, 3.4))
-    labels_ref = None
-    for i, pair in enumerate(pairs):
-        label, _, path = pair.partition("=")
-        share, labels = _mass_share_and_labels(Path(path))
-        if labels_ref is None:
-            labels_ref = labels
-        assert len(labels) == len(labels_ref), (label, len(labels))
-        x = np.arange(len(share))
-        ax.plot(x, share, color=COMPARE_COLORS[i], lw=1.6, zorder=3,
+    x = np.arange(n_sites)
+    bp = ax.boxplot(
+        [stats.median_f[i] for i in range(n_sites)], positions=x, widths=0.62,
+        whis=(5, 95), showfliers=False, patch_artist=True, zorder=2,
+        medianprops=dict(color="#1f2430", lw=1.4),
+        boxprops=dict(facecolor="#aec7e0", edgecolor="#4d6a86", lw=0.8),
+        whiskerprops=dict(color="#4d6a86", lw=0.9),
+        capprops=dict(color="#4d6a86", lw=0.9),
+    )
+    ax.plot(x, stats.total_share, color="#c4442a", lw=1.4, marker="o", ms=4.5,
+            zorder=3, label="total branch share (mass-weighted)")
+    ax.axhline(0.5, color="0.55", lw=0.8, ls=(0, (4, 3)), zorder=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels(stats.labels, rotation=90)
+    ax.set_ylabel("branch fraction")
+    ax.set_ylim(0, 1)
+    ax.yaxis.grid(True, color="0.9", lw=0.7)
+    ax.set_axisbelow(True)
+    handles, lab = ax.get_legend_handles_labels()
+    handles.append(bp["boxes"][0])
+    lab.append("per-dim median $f$ (IQR box, 5–95% whiskers)")
+    ax.legend(handles, lab, loc="upper left", frameon=False)
+    _save(fig, out_dir, f"{stem}site_summary")
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — cross-model comparison on the shared sites only
+# ---------------------------------------------------------------------------
+
+def shared_site_keys(models: List[Tuple[str, Dict[SiteKey, float]]]
+                     ) -> List[SiteKey]:
+    """Sites present in EVERY compared model, in the first model's site order.
+
+    The comparison axis gets one slot per shared site — never a slot for a
+    layer some evaluated model does not have. Sites a model has outside the
+    shared set are reported, not plotted under another model's name.
+    """
+    shared = [k for k in models[0][1] if all(k in m for _, m in models[1:])]
+    for name, per_site in models:
+        dropped = [site_label(k) for k in per_site if k not in shared]
+        if dropped:
+            print(f"  {name}: {len(dropped)} site(s) not shared by all "
+                  f"models, excluded from comparison: {dropped}")
+    if not shared:
+        raise RuntimeError("the compared models share no residual sites")
+    return shared
+
+
+def compare(pairs: List[str], out_dir: Path) -> None:
+    """Per-site mass-weighted total branch share, one line per model, on the
+    residual sites all compared models share."""
+    models = [(pair.partition("=")[0],
+               load_branch_share_by_site(Path(pair.partition("=")[2])))
+              for pair in pairs]
+    shared = shared_site_keys(models)
+
+    _journal_style()
+    fig, ax = plt.subplots(figsize=(6.8, 3.4))
+    x = np.arange(len(shared))
+    for i, (label, per_site) in enumerate(models):
+        ax.plot(x, [per_site[k] for k in shared],
+                color=COMPARE_COLORS[i], lw=1.6, zorder=3,
                 marker=COMPARE_MARKERS[i], ms=4, label=label)
     ax.axhline(0.5, color="0.55", lw=0.8, ls=(0, (4, 3)), zorder=1)
-    ax.set_xticks(np.arange(len(labels_ref)))
-    ax.set_xticklabels(labels_ref, rotation=90)
+    ax.set_xticks(x)
+    ax.set_xticklabels([site_label(k) for k in shared], rotation=90)
     ax.set_ylabel("total branch share (mass-weighted)")
     ax.set_ylim(0, 1)
     ax.yaxis.grid(True, color="0.9", lw=0.7)
@@ -97,6 +239,10 @@ def compare(pairs: list[str], out_dir: Path) -> None:
     ax.legend(loc="upper left", frameon=False, ncols=2)
     _save(fig, out_dir, "rf_compare_models")
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -107,77 +253,18 @@ def main() -> None:
     ap.add_argument("--compare", nargs="+", default=None,
                     metavar="LABEL=NPZ",
                     help="cross-model mode: per-site mass-weighted branch "
-                         "share, one line per model → rf_compare_models")
+                         "share, one line per model -> rf_compare_models")
     args = ap.parse_args()
 
     if args.compare:
         compare(args.compare, args.out_dir)
         return
 
-    z = np.load(args.npz, allow_pickle=False)
-    ba, sa = z["branch_abs"], z["skip_abs"]          # (24, S, 384)
-    site_block, site_kind = z["site_block"], z["site_kind"]
-    n_sites, n_samples, n_dim = ba.shape
-    labels = [f"blk {b} {k}" for b, k in zip(site_block, site_kind)]
-
-    f = ba / (ba + sa + 1e-12)                       # (24, S, D)
-    mean_f = f.mean(axis=1)                          # (24, D)
-    med_f = np.median(f, axis=1)                     # (24, D) per-dim median over samples
-    tot_share = (ba.sum(axis=2)
-                 / (ba.sum(axis=2) + sa.sum(axis=2) + 1e-12)).mean(axis=1)  # (24,)
-
-    plt.rcParams.update({
-        "font.size": 9, "axes.labelsize": 9, "xtick.labelsize": 8,
-        "ytick.labelsize": 8, "legend.fontsize": 8,
-        "axes.spines.top": False, "axes.spines.right": False,
-    })
-
-    # ---- Figure 1: per-dim mean branch fraction heatmap ----------------
-    fig, ax = plt.subplots(figsize=(6.8, 4.6))
-    im = ax.imshow(mean_f, aspect="auto", cmap=CMAP, vmin=0.0, vmax=1.0,
-                   interpolation="nearest")
-    ax.set_yticks(np.arange(n_sites))
-    ax.set_yticklabels(labels)
-    ax.set_xlabel("embedding dimension index")
-    ax.set_xticks(list(np.arange(0, n_dim - 1, 64)) + [n_dim - 1])
-    for sp in ("top", "right"):
-        ax.spines[sp].set_visible(True)
-    # light separators between blocks (every 2 rows = attn+mlp)
-    for y in np.arange(1.5, n_sites - 1, 2):
-        ax.axhline(y, color="white", lw=0.5, alpha=0.6)
-    cb = fig.colorbar(im, ax=ax, pad=0.015, fraction=0.04)
-    cb.set_label(r"mean branch fraction  $f=\frac{|R_\mathrm{branch}|}"
-                 r"{|R_\mathrm{branch}|+|R_\mathrm{skip}|}$", fontsize=9)
-    cb.set_ticks([0, 0.25, 0.5, 0.75, 1.0])
-    _save(fig, args.out_dir, f"{args.stem_prefix}branch_fraction_by_dim")
-
-    # ---- Figure 2: per-site distribution + mass-weighted total ---------
-    fig, ax = plt.subplots(figsize=(6.8, 3.4))
-    x = np.arange(n_sites)
-    bp = ax.boxplot(
-        [med_f[i] for i in range(n_sites)], positions=x, widths=0.62,
-        whis=(5, 95), showfliers=False, patch_artist=True, zorder=2,
-        medianprops=dict(color="#1f2430", lw=1.4),
-        boxprops=dict(facecolor="#aec7e0", edgecolor="#4d6a86", lw=0.8),
-        whiskerprops=dict(color="#4d6a86", lw=0.9),
-        capprops=dict(color="#4d6a86", lw=0.9),
-    )
-    ax.plot(x, tot_share, color="#c4442a", lw=1.4, marker="o", ms=4.5,
-            zorder=3, label="total branch share (mass-weighted)")
-    ax.axhline(0.5, color="0.55", lw=0.8, ls=(0, (4, 3)), zorder=1)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=90)
-    ax.set_ylabel("branch fraction")
-    ax.set_ylim(0, 1)
-    ax.yaxis.grid(True, color="0.9", lw=0.7)
-    ax.set_axisbelow(True)
-    handles, lab = ax.get_legend_handles_labels()
-    handles.append(bp["boxes"][0])
-    lab.append("per-dim median $f$ (IQR box, 5–95% whiskers)")
-    ax.legend(handles, lab, loc="upper left", frameon=False)
-    _save(fig, args.out_dir, f"{args.stem_prefix}site_summary")
-
-    print(f"n_sites={n_sites} n_samples={n_samples} n_dim={n_dim}")
+    stats = load_site_stats(args.npz)
+    _journal_style()
+    plot_branch_fraction_by_dim(stats, args.out_dir, args.stem_prefix)
+    plot_site_summary(stats, args.out_dir, args.stem_prefix)
+    print(f"n_sites={len(stats.keys)} n_dims={stats.mean_f.shape[1]}")
 
 
 if __name__ == "__main__":
