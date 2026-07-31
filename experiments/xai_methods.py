@@ -62,6 +62,16 @@ def to_patch_grid(pixel_map: torch.Tensor, grid: int, patch: int) -> torch.Tenso
     return pm
 
 
+def to_patch_max(pixel_map: torch.Tensor, grid: int, patch: int) -> torch.Tensor:
+    """``(H, W)`` pixel saliency → ``(grid, grid)`` **max** over each patch.
+
+    The MAX patch-aggregation the Insertion-Deletion benchmark mandates (a patch
+    is as salient as its single most-salient pixel). Values are kept **signed**
+    (no ``abs``): for LRP a patch whose every pixel is negatively-relevant is
+    correctly ranked least-salient, so the descending sort places it last."""
+    return pixel_map.reshape(grid, patch, grid, patch).amax(dim=(1, 3))
+
+
 def saliency_flags(patch_map: np.ndarray, k: float = SD_K) -> np.ndarray:
     """Boolean hot-patch mask: ``value > mean + k·sd`` over the map's own patches
     (the per-sample μ+kσ rule reused across every method / OOD detection)."""
@@ -132,12 +142,20 @@ def attention_rollout(attns: List[torch.Tensor], n_prefix: int, grid: int,
 
 def chefer_relevance(model, xn: torch.Tensor, targets: List[int], *,
                      n_prefix: int, grid: int) -> torch.Tensor:
-    """Chefer/Gur/Wolf (CVPR'21) grad-weighted attention rollout → ``(B, grid,
-    grid)``, class-conditional on ``targets``.
+    """Grad-weighted attention rollout → ``(B, grid, grid)``, class-conditional
+    on ``targets``.
 
     Per block: ``cam = mean_heads((∂logit_t/∂A ⊙ A)⁺)``, ``Ā = I + cam``
     row-normalised, chained by matmul; read the CLS row over patches. The target
-    logit is summed over the batch so one backward yields every block's grad."""
+    logit is summed over the batch so one backward yields every block's grad.
+
+    NOTE (method provenance): this weights the attention *gradient* by the **raw
+    post-softmax attention** ``A`` — i.e. Chefer/Gur/Wolf **ICCV'21** "Generic
+    Attention-model Explainability" self-attention rule, *not* the **CVPR'21**
+    "Transformer Attribution" of \\cite{chefer2021transformer}, which weights the
+    gradient by the **LRP relevance** of the attention map (``get_attn_cam`` in
+    baselines/ViT/ViT_LRP.py). For the CVPR'21 method used by the benchmark, see
+    :func:`chefer_transformer_attribution`."""
     # The backbone params are frozen, so the autograd graph exists only if the
     # INPUT requires grad — set it here (mirrors the register-study scripts).
     xn = xn.detach().clone().requires_grad_(True)
@@ -155,6 +173,116 @@ def chefer_relevance(model, xn: torch.Tensor, targets: List[int], *,
         ab = ab / ab.sum(dim=-1, keepdim=True)
         r = ab if r is None else ab @ r
     return _cls_row_to_grid(r[:, 0], n_prefix, grid)
+
+
+def softmax_layer_names(model) -> List[str]:
+    """Per-block attention-softmax layer names as exposed by the unfolded
+    attention (:class:`zennit_ext.attention_unfolded.TimmAttentionUnfolded` /
+    ``EvaAttentionUnfolded``): ``backbone.blocks.{b}.attn.softmax``. These exist
+    only *inside* an attribution's canonized context — pass them as ``record_layer``
+    to capture the post-softmax attention relevance ``R_A`` (Chefer's
+    ``get_attn_cam``)."""
+    return [f"backbone.blocks.{b}.attn.softmax"
+            for b in range(len(model.backbone.blocks))]
+
+
+def chefer_transformer_attribution(model, attribution, composite, xn: torch.Tensor,
+                                   target: int, *, n_prefix: int, grid: int,
+                                   softmax_layers: List[str]) -> torch.Tensor:
+    """Chefer/Gur/Wolf **CVPR'21** "Transformer Attribution"
+    (\\cite{chefer2021transformer}) → ``(1, grid, grid)``, class-conditional on
+    ``target``. Faithful reproduction of ``generate_LRP(method=
+    "transformer_attribution")`` in the authors' repo
+    (https://github.com/hila-chefer/Transformer-Explainability,
+    baselines/ViT/ViT_LRP.py). One image at a time.
+
+    The original algorithm (verbatim structure)::
+
+        for blk in blocks:
+            grad = blk.attn.get_attn_gradients()   # ∂logit_t/∂A  (clean autograd)
+            cam  = blk.attn.get_attn_cam()         # LRP relevance R_A of the attn map
+            cam  = (grad * cam).clamp(min=0).mean(dim=0 over heads)
+        rollout = compute_rollout_attention(cams)  # ∏ row-norm(I + cam)
+        return rollout[:, 0, 1:]                    # CLS→patch row
+
+    We supply the two ingredients without vendoring the authors' bespoke
+    LRP-instrumented ViT (spec: do **not** vendor the whole repo):
+
+    * ``grad`` — the *clean* autograd gradient of the target logit w.r.t. each
+      block's post-softmax attention, from :func:`capture_attention`
+      (``keep_graph=True``) + one ``autograd.grad`` (identical to
+      ``get_attn_gradients``).
+    * ``cam`` — the attention-map **LRP relevance** ``R_A``, recorded at each
+      block's ``attn.softmax`` under our AttnLRP composite (``composite`` must be
+      the full-bilinear recipe, e.g. ``attnlrp_gamma``; the value-path-only
+      ``cp_lrp_baseline`` StopGradients Q/K, leaving the softmax a graph constant
+      with ``R_A ≡ 0``). This is the faithful analogue of the authors'
+      ``get_attn_cam`` — LRP relevance of the attention softmax — computed with
+      our LRP framework instead of theirs.
+
+    Both tensors are ``(1, heads, T, T)`` in the identical timm head layout
+    (same qkv/reshape convention), so the elementwise ``grad ⊙ cam`` and the
+    mean-over-heads are head-aligned. Rollout, row-normalisation and the CLS→patch
+    read reproduce ``compute_rollout_attention`` exactly."""
+    if xn.shape[0] != 1:
+        raise ValueError("chefer_transformer_attribution runs one image at a time")
+    # (1) clean autograd gradient of the target logit w.r.t. each block's attn.
+    xg = xn.detach().clone().requires_grad_(True)
+    logits, attns = capture_attention(model, xg, keep_graph=True)   # attns[b] (1,h,T,T)
+    logit = logits[0, int(target)]
+    grads = torch.autograd.grad(logit, attns)                       # tuple of (1,h,T,T)
+    # (2) attention-map LRP relevance R_A at each softmax (AttnLRP composite).
+    xa = xn.detach().clone().requires_grad_(True)
+    res = attribution(xa, [{"y": [int(target)]}], composite, record_layer=list(softmax_layers))
+    n_tok = attns[0].shape[-1]
+    eye = torch.eye(n_tok, device=xn.device).unsqueeze(0)
+    r = None
+    for b, ln in enumerate(softmax_layers):
+        g = grads[b]                                                # (1,h,T,T)
+        cam = res.relevances[ln]                                    # (1,h,T,T)  R_A
+        c = (g * cam).clamp(min=0).mean(dim=1)                      # (1,T,T)
+        ab = eye + c
+        ab = ab / ab.sum(dim=-1, keepdim=True)
+        r = ab if r is None else ab @ r
+    return _cls_row_to_grid(r[:, 0], n_prefix, grid)
+
+
+def rise_saliency(model, normalize, x: torch.Tensor, target: int, *, input_size: int,
+                  n_masks: int = 2000, s: int = 8, p: float = 0.5, batch: int = 128,
+                  seed: int = 0) -> torch.Tensor:
+    """RISE (Petsiuk, Das, Saenko, BMVC'18 — https://github.com/eclique/RISE) →
+    ``(H, W)`` pixel saliency for ``target``.
+
+    Faithful to the authors' ``generate_masks`` / ``explain``: ``n_masks`` binary
+    ``s×s`` grids ``~Bernoulli(p)``, bilinearly upsampled to ``(s+1)·cell`` with
+    ``cell = ceil(H/s)``, then randomly cropped back to ``H×H`` (random shift in
+    ``[0,cell)``). Saliency ``= (1/(N·p)) Σ_i f_target(x ⊙ mask_i) · mask_i`` with
+    ``f`` the softmax probability. Masking is RISE's own zero-fill (``x ⊙ mask``),
+    which is *not* the benchmark's single-patch mean-fill occlusion — RISE
+    estimates each pixel's expected contribution over many random multi-patch
+    subsets, whereas :func:`occlusion_deltap` measures one patch's marginal
+    leave-one-in drop. ``x`` is a single un-normalised ``(3,H,W)`` image in [0,1]."""
+    import torch.nn.functional as F
+    device = next(model.parameters()).device
+    x = x.to(device)
+    g = torch.Generator().manual_seed(seed)                         # CPU generator
+    cell = int(math.ceil(input_size / s))
+    up = (s + 1) * cell
+    grid = (torch.rand(n_masks, 1, s, s, generator=g) < p).float()
+    big = F.interpolate(grid, size=(up, up), mode="bilinear", align_corners=False)
+    masks = torch.empty(n_masks, 1, input_size, input_size)
+    shifts = torch.randint(0, cell, (n_masks, 2), generator=g)
+    for i in range(n_masks):
+        ox, oy = int(shifts[i, 0]), int(shifts[i, 1])
+        masks[i] = big[i, :, ox:ox + input_size, oy:oy + input_size]
+    masks = masks.to(device)
+    sal = torch.zeros(input_size, input_size, device=device)
+    with torch.no_grad():
+        for s0 in range(0, n_masks, batch):
+            m = masks[s0:s0 + batch]                                # (b,1,H,W)
+            probs = model(normalize(m * x[None])).softmax(-1)[:, int(target)]
+            sal += (probs[:, None, None] * m[:, 0]).sum(0)
+    return (sal / (n_masks * p)).cpu()
 
 
 def occlusion_deltap(model, normalize, x: torch.Tensor, target: int, *,
@@ -239,7 +367,8 @@ METHODS: Tuple[str, ...] = ("lrp", "chefer", "rollout", "occlusion")
 
 __all__ = [
     "SD_K", "METHODS", "METHOD_CAPTIONS",
-    "model_geometry", "to_patch_grid", "saliency_flags", "capture_attention",
-    "attention_rollout", "chefer_relevance", "occlusion_deltap", "lrp_patch",
-    "render_patch_map",
+    "model_geometry", "to_patch_grid", "to_patch_max", "saliency_flags",
+    "capture_attention", "attention_rollout", "chefer_relevance",
+    "chefer_transformer_attribution", "softmax_layer_names", "rise_saliency",
+    "occlusion_deltap", "lrp_patch", "render_patch_map",
 ]
