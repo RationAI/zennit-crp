@@ -11,22 +11,20 @@ model's non-overlapping ``patch×patch`` grid (aligned to the patch-embedding),
 aggregate the pixel saliency to one score per patch by **MAX**, and sort patches
 by descending score ``S_0 ≥ S_1 ≥ … ≥ S_{N-1}``. ``M(·)`` is the
 **predicted-class softmax probability**. We occlude patches by **image-mean fill**
-and build two prediction curves, each normalised by dividing by ``M(x)`` (so both
-start at ``1.0``):
+and build two prediction curves in **predicted-class probability**:
 
 * **MoRF** — occlude most-salient-first (``{p_0..p_{k-1}}`` at step ``k``); a
   faithful map makes this drop fastest → smallest area.
 * **LeRF** — occlude least-salient-first; drops slowest → largest area.
 
 Each stored curve has length ``N+1`` (step ``k = 0..N`` = #patches occluded;
-index 0 = clean = 1.0; index ``N`` = all-occluded, identical for MoRF & LeRF).
+index 0 = clean prediction ``M(x)``; index ``N`` = all-occluded, identical for MoRF & LeRF).
 
     DAPC(ψ, M, x) = area_under(LeRF curve) − area_under(MoRF curve)      (≥0 good)
 
 with area = trapezoid over occlusion-fraction ``∈[0,1]`` (``np.trapz(curve,
-dx=1/N)``). Higher = better. This equals the journal's ``LeRF − MoRF`` of the
-mean *drops* exactly (drop = 1 − normalised prediction). RAW curves are stored so
-any AOPC/AUC/sign variant is recomputable offline without rerunning.
+dx=1/N)``). Higher = better. Raw probability curves are stored so any AOPC/AUC/sign variant is recomputable
+offline without rerunning.
 
 METHODS (Benchmark run 1)
 -------------------------
@@ -198,11 +196,11 @@ def saliency_patch(method: str, *, model, normalize, attribution, lrp_comp, chef
     raise ValueError(f"unknown method {method!r}")
 
 
-# ── perturbation engine → normalised MoRF / LeRF prediction curves ─────────────
+# ── perturbation engine → MoRF / LeRF predicted-class probability curves ──────
 def perturbation_curves(model, normalize, x01, target, sal_grid, *, grid, patch,
                         batch: int = 128) -> Tuple[np.ndarray, np.ndarray, float]:
-    """(morf_curve, lerf_curve, clean_prob). Curves length ``N+1``, normalised so
-    index 0 = 1.0. Mean-fill occlusion; cumulative in descending / ascending order."""
+    """(morf_curve, lerf_curve, clean_prob). Curves length ``N+1``, in
+    predicted-class probability. Mean-fill occlusion; cumulative descending / ascending."""
     device = next(model.parameters()).device
     x = x01.to(device)
     n = grid * grid
@@ -221,10 +219,7 @@ def perturbation_curves(model, normalize, x01, target, sal_grid, *, grid, patch,
 
     morf = _curve(order)
     lerf = _curve(order.flip(0))
-    clean = float(morf[0])
-    if clean <= 0:
-        clean = 1e-8
-    return (morf / clean).cpu().numpy(), (lerf / clean).cpu().numpy(), float(morf[0])
+    return morf.cpu().numpy(), lerf.cpu().numpy(), float(morf[0])
 
 
 _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))   # numpy 2.x renamed trapz
@@ -470,7 +465,7 @@ def figures():
             ax.plot(frac, mo, color=c, lw=1.8, label=f"{METHOD_LABEL[me]} (DAPC={np.nanmean(store[kd]):+.3f})")
             ax.plot(frac, le, color=c, lw=1.2, ls="--", alpha=0.7)
         ax.set_xlabel("fraction of patches occluded")
-        ax.set_ylabel("normalised predicted-class probability")
+        ax.set_ylabel("predicted-class probability")
         ax.set_title(f"{model}: {MODELS[model].label}\nMoRF (solid) vs LeRF (dashed)")
         ax.set_ylim(-0.02, 1.05); ax.grid(alpha=0.3); ax.legend(fontsize=7, loc="upper right")
         _save(fig, FIG_DIR / f"iddapc_curves_{model}")
