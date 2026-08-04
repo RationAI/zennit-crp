@@ -18,7 +18,7 @@ import torch.nn as nn
 from zennit.composites import LayerMapComposite
 from zennit.rules import Gamma, Pass
 
-from zennit_ext import (
+from zennit_extentions import (
     QInspectionLayer, KInspectionLayer, StopGradient,
     SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd, LayerScaleMul,
     ResidualRatio, Uniform,

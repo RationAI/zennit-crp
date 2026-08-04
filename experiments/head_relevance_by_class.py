@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader
 from timm.data import resolve_data_config, create_transform
 
 from crp.attribution import CondAttribution
-from zennit_ext import AttnLRPCombinedComposite
+from zennit_extentions import AttnLRPCombinedComposite
 from crp.concepts import HeadConcept
 from experiments.datasets import load as load_dataset
 from experiments.models import build_probe

@@ -41,7 +41,7 @@ from PIL import Image
 from timm.data import resolve_data_config, create_transform
 
 from crp.attribution import CondAttribution
-from zennit_ext import AttnLRPCombinedComposite
+from zennit_extentions import AttnLRPCombinedComposite
 from experiments.datasets import FunnyBirdsDataset
 from experiments.datasets.funny_birds import (
     PART_COLORS_TO_NAME, BACKGROUND_COLOR,

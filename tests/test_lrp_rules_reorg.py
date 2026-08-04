@@ -25,8 +25,8 @@ import torch.nn as nn
 from zennit.core import stabilize
 from zennit.rules import Gamma, Epsilon
 
-from zennit_ext import MatmulAttnLRP, EpsilonAdd, CheferMatmul, CheferAdd
-from zennit_ext.attnlrp_composites import AttnLRPBaselineComposite, CheferLRPComposite
+from zennit_extentions import MatmulAttnLRP, EpsilonAdd, CheferMatmul, CheferAdd
+from zennit_extentions.attnlrp_composites import AttnLRPBaselineComposite, CheferLRPComposite
 
 
 # ── MatmulAttnLRP: vectorized backward == literal Eq. 15 ─────────────────────

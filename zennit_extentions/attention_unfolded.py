@@ -895,46 +895,13 @@ def _extract_block_index(parent_name: str) -> Optional[int]:
 
 
 class StopGradient(Hook):
-    """LRP rule that blocks relevance flow through the module (CP-LRP: the
-    attention weights are treated as constants, so relevance flows only through
-    the value path).
+    """LRP rule that blocks relevance flow through the module.
 
     Sourced from 'XAI for Transformers: Better Explanations through Conservative
     Propagation', https://proceedings.mlr.press/v162/ali22a.html
 
     Backward returns a zero tensor in place of every non-``None`` element
-    of ``grad_input`` — i.e. the LRP relevance reaching the module on its
-    upstream side does not propagate further down. Forward is untouched
-    (zennit's :class:`Hook` is a backward-side rule; the module's own
-    forward still runs and downstream activations are unaffected).
-
-    Designed for use in :class:`LayerMapComposite`'s ``layer_map`` to
-    target :class:`QInspectionLayer` / :class:`KInspectionLayer` for the
-    **CP-LRP attention rule** (Chefer et al. 2021; adopted by LXT,
-    Achtibat et al. *LRP eXplains Transformers*): the Q and K linear
-    projections receive zero relevance, and the entire attention output
-    relevance flows through the V path via standard autograd on
-    ``context = softmax(QKᵀ/√d) @ v`` (softmax weights become a graph
-    constant once Q,K gradients are killed).
-
-    Combine with the natural autograd backward on :class:`BilinearMatmul`
-    — do NOT assign the :class:`~zennit_ext.attnlrp_rules.AlphaBetaMatmul`
-    hook to ``BilinearMatmul`` here, as it would override backward on
-    ``context`` and break the CP-LRP value attribution.
-
-    Example usage in a composite::
-
-        from zennit.composites import LayerMapComposite
-        from zennit_ext.attention_unfolded import (
-            QInspectionLayer, KInspectionLayer, StopGradient,
-        )
-
-        layer_map = [
-            (QInspectionLayer, StopGradient()),
-            (KInspectionLayer, StopGradient()),
-            # ... other rules ...
-        ]
-        composite = LayerMapComposite(layer_map=layer_map, canonizers=[...])
+    of ``grad_input``. Forward is untouched.
     """
 
     def backward(self, module, grad_input, grad_output):

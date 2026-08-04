@@ -13,7 +13,7 @@ import torch.nn as nn
 from zennit.composites import LayerMapComposite
 from zennit.rules import Epsilon, Gamma, Pass
 
-from zennit_ext.attnlrp_rules import (
+from zennit_extentions.attnlrp_rules import (
     TimmViTCanonizer, AlphaBetaMatmul, ResidualRatio, ResidualL1, Uniform,
 )
 
@@ -169,7 +169,7 @@ class AttnLRPCombinedComposite(LayerMapComposite):
     ):
         # Lazy import to avoid the import cycle
         # (attnlrp_composites → attention_unfolded → attnlrp_rules).
-        from zennit_ext.attention_unfolded import (
+        from zennit_extentions.attention_unfolded import (
             EvaAttentionSubstitutionCanonizer,
             TimmAttentionSubstitutionCanonizer,
             BilinearMatmul,
@@ -260,12 +260,12 @@ class AttnLRPBaselineComposite(LayerMapComposite):
     ):
         # Lazy import to avoid the import cycle
         # (attnlrp_composites → attention_unfolded → attnlrp_rules).
-        from zennit_ext.attention_unfolded import (
+        from zennit_extentions.attention_unfolded import (
             EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
             BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
             LayerScaleMul,
         )
-        from zennit_ext.attnlrp_rules import (
+        from zennit_extentions.attnlrp_rules import (
             TimmViTCanonizer, MatmulAttnLRP, SoftmaxAttnLRP, Identity, Uniform,
             EpsilonAdd,
         )
@@ -329,12 +329,12 @@ class CheferLRPComposite(LayerMapComposite):
     def __init__(self, *, epsilon: float = 1e-6, low: float = -3.0,
                  high: float = 3.0, canonizers=None):
         from zennit.rules import ZPlus, ZBox
-        from zennit_ext.attention_unfolded import (
+        from zennit_extentions.attention_unfolded import (
             EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
             BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
             LayerScaleMul,
         )
-        from zennit_ext.attnlrp_rules import (
+        from zennit_extentions.attnlrp_rules import (
             TimmViTCanonizer, CheferMatmul, CheferAdd, Uniform,
         )
         self._zbox = ZBox(low=low, high=high)   # first (pixel-space) conv

@@ -12,7 +12,7 @@ See :class:`zennit_ext.attnlrp_composites.CheferLRPComposite`.
 """
 from __future__ import annotations
 
-from zennit_ext.attnlrp_composites import CheferLRPComposite
+from zennit_extentions.attnlrp_composites import CheferLRPComposite
 from ._base import LRPConfig, register
 
 CONFIG = register(LRPConfig(

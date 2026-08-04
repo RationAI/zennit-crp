@@ -29,12 +29,12 @@ from crp.concepts import (
     EmbeddingDimConcept,
     TokenConcept,
 )
-from zennit_ext import (
+from zennit_extentions import (
     EvaAttentionUnfolded,
     EvaAttentionSubstitutionCanonizer,
 )
 from crp.attribution import CondAttribution
-from zennit_ext import (
+from zennit_extentions import (
     AttnLRPEpsilonComposite,
     AttnLRPGammaComposite,
     AttnLRPCombinedComposite,
