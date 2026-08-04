@@ -13,7 +13,7 @@ See :class:`zennit_ext.attnlrp_composites.AttnLRPBaselineComposite`.
 """
 from __future__ import annotations
 
-from zennit_ext.attnlrp_composites import AttnLRPBaselineComposite
+from zennit_extensions.attnlrp_composites import AttnLRPBaselineComposite
 from ._base import LRPConfig, register
 
 CONFIG = register(LRPConfig(

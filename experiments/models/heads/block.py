@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from zennit_ext import (
+from zennit_extensions import (
     BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant,
 )
 

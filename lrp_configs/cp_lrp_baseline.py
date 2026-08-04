@@ -18,14 +18,14 @@ import torch.nn as nn
 from zennit.composites import LayerMapComposite
 from zennit.rules import Gamma, Pass
 
-from zennit_ext import (
-    QInspectionLayer, KInspectionLayer, StopGradient,
-    SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd, LayerScaleMul,
+from zennit_extensions import (
+    QInspectionLayer, KInspectionLayer, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd, LayerScaleMul,
     ResidualRatio, Uniform,
     LayerNormForwardCanonizer, DropoutPassthroughCanonizer,
     TimmBlockResidualCanonizer, EvaBlockResidualCanonizer,
     EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
 )
+from zennit_extensions.cp_lrp import StopGradient
 from ._base import LRPConfig, register
 
 

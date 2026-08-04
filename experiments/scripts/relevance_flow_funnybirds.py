@@ -50,7 +50,7 @@ import typer
 from timm.models.vision_transformer import Block as TimmBlock
 from zennit.canonizers import AttributeCanonizer
 
-from zennit_ext import AttnLRPCombinedComposite
+from zennit_extensions import AttnLRPCombinedComposite
 from crp.attribution import CondAttribution
 from experiments.datasets import load as load_dataset
 from experiments.models import build_probe

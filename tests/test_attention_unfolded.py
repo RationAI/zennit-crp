@@ -31,7 +31,7 @@ timm = pytest.importorskip("timm")
 
 from zennit.rules import Pass
 
-from zennit_ext import (
+from zennit_extensions import (
     AddBias,
     AlphaBetaMatmul,
     BilinearMatmul,
@@ -619,7 +619,7 @@ class TestTimmAttentionUnfolded:
         attn = synthetic_timm_attention
         with torch.no_grad():
             y_orig = attn(x)
-        from zennit_ext import TimmAttentionUnfolded
+        from zennit_extensions import TimmAttentionUnfolded
         unfolded = TimmAttentionUnfolded(attn)
         with torch.no_grad():
             y_new = unfolded(x)
@@ -635,7 +635,7 @@ class TestTimmAttentionUnfolded:
         g_orig = x_orig.grad.clone()
 
         x_new = timm_attn_input.clone().requires_grad_(True)
-        from zennit_ext import TimmAttentionUnfolded
+        from zennit_extensions import TimmAttentionUnfolded
         unfolded = TimmAttentionUnfolded(attn)
         y_new = unfolded(x_new)
         y_new.backward(go)
@@ -654,7 +654,7 @@ class TestTimmAttentionUnfolded:
         attn = synthetic_timm_attention
         with torch.no_grad():
             y_orig = attn(x)
-        from zennit_ext import TimmAttentionUnfolded
+        from zennit_extensions import TimmAttentionUnfolded
         unfolded = TimmAttentionUnfolded(attn)
         instances = [
             AlphaBetaMatmul(alpha=0.5, beta=0.5, epsilon=1e-6).register(sm)
@@ -673,7 +673,7 @@ class TestTimmAttentionUnfolded:
         the concept classes target: q_lrp_probe / k_lrp_probe / v_lrp_probe
         (3D, post qkv split), proj_drop (3D, attention output), context
         (4D, pre-merge), plus qk_scores / softmax for diagnostics."""
-        from zennit_ext import (
+        from zennit_extensions import (
             TimmAttentionUnfolded,
             LRPInspectionLayer,
         )
@@ -705,7 +705,7 @@ class TestTimmAttentionSubstitutionCanonizer:
     def test_apply_substitutes_one_block(self):
         m = self._make_model()
         from timm.models.vision_transformer import Attention as TimmAttention
-        from zennit_ext import (
+        from zennit_extensions import (
             TimmAttentionSubstitutionCanonizer, TimmAttentionUnfolded,
         )
         can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
@@ -721,7 +721,7 @@ class TestTimmAttentionSubstitutionCanonizer:
     def test_remove_restores_original(self):
         m = self._make_model()
         from timm.models.vision_transformer import Attention as TimmAttention
-        from zennit_ext import TimmAttentionSubstitutionCanonizer
+        from zennit_extensions import TimmAttentionSubstitutionCanonizer
         original = m.blocks[0].attn
         can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
         instances = can.apply(m)
@@ -732,7 +732,7 @@ class TestTimmAttentionSubstitutionCanonizer:
 
     def test_round_trip_forward_parity(self):
         """apply → forward → remove → re-apply → forward: outputs match."""
-        from zennit_ext import TimmAttentionSubstitutionCanonizer
+        from zennit_extensions import TimmAttentionSubstitutionCanonizer
         m = self._make_model()
         torch.manual_seed(0)
         img = torch.randn(1, 3, 224, 224)
@@ -761,7 +761,7 @@ class TestTimmAttentionSubstitutionCanonizer:
         """Each substitution canonizer's isinstance filter must skip the
         other backbone's attention class — so both can be bundled into
         one composite without coupling."""
-        from zennit_ext import TimmAttentionSubstitutionCanonizer
+        from zennit_extensions import TimmAttentionSubstitutionCanonizer
         m_eva = timm.create_model(
             "vit_large_patch16_dinov3", pretrained=False, num_classes=10,
         )

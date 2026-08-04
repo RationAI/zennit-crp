@@ -633,7 +633,7 @@ class TimmBlockResidualCanonizer(AttributeCanonizer):
                   "norm2", "attn", "mlp")
         if not all(hasattr(module, a) for a in needed):
             return None
-        from zennit_ext.attention_unfolded import ResidualAdd
+        from zennit_extensions.attention_unfolded import ResidualAdd
 
         def fwd(self, x, attn_mask=None, is_causal=False):
             return _timm_block_forward(
@@ -681,7 +681,7 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
                   "gamma_1", "gamma_2")
         if not all(hasattr(module, a) for a in needed):
             return None
-        from zennit_ext.attention_unfolded import ResidualAdd, LayerScaleMul
+        from zennit_extensions.attention_unfolded import ResidualAdd, LayerScaleMul
 
         def fwd(self, x, rope=None, attn_mask=None, is_causal=False):
             return _eva_block_forward(
@@ -758,7 +758,7 @@ class VitPosEmbedPALRPCanonizer(AttributeCanonizer):
     def _attribute_map(self, _name, module):
         if not isinstance(module, VisionTransformer) or not hasattr(module, "_pos_embed"):
             return None
-        from zennit_ext.attention_unfolded import PosEmbedAdd
+        from zennit_extensions.attention_unfolded import PosEmbedAdd
         attrs = _bind_forward(module, vit_pos_embed_palrp, attr="_pos_embed")
         attrs["_lrp_posadd"] = PosEmbedAdd()  # x + pos_embed → its own rule via layer_map
         return attrs
