@@ -20,12 +20,12 @@ from zennit.rules import Gamma, Pass
 
 from zennit_extensions import (
     QInspectionLayer, KInspectionLayer, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd, LayerScaleMul,
-    ResidualRatio, Uniform,
-    LayerNormForwardCanonizer, DropoutPassthroughCanonizer,
-    TimmBlockResidualCanonizer, EvaBlockResidualCanonizer,
-    EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
+    LayerNormForwardCanonizer,
 )
+from zennit_extensions.canonisation.canonizers import DropoutPassthroughCanonizer, EvaAttentionSubstitutionCanonizer, EvaBlockResidualCanonizer, TimmAttentionSubstitutionCanonizer, TimmBlockResidualCanonizer
 from zennit_extensions.cp_lrp import StopGradient
+from zennit_extensions.rules.attnlrp import Uniform
+from zennit_extensions.rules.residuals_otsuki2024 import ResidualRatio
 from ._base import LRPConfig, register
 
 

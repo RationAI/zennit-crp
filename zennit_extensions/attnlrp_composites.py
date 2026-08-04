@@ -13,9 +13,14 @@ import torch.nn as nn
 from zennit.composites import LayerMapComposite
 from zennit.rules import Epsilon, Gamma, Pass
 
-from zennit_extensions.attnlrp_rules import (
-    TimmViTCanonizer, AlphaBetaMatmul, ResidualRatio, ResidualL1, Uniform,
+from zennit_extensions.rules.bajger_contrib import (
+    AlphaBetaMatmul,
 )
+from zennit_extensions.canonisation.canonizers import EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer, TimmViTCanonizer2
+from zennit_extensions.rules.attnlrp import EpsilonAdd, MatmulAttnLRP, SoftmaxAttnLRP, Uniform
+from zennit_extensions.rules.bajger_contrib import ResidualL1
+from zennit_extensions.rules.chefer2021 import CheferAdd, CheferMatmul
+from zennit_extensions.rules.residuals_otsuki2024 import ResidualRatio
 
 # ─── 6. Composites — one per recipe (3 total after cleanup) ──────────────────
 
@@ -74,7 +79,7 @@ class AttnLRPEpsilonComposite(LayerMapComposite):
         palrp: bool = False, residual_lrp: Optional[str] = None,
     ):
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
+            TimmViTCanonizer2(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
         ]
         super().__init__(layer_map=_epsilon_layer_map(epsilon), canonizers=canonizers)
 
@@ -105,7 +110,7 @@ class AttnLRPGammaComposite(LayerMapComposite):
         palrp: bool = False, residual_lrp: Optional[str] = None,
     ):
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
+            TimmViTCanonizer2(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
         ]
         super().__init__(
             layer_map=_gamma_layer_map(gamma, epsilon), canonizers=canonizers,
@@ -170,8 +175,6 @@ class AttnLRPCombinedComposite(LayerMapComposite):
         # Lazy import to avoid the import cycle
         # (attnlrp_composites → attention_unfolded → attnlrp_rules).
         from zennit_extensions.attention_unfolded import (
-            EvaAttentionSubstitutionCanonizer,
-            TimmAttentionSubstitutionCanonizer,
             BilinearMatmul,
             SoftmaxAlongLastDim,
             ScaleByConstant,
@@ -192,7 +195,7 @@ class AttnLRPCombinedComposite(LayerMapComposite):
                 f"residual_lrp must be None or one of {sorted(res_rules)}; "
                 f"got {residual_lrp!r}")
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
+            TimmViTCanonizer2(
                 palrp=palrp, residual=residual_lrp is not None,
                 layerscale_uniform=layerscale_uniform,
                 epsilon=epsilon,
@@ -261,18 +264,16 @@ class AttnLRPBaselineComposite(LayerMapComposite):
         # Lazy import to avoid the import cycle
         # (attnlrp_composites → attention_unfolded → attnlrp_rules).
         from zennit_extensions.attention_unfolded import (
-            EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
             BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
             LayerScaleMul,
         )
         from zennit_extensions.attnlrp_rules import (
-            TimmViTCanonizer, MatmulAttnLRP, SoftmaxAttnLRP, Identity, Uniform,
-            EpsilonAdd,
+            Identity,
         )
         self._ffn_gamma = ffn_gamma
         self._epsilon = epsilon
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
+            TimmViTCanonizer2(
                 palrp=False, residual=True, layerscale_uniform=True, epsilon=epsilon),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
             TimmAttentionSubstitutionCanonizer(block_indices=None),
@@ -330,16 +331,15 @@ class CheferLRPComposite(LayerMapComposite):
                  high: float = 3.0, canonizers=None):
         from zennit.rules import ZPlus, ZBox
         from zennit_extensions.attention_unfolded import (
-            EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
             BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
             LayerScaleMul,
         )
-        from zennit_extensions.attnlrp_rules import (
-            TimmViTCanonizer, CheferMatmul, CheferAdd, Uniform,
+        from zennit_extensions.canonisation.canonizers import (
+            TimmViTCanonizer2,
         )
         self._zbox = ZBox(low=low, high=high)   # first (pixel-space) conv
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
+            TimmViTCanonizer2(
                 palrp=False, residual=True, layerscale_uniform=True, epsilon=epsilon),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
             TimmAttentionSubstitutionCanonizer(block_indices=None),

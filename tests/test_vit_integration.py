@@ -20,6 +20,8 @@ Run::
 import pytest
 import torch
 
+from zennit_extensions.attention_unfolded import EvaAttentionUnfolded
+
 timm = pytest.importorskip("timm")
 zennit = pytest.importorskip("zennit")
 
@@ -29,16 +31,15 @@ from crp.concepts import (
     EmbeddingDimConcept,
     TokenConcept,
 )
-from zennit_extensions import (
-    EvaAttentionUnfolded,
+from zennit_extensions.canonisation.canonizers import (
     EvaAttentionSubstitutionCanonizer,
+    TimmViTCanonizer2,
 )
 from crp.attribution import CondAttribution
 from zennit_extensions import (
     AttnLRPEpsilonComposite,
     AttnLRPGammaComposite,
     AttnLRPCombinedComposite,
-    TimmViTCanonizer,
 )
 
 
@@ -108,7 +109,7 @@ class TestTimmViTCanonizer:
         ln = vit_tiny.blocks[0].norm1
         original_class_forward = type(ln).forward
         assert "forward" not in ln.__dict__, "test pre-condition: clean state"
-        canonizer = TimmViTCanonizer()
+        canonizer = TimmViTCanonizer2()
         instances = canonizer.apply(vit_tiny)
         try:
             assert "forward" in ln.__dict__, "canonizer did not swap LayerNorm forward"

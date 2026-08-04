@@ -18,6 +18,9 @@ Run::
 import pytest
 import torch
 
+from zennit_extensions.rules.attnlrp import EpsilonAdd, MatmulAttnLRP
+from zennit_extensions.rules.chefer2021 import CheferMatmul
+
 timm = pytest.importorskip("timm")
 pytest.importorskip("zennit")
 
@@ -25,7 +28,7 @@ import torch.nn as nn
 from zennit.core import stabilize
 from zennit.rules import Gamma, Epsilon
 
-from zennit_extensions import MatmulAttnLRP, EpsilonAdd, CheferMatmul, CheferAdd
+from zennit_extensions.rules.chefer2021 import CheferAdd
 from zennit_extensions.attnlrp_composites import AttnLRPBaselineComposite, CheferLRPComposite
 
 

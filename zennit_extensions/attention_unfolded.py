@@ -67,7 +67,7 @@ CP-LRP attention rule — relevance flows through the value path only).
 """
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -75,10 +75,10 @@ import torch.nn.functional as F
 from torch.autograd import Function
 
 from timm.layers import apply_rot_embed_cat
-from timm.models.eva import EvaAttention
-from timm.models.vision_transformer import Attention as TimmAttention
 
-from zennit.canonizers import AttributeCanonizer, Canonizer
+from zennit.canonizers import AttributeCanonizer
+
+
 
 
 # ─── 1. Vanilla atomic modules ──────────────────────────────────────────────
@@ -361,7 +361,176 @@ def _to_heads(t: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
     return t.reshape(B, N, num_heads, head_dim).transpose(1, 2)
 
 
+class TimmAttentionUnfolded(nn.Module):
+    """Unfolded ``timm.models.vision_transformer.Attention`` analogue.
+
+    Constructor takes a real ``Attention`` instance, references
+    its parameter-bearing submodules (``qkv``, ``q_norm``, ``k_norm``,
+    ``proj``, ``attn_drop``, ``proj_drop``, optional ``norm``) by
+    attribute, and exposes hookable atomic ops for zennit canonizers.
+
+    Forward signature mirrors
+    stock ``timm.models.vision_transformer.Attention.forward``
+    The block keeps invoking ``self.attn(x, attn_mask=…, is_causal=…)`` with no signature break.
+    For ViT image classification ``is_causal`` is always ``False``; the
+    kwarg is accepted but trivially unused on that path.
+
+    Parameters
+    ----------
+    orig : timm.models.vision_transformer.Attention
+        Source module to wrap.
+    num_prefix_tokens : int
+        Number of leading (non-spatial) tokens in the model's sequence —
+        ``1`` for the standard ``cls``-only setup, more if the model was
+        built with ``reg_tokens > 0``. Stock timm ``Attention`` does not
+        carry this attribute (only the top-level ``VisionTransformer``
+        does), so the substitution canonizer is responsible for passing
+        it in at construction time. Default ``1`` matches the most common
+        case but the canonizer always overrides it.
+    """
+
+    def __init__(self, orig, *, num_prefix_tokens: int = 1) -> None:
+        super().__init__()
+        if not (
+            hasattr(orig, "qkv")
+            and isinstance(orig.qkv, nn.Linear)
+            and hasattr(orig, "num_heads")
+            and hasattr(orig, "proj")
+        ):
+            raise TypeError(
+                "TimmAttentionUnfolded expects a timm vision_transformer.Attention-like instance"
+            )
+
+        # Cache shape constants from the original module.
+        self.num_heads = int(orig.num_heads)
+        # Stock timm sets head_dim. Older variants compute it from dim/num_heads.
+        if hasattr(orig, "head_dim"):
+            self.head_dim = int(orig.head_dim)
+        else:
+            self.head_dim = int(orig.qkv.weight.shape[0] // 3 // self.num_heads)
+        self.num_prefix_tokens = int(num_prefix_tokens)
+        # Scale: stock timm sets self.scale = head_dim ** -0.5
+        self.scale = float(getattr(orig, "scale", self.head_dim ** -0.5))
+
+        # Reference (do not copy) the parameter-bearing / stateful submodules.
+        self.qkv = orig.qkv
+        # q_norm / k_norm may be nn.LayerNorm or nn.Identity depending on
+        # the qk_norm flag at construction time.
+        self.q_norm = getattr(orig, "q_norm", nn.Identity())
+        self.k_norm = getattr(orig, "k_norm", nn.Identity())
+        self.attn_drop = orig.attn_drop
+        # Newer timm variants add a post-attention norm; older variants don't.
+        self.norm = getattr(orig, "norm", nn.Identity())
+        self.proj = orig.proj
+        self.proj_drop = orig.proj_drop
+
+        # Atomic vanilla submodules. LRP rules are layered in by the
+        # per-module canonizers at composite-context-entry time.
+        self.split = ChunkAlongLastDim(3)
+        self.scale_q = ScaleByConstant(self.scale)
+        self.qk_scores = BilinearMatmul()
+        self.add_mask = AddBias()
+        self.softmax = SoftmaxAlongLastDim()
+        self.context = BilinearMatmul()
+        self.reshape = ReshapeMergeHeads()
+        # LRP inspection sites. Placed AFTER ``split``, BEFORE
+        # ``_to_heads`` — tensor shape is ``(B, N, embed_dim)``, identical
+        # to ``proj_drop`` output. HeadConcept slices embed_dim per-head
+        # internally; q_norm / k_norm and the per-head reshape are
+        # downstream and not inspected through these probes. Distinct
+        # subclasses (Q/K/V) so a LayerMapComposite can target them
+        # independently with different LRP rules.
+        self.q_lrp_probe = QInspectionLayer()
+        self.k_lrp_probe = KInspectionLayer()
+        self.v_lrp_probe = VInspectionLayer()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        B, N, C = x.shape
+
+        qkv_flat = self.qkv(x)
+        q_flat, k_flat, v_flat = self.split(qkv_flat)
+        q_flat = self.q_lrp_probe(q_flat)
+        k_flat = self.k_lrp_probe(k_flat)
+        v_flat = self.v_lrp_probe(v_flat)
+
+        q = _to_heads(q_flat, self.num_heads, self.head_dim)
+        k = _to_heads(k_flat, self.num_heads, self.head_dim)
+        v = _to_heads(v_flat, self.num_heads, self.head_dim)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = self.scale_q(q)
+        scores = self.qk_scores(q, k.transpose(-2, -1))
+        scores = self._resolve_and_add_mask(scores, attn_mask, is_causal, N)
+
+        weights = self.softmax(scores)
+        weights = self.attn_drop(weights)
+
+        ctx = self.context(weights, v)
+        out = self.reshape(ctx)
+        out = self.norm(out)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        return out
+
+    def _resolve_and_add_mask(self, scores, attn_mask, is_causal, N):
+        # Standard timm Attention's explicit-math path does
+        #   if attn_mask is not None: attn = attn + attn_mask
+        # and ignores is_causal on this path (it only applies to the
+        # F.scaled_dot_product_attention dispatch). We still honour
+        # is_causal=True by building a triangular mask for consistency
+        # with the Eva unfolded variant.
+        attn_bias = attn_mask
+        if is_causal:
+            causal = torch.triu(
+                torch.full(
+                    (N, N), float("-inf"), device=scores.device, dtype=scores.dtype,
+                ),
+                diagonal=1,
+            )
+            attn_bias = causal if attn_bias is None else attn_bias + causal
+        return self.add_mask(scores, attn_bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"num_heads={self.num_heads}, head_dim={self.head_dim}, "
+            f"num_prefix_tokens={self.num_prefix_tokens}, scale={self.scale}"
+        )
+
+
 # ─── 3. Container: EvaAttentionUnfolded (vanilla forward) ───────────────────
+
+
+# ─── 3. Substitution canonizer (no LRP knobs) ───────────────────────────────
+
+
+# ─── 3b. Timm-standard unfolded attention + substitution canonizer ──────────
+
+
+# ─── 4. Autograd Function kernels for the LRP rules ─────────────────────────
+# These are used ONLY by the canonizers below — never by the modules' own
+# forwards. They live here (not in transformer_patches) because their sole
+# consumers are the per-module canonizers right below them.
+
+
+# ─── 5. LRP-rule canonizers (one per rule, vanilla ↔ rule-aware swap) ───────
+#
+# Each canonizer rebinds the forward of a specific module class with a
+# wrapper that routes through an autograd Function whose backward
+# implements the LRP rule. On ``apply()`` the wrapper is bound; on
+# ``remove()`` the original ``forward`` is restored. Forward output is
+# numerically identical to vanilla in every case (Functions do
+# ``a @ b`` / ``F.softmax`` / ``x * scalar`` etc. — only backward differs).
+
+
+# ─── 6. Internal helpers ────────────────────────────────────────────────────
+
 
 
 class EvaAttentionUnfolded(nn.Module):
@@ -378,8 +547,7 @@ class EvaAttentionUnfolded(nn.Module):
 
     Forward signature matches ``EvaAttention.forward`` exactly:
     ``(self, x, rope=None, attn_mask=None, is_causal=False)``. All atomic
-    submodules are vanilla (see module docstrings); LRP behaviour is
-    opt-in via composite-time canonizers.
+    submodules are vanilla (see module docstrings)..
 
     Parameters
     ----------
@@ -523,405 +691,3 @@ class EvaAttentionUnfolded(nn.Module):
             f"num_heads={self.num_heads}, head_dim={self.head_dim}, "
             f"num_prefix_tokens={self.num_prefix_tokens}, scale={self.scale}"
         )
-
-
-# ─── 3. Substitution canonizer (no LRP knobs) ───────────────────────────────
-
-
-class EvaAttentionSubstitutionCanonizer(Canonizer):
-    """Replace ``EvaAttention`` instances with :class:`EvaAttentionUnfolded`.
-
-    Lifecycle
-    ---------
-    * ``apply(root)`` walks ``root`` for ``EvaAttention`` modules whose
-      block index is in ``block_indices`` (or all, if ``block_indices``
-      is None). For each one it constructs a vanilla
-      :class:`EvaAttentionUnfolded` around the original and re-binds the
-      parent ``EvaBlock``'s ``.attn`` attribute to the unfolded version.
-    * ``remove()`` re-binds the parent's ``.attn`` to the original
-      module reference. Weight-sharing means no parameter state is lost.
-
-    This canonizer makes NO LRP-rule decisions — it just exposes the
-    attention as named submodules so a composite ``layer_map`` can assign
-    rule hooks (e.g. :class:`~zennit_ext.attnlrp_rules.AlphaBetaMatmul`) to
-    the new ``BilinearMatmul`` / ``SoftmaxAlongLastDim`` / etc. instances.
-
-    No source paper — infrastructure for unfolded attention (Eva/DINOv3).
-
-    Parameters
-    ----------
-    block_indices : tuple[int, ...] | None
-        Indices of blocks to substitute. ``None`` (default) means
-        substitute all attention blocks.
-    rope_detach : bool
-        Forwarded to :class:`EvaAttentionUnfolded` → :class:`RotaryEmbedding`.
-        Structural (whether RoPE owns parameters in the autograd graph),
-        not an LRP rule. Default False.
-    """
-
-    def __init__(
-        self,
-        *,
-        block_indices: Optional[Sequence[int]] = None,
-        rope_detach: bool = False,
-    ):
-        self.block_indices = (
-            None if block_indices is None else tuple(int(i) for i in block_indices)
-        )
-        self.rope_detach = rope_detach
-
-        # State filled by ``register``.
-        self.parent: Optional[nn.Module] = None
-        self.attr_name: Optional[str] = None
-        self.original_module: Optional[nn.Module] = None
-        self.unfolded_module: Optional[EvaAttentionUnfolded] = None
-
-    def apply(self, root_module: nn.Module) -> List["EvaAttentionSubstitutionCanonizer"]:
-        instances: List[EvaAttentionSubstitutionCanonizer] = []
-        for parent_name, parent in root_module.named_modules():
-            for attr_name, child in parent.named_children():
-                if not isinstance(child, EvaAttention):
-                    continue
-                if self.block_indices is not None:
-                    block_idx = _extract_block_index(parent_name)
-                    if block_idx is None or block_idx not in self.block_indices:
-                        continue
-                inst = self.copy()
-                inst.register(parent, attr_name, child)
-                instances.append(inst)
-        return instances
-
-    def register(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        parent: nn.Module,
-        attr_name: str,
-        original: nn.Module,
-    ) -> None:
-        # Signature intentionally differs from ``Canonizer.register(self)``;
-        # zennit's own canonizers (e.g. ``MergeBatchNorm.register(linears,
-        # batch_norm)``) do the same — ABC enforces method NAME, not
-        # signature, and zennit's lifecycle calls ``apply()`` which then
-        # dispatches to this overload.
-        self.parent = parent
-        self.attr_name = attr_name
-        self.original_module = original
-        unfolded = EvaAttentionUnfolded(original, rope_detach=self.rope_detach)
-        setattr(parent, attr_name, unfolded)
-        self.unfolded_module = unfolded
-
-    def remove(self) -> None:
-        if self.parent is None or self.attr_name is None or self.original_module is None:
-            return
-        setattr(self.parent, self.attr_name, self.original_module)
-        self.unfolded_module = None
-
-    def copy(self) -> "EvaAttentionSubstitutionCanonizer":
-        return type(self)(
-            block_indices=self.block_indices,
-            rope_detach=self.rope_detach,
-        )
-
-
-# ─── 3b. Timm-standard unfolded attention + substitution canonizer ──────────
-
-
-class TimmAttentionUnfolded(nn.Module):
-    """Unfolded ``timm.models.vision_transformer.Attention`` analogue.
-
-    Same role as :class:`EvaAttentionUnfolded` but for the standard timm
-    ViT attention (no RoPE, no LayerScale, ``num_prefix_tokens=1``: cls
-    only). Constructor takes a real ``Attention`` instance, references
-    its parameter-bearing submodules (``qkv``, ``q_norm``, ``k_norm``,
-    ``proj``, ``attn_drop``, ``proj_drop``, optional ``norm``) by
-    attribute, and exposes hookable atomic ops so the AttnLRP composite
-    can canonize them and the concept classes can target
-    ``q_lrp_probe`` / ``k_lrp_probe`` / ``v_lrp_probe`` / ``proj_drop``
-    (all 3D ``(B, N, embed_dim)``) and ``context`` (4D, attention output
-    pre-merge).
-
-    Forward signature: ``(x, attn_mask=None, is_causal=False)``. Mirrors
-    stock ``timm.models.vision_transformer.Attention.forward`` so the
-    substitution canonizer's ``setattr(parent, 'attn', unfolded)`` is
-    transparent to the calling block — the block keeps invoking
-    ``self.attn(x, attn_mask=…, is_causal=…)`` with no signature break.
-    For ViT image classification ``is_causal`` is always ``False``; the
-    kwarg is accepted but trivially unused on that path.
-
-    Numerical output is bit-identical to stock when the source has
-    ``fused_attn=False`` (explicit-math path); ``fused_attn=True`` source
-    uses ``F.scaled_dot_product_attention`` which can differ at fp32
-    noise level, but the substituted unfolded instance takes the
-    explicit path either way.
-
-    Parameters
-    ----------
-    orig : timm.models.vision_transformer.Attention
-        Source module to wrap.
-    num_prefix_tokens : int
-        Number of leading (non-spatial) tokens in the model's sequence —
-        ``1`` for the standard ``cls``-only setup, more if the model was
-        built with ``reg_tokens > 0``. Stock timm ``Attention`` does not
-        carry this attribute (only the top-level ``VisionTransformer``
-        does), so the substitution canonizer is responsible for passing
-        it in at construction time. Default ``1`` matches the most common
-        case but the canonizer always overrides it.
-    """
-
-    def __init__(self, orig, *, num_prefix_tokens: int = 1) -> None:
-        super().__init__()
-        if not (
-            hasattr(orig, "qkv")
-            and isinstance(orig.qkv, nn.Linear)
-            and hasattr(orig, "num_heads")
-            and hasattr(orig, "proj")
-        ):
-            raise TypeError(
-                "TimmAttentionUnfolded expects a timm vision_transformer.Attention-like instance"
-            )
-
-        # Cache shape constants from the original module.
-        self.num_heads = int(orig.num_heads)
-        # Stock timm sets head_dim. Older variants compute it from dim/num_heads.
-        if hasattr(orig, "head_dim"):
-            self.head_dim = int(orig.head_dim)
-        else:
-            self.head_dim = int(orig.qkv.weight.shape[0] // 3 // self.num_heads)
-        self.num_prefix_tokens = int(num_prefix_tokens)
-        # Scale: stock timm sets self.scale = head_dim ** -0.5
-        self.scale = float(getattr(orig, "scale", self.head_dim ** -0.5))
-
-        # Reference (do not copy) the parameter-bearing / stateful submodules.
-        self.qkv = orig.qkv
-        # q_norm / k_norm may be nn.LayerNorm or nn.Identity depending on
-        # the qk_norm flag at construction time.
-        self.q_norm = getattr(orig, "q_norm", nn.Identity())
-        self.k_norm = getattr(orig, "k_norm", nn.Identity())
-        self.attn_drop = orig.attn_drop
-        # Newer timm variants add a post-attention norm; older variants don't.
-        self.norm = getattr(orig, "norm", nn.Identity())
-        self.proj = orig.proj
-        self.proj_drop = orig.proj_drop
-
-        # Atomic vanilla submodules. LRP rules are layered in by the
-        # per-module canonizers at composite-context-entry time.
-        self.split = ChunkAlongLastDim(3)
-        self.scale_q = ScaleByConstant(self.scale)
-        self.qk_scores = BilinearMatmul()
-        self.add_mask = AddBias()
-        self.softmax = SoftmaxAlongLastDim()
-        self.context = BilinearMatmul()
-        self.reshape = ReshapeMergeHeads()
-        # LRP inspection sites. Placed AFTER ``split``, BEFORE
-        # ``_to_heads`` — tensor shape is ``(B, N, embed_dim)``, identical
-        # to ``proj_drop`` output. HeadConcept slices embed_dim per-head
-        # internally; q_norm / k_norm and the per-head reshape are
-        # downstream and not inspected through these probes. Distinct
-        # subclasses (Q/K/V) so a LayerMapComposite can target them
-        # independently with different LRP rules.
-        self.q_lrp_probe = QInspectionLayer()
-        self.k_lrp_probe = KInspectionLayer()
-        self.v_lrp_probe = VInspectionLayer()
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        B, N, C = x.shape
-
-        qkv_flat = self.qkv(x)
-        q_flat, k_flat, v_flat = self.split(qkv_flat)
-        q_flat = self.q_lrp_probe(q_flat)
-        k_flat = self.k_lrp_probe(k_flat)
-        v_flat = self.v_lrp_probe(v_flat)
-
-        q = _to_heads(q_flat, self.num_heads, self.head_dim)
-        k = _to_heads(k_flat, self.num_heads, self.head_dim)
-        v = _to_heads(v_flat, self.num_heads, self.head_dim)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        q = self.scale_q(q)
-        scores = self.qk_scores(q, k.transpose(-2, -1))
-        scores = self._resolve_and_add_mask(scores, attn_mask, is_causal, N)
-
-        weights = self.softmax(scores)
-        weights = self.attn_drop(weights)
-
-        ctx = self.context(weights, v)
-        out = self.reshape(ctx)
-        out = self.norm(out)
-        out = self.proj(out)
-        out = self.proj_drop(out)
-        return out
-
-    def _resolve_and_add_mask(self, scores, attn_mask, is_causal, N):
-        # Standard timm Attention's explicit-math path does
-        #   if attn_mask is not None: attn = attn + attn_mask
-        # and ignores is_causal on this path (it only applies to the
-        # F.scaled_dot_product_attention dispatch). We still honour
-        # is_causal=True by building a triangular mask for consistency
-        # with the Eva unfolded variant.
-        attn_bias = attn_mask
-        if is_causal:
-            causal = torch.triu(
-                torch.full(
-                    (N, N), float("-inf"), device=scores.device, dtype=scores.dtype,
-                ),
-                diagonal=1,
-            )
-            attn_bias = causal if attn_bias is None else attn_bias + causal
-        return self.add_mask(scores, attn_bias)
-
-    def extra_repr(self) -> str:
-        return (
-            f"num_heads={self.num_heads}, head_dim={self.head_dim}, "
-            f"num_prefix_tokens={self.num_prefix_tokens}, scale={self.scale}"
-        )
-
-
-class TimmAttentionSubstitutionCanonizer(Canonizer):
-    """Replace standard timm ``Attention`` instances with :class:`TimmAttentionUnfolded`.
-
-    Mirror of :class:`EvaAttentionSubstitutionCanonizer` for the
-    standard timm `vision_transformer.Attention` class. Both canonizers
-    are typically bundled into the same composite — each one's
-    ``isinstance`` filter skips the other's target so there's no
-    coupling.
-
-    No source paper — infrastructure for unfolded attention (standard timm ViT).
-
-    Parameters
-    ----------
-    block_indices : tuple[int, ...] | None
-        Indices of blocks to substitute. ``None`` (default) means
-        substitute all attention blocks.
-    """
-
-    def __init__(
-        self,
-        *,
-        block_indices: Optional[Sequence[int]] = None,
-    ):
-        self.block_indices = (
-            None if block_indices is None else tuple(int(i) for i in block_indices)
-        )
-
-        # State filled by ``register``.
-        self.parent: Optional[nn.Module] = None
-        self.attr_name: Optional[str] = None
-        self.original_module: Optional[nn.Module] = None
-        self.unfolded_module: Optional[TimmAttentionUnfolded] = None
-
-    def apply(self, root_module: nn.Module) -> List["TimmAttentionSubstitutionCanonizer"]:
-        # Stock timm `Attention` does not carry `num_prefix_tokens`. The
-        # value lives on the top-level `VisionTransformer` instance and the
-        # canonizer is the right place to read it once and mediate it down
-        # to each unfolded replacement. ``getattr`` with a fallback to 1
-        # handles bare attentions used in tests.
-        num_prefix_tokens = int(getattr(root_module, "num_prefix_tokens", 1))
-
-        instances: List[TimmAttentionSubstitutionCanonizer] = []
-        for parent_name, parent in root_module.named_modules():
-            for attr_name, child in parent.named_children():
-                if not isinstance(child, TimmAttention):
-                    continue
-                if self.block_indices is not None:
-                    block_idx = _extract_block_index(parent_name)
-                    if block_idx is None or block_idx not in self.block_indices:
-                        continue
-                inst = self.copy()
-                inst.register(parent, attr_name, child, num_prefix_tokens=num_prefix_tokens)
-                instances.append(inst)
-        return instances
-
-    def register(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self,
-        parent: nn.Module,
-        attr_name: str,
-        original: nn.Module,
-        *,
-        num_prefix_tokens: int = 1,
-    ) -> None:
-        # See note on ``EvaAttentionSubstitutionCanonizer.register`` —
-        # zennit's lifecycle dispatches through ``apply()``; the ABC
-        # only requires the method name.
-        self.parent = parent
-        self.attr_name = attr_name
-        self.original_module = original
-        unfolded = TimmAttentionUnfolded(original, num_prefix_tokens=num_prefix_tokens)
-        setattr(parent, attr_name, unfolded)
-        self.unfolded_module = unfolded
-
-    def remove(self) -> None:
-        if self.parent is None or self.attr_name is None or self.original_module is None:
-            return
-        setattr(self.parent, self.attr_name, self.original_module)
-        self.unfolded_module = None
-
-    def copy(self) -> "TimmAttentionSubstitutionCanonizer":
-        return type(self)(block_indices=self.block_indices)
-
-
-def _extract_block_index(parent_name: str) -> Optional[int]:
-    """Return ``i`` if ``parent_name`` ends in ``...blocks.i`` else None."""
-    parts = parent_name.split(".")
-    for j in range(len(parts) - 1):
-        if parts[j] == "blocks":
-            try:
-                return int(parts[j + 1])
-            except (ValueError, IndexError):
-                continue
-    return None
-
-
-# ─── 4. Autograd Function kernels for the LRP rules ─────────────────────────
-# These are used ONLY by the canonizers below — never by the modules' own
-# forwards. They live here (not in transformer_patches) because their sole
-# consumers are the per-module canonizers right below them.
-
-
-# ─── 5. LRP-rule canonizers (one per rule, vanilla ↔ rule-aware swap) ───────
-#
-# Each canonizer rebinds the forward of a specific module class with a
-# wrapper that routes through an autograd Function whose backward
-# implements the LRP rule. On ``apply()`` the wrapper is bound; on
-# ``remove()`` the original ``forward`` is restored. Forward output is
-# numerically identical to vanilla in every case (Functions do
-# ``a @ b`` / ``F.softmax`` / ``x * scalar`` etc. — only backward differs).
-
-
-# ─── 6. Internal helpers ────────────────────────────────────────────────────
-
-
-def _bind_forward(module: nn.Module, fn: Callable, attr: str = "forward") -> dict:
-    """Bind ``fn`` as ``attr`` on ``module``'s class — return dict for
-    AttributeCanonizer."""
-    return {attr: fn.__get__(module, type(module))}
-
-
-__all__ = [
-    # Vanilla atomic modules
-    "BilinearMatmul",
-    "AddBias",
-    "ResidualAdd",
-    "PosEmbedAdd",
-    "SoftmaxAlongLastDim",
-    "RotaryEmbedding",
-    "ScaleByConstant",
-    "ChunkAlongLastDim",
-    "ReshapeMergeHeads",
-    "LayerScaleMul",
-    "LRPInspectionLayer",
-    "QInspectionLayer",
-    "KInspectionLayer",
-    "VInspectionLayer",
-    # Containers + substitution canonizers
-    "EvaAttentionUnfolded",
-    "EvaAttentionSubstitutionCanonizer",
-    "TimmAttentionUnfolded",
-    "TimmAttentionSubstitutionCanonizer",
-    ,
-]
