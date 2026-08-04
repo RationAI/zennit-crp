@@ -21,8 +21,7 @@ Predictions tested (hypothesis H_A):
    ``f = |R_branch| / (|R_branch| + |R_skip|)`` at outlier tokens is even lower
    than at normal tokens, in the blocks where outliers live (the ResidualRatio
    rule pushes relevance into the skip where the stream norm explodes).
-2. Composites that split residuals 50/50 (``attnlrp_gamma_residual_symmetric``)
-   or attribute the full bilinear attention (``attnlrp_gamma``) reduce the
+2. Attributing the full bilinear attention (``attnlrp_baseline``) reduces the
    input-relevance mass concentrated on outlier patches relative to
    ``cp_lrp_baseline`` (metric: concentration ratio = share of total |input R|
    inside outlier patches / their area share).
@@ -56,7 +55,7 @@ OUT_DIR = REPO_ROOT / "data" / "results" / "registers"
 FIG_DIR = REPO_ROOT / "figures" / "registers" / "step2_flow"
 NOTE_PATH = REPO_ROOT / "research" / "registers" / "step2_token_flow.md"
 
-ABLATE_CONFIGS = ("cp_lrp_baseline", "attnlrp_gamma", "attnlrp_gamma_residual_symmetric")
+ABLATE_CONFIGS = ("cp_lrp_baseline", "attnlrp_baseline")
 SD_K = 4.0          # outlier criterion: norm > mean + SD_K * sd over patch tokens
 N_TOK = 197         # ViT-B/16 @224: CLS + 14*14 patches
 N_PATCH = 196
@@ -553,8 +552,7 @@ def cmd_report(args):
         rng = np.random.default_rng(0)
         fig, ax = plt.subplots(figsize=(6.4, 3.8))
         names = list(conc)
-        colors = {"cp_lrp_baseline": C_OUT, "attnlrp_gamma": C_ACC,
-                  "attnlrp_gamma_residual_symmetric": C_NRM}
+        colors = {"cp_lrp_baseline": C_OUT, "attnlrp_baseline": C_ACC}
         summary = {}
         for k, name in enumerate(names):
             v = conc[name][~np.isnan(conc[name])]
@@ -571,10 +569,8 @@ def cmd_report(args):
         ax.text(len(names) - 0.45, 1.0, "area-proportional", fontsize=8,
                 color=INK2, va="bottom", ha="right")
         ax.set_xticks(range(len(names)))
-        ax.set_xticklabels([n.replace("attnlrp_gamma_residual_symmetric",
-                                      "attnlrp_gamma\nresid. symmetric")
-                            .replace("cp_lrp_baseline", "cp_lrp\nbaseline")
-                            .replace("attnlrp_gamma", "attnlrp_gamma")
+        ax.set_xticklabels([n.replace("cp_lrp_baseline", "cp_lrp\nbaseline")
+                            .replace("attnlrp_baseline", "attnlrp\nbaseline")
                             for n in names], fontsize=9)
         ax.set_yscale("log")
         ax.set_ylabel("|R| concentration on outlier patches\n(share / area share)",

@@ -1,17 +1,16 @@
-"""``cp_lrp_baseline`` — the LXT-analogue value-path-only recipe.
+"""``cp_lrp_baseline`` — the LXT-analogue value-path-only recipe (the default).
 
-This is the BASELINE every other configuration is built from. Attention is
-unfolded, but the Q and K probes carry a ``StopGradient`` so relevance flows
-**only through the value path** (CP-LRP): the attention weights are treated as
-constants and the softmax/Q·Kᵀ bilinear conduct no relevance. It produces the
-cleanest, sharpest heatmaps (hence its use in the walkthrough), at the cost of
-attributing nothing to *why* a token was attended to.
+Attention is unfolded, but the Q and K probes carry a ``StopGradient`` so
+relevance flows **only through the value path** (CP-LRP): the attention weights
+are treated as constants and the softmax / Q·Kᵀ bilinear conduct no relevance.
+It produces the cleanest, sharpest heatmaps (hence its use in the walkthrough),
+at the cost of attributing nothing to *why* a token was attended to.
 
-Relative to the reference :mod:`lrp_configs.attnlrp_gamma`, the only changed
-building block is the attention path: StopGradient on Q/K here vs the
-AlphaBeta-on-bilinear rule there. That single difference is the headline
-ablation — does attributing the query/key (attention-formation) path help or
-just add noise?
+Relative to :mod:`lrp_configs.attnlrp_baseline` (AttnLRP as published), the only
+changed building block is the attention path: StopGradient on Q/K here vs the
+matmul rule (Eq. 15) + softmax rule (Prop. 3.1) there. That single difference is
+the headline comparison — does attributing the query/key (attention-formation)
+path help or just add noise?
 """
 from __future__ import annotations
 

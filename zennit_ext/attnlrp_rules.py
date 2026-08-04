@@ -74,12 +74,11 @@ def stop_gradient(input):
 
 
 class AlphaBetaMatmul(Hook):
-    """AlphaBeta-on-bilinear LRP rule for a 2-input matmul ``y = a @ b``
-    (AttnLRP bilinear; Bach 2015 generalised — see ``RESEARCH_NOTES.md``
-    Entry 6). Attach to :class:`~zennit_ext.attention_unfolded.BilinearMatmul`
-    via a composite ``layer_map``.
-
-    ``α + β = 1`` ⇒ exact conservation (modulo ε).
+    """Own contribution — AlphaBeta LRP rule generalised to a 2-input bilinear
+    matmul ``y = a @ b`` (separate positive/negative pre-activation paths, ``α+β=1``
+    ⇒ exact conservation modulo ε). Attach to
+    :class:`~zennit_ext.attention_unfolded.BilinearMatmul` via a composite
+    ``layer_map``.
     """
 
     def __init__(self, alpha: float = 0.5, beta: float = 0.5, epsilon: float = 1e-6):
@@ -95,7 +94,6 @@ class AlphaBetaMatmul(Hook):
     def backward(self, module, grad_input, grad_output):
         a, b = self.stored_tensors["a"], self.stored_tensors["b"]
         rel = grad_output[0]
-        # eps, al, be = self.epsilon, self.alpha, self.beta
         a_pos, a_neg = a.clamp(min=0), a.clamp(max=0)
         b_pos, b_neg = b.clamp(min=0), b.clamp(max=0)
         y_pos = a_pos @ b_pos + a_neg @ b_neg
@@ -122,6 +120,9 @@ class ResidualRatio(Hook):
     """Otsuki ratio-split residual rule for a 2-input add ``y = x + branch``:
     distribute ``R_y`` ∝ ``|x|`` vs ``|branch|``. Attach to
     :class:`~zennit_ext.attention_unfolded.ResidualAdd`.
+
+    Sourced from 'Layer-Wise Relevance Propagation with Conservation Property for
+    ResNet', https://doi.org/10.1007/978-3-031-72775-7_20
     """
 
     def __init__(self, epsilon: float = 1e-6):
@@ -143,33 +144,11 @@ class ResidualRatio(Hook):
 
 
 class ResidualL1(Hook):
-    """Sign-preserving, L1-conserving residual split for ``y = x + branch``.
-
-    Distributes the incoming relevance by *signed* contribution but normalises
-    by the **absolute** sum, keeping each operand's own sign:
-
-    .. code::
-
-        S = |x| + |branch| + eps
-        R_x      = R_y * x      / S
-        R_branch = R_y * branch / S
-
-    Properties (per neuron, element-wise):
-
-    * **bounded** — ``|R_x| <= |R_y|`` (no cancellation blow-up; the |.| denom
-      never collapses when ``x ≈ -branch``);
-    * **continuous** — no pole, no seam (singular only at the removable origin);
-    * **sign-aware** — ``sign(R_x) = sign(x)``: an operand that was negative gets
-      negative relevance, so an opposing branch flips sign.
-
-    Conservation is **L1, not signed-sum**: ``|R_x| + |R_branch| = |R_y|``
-    (absolute mass preserved), whereas the signed sum is
-    ``R_x + R_branch = R_y * (x+branch)/S`` which equals ``R_y`` only when ``x``
-    and ``branch`` share a sign. This trades LRP's global "relevance sums to the
-    logit" guarantee (which needs signed-sum conservation at every node) for a
-    local absolute-mass identity — see RESEARCH note on L1-normalised rules.
-    Select it by mapping :class:`~zennit_ext.attention_unfolded.ResidualAdd` to
-    this hook in the composite ``layer_map``.
+    """Own contribution — sign-preserving, L1-conserving residual split for
+    ``y = x + branch``: ``R_x = R_y·x/S``, ``R_branch = R_y·branch/S`` with
+    ``S = |x|+|branch|+ε``. Keeps each operand's sign, bounded (``|R_x|≤|R_y|``),
+    no cancellation pole. Conserves L1 mass, not the signed sum. Attach to
+    :class:`~zennit_ext.attention_unfolded.ResidualAdd`.
     """
 
     def __init__(self, epsilon: float = 1e-6):
@@ -191,9 +170,12 @@ class ResidualL1(Hook):
 
 
 class Uniform(Hook):
-    """Uniform allocation rule (AttnLRP Eq. 7): divide the incoming relevance
-    equally, ``grad_input / factor``. ``factor=2`` is the per-bilinear default
-    (e.g. the LayerScale γ multiply or the ``x + pos_embed`` add).
+    """Uniform allocation rule (Eq. 14): divide the incoming relevance equally,
+    ``grad_input / factor``. ``factor=2`` is the per-bilinear default (e.g. the
+    LayerScale γ multiply or the ``x + pos_embed`` add).
+
+    Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
+    Transformers', https://proceedings.mlr.press/v235/achtibat24a.html
     """
 
     def __init__(self, factor: int = 2):
@@ -211,64 +193,39 @@ class Uniform(Hook):
 
 class Identity(Hook):
     """AttnLRP identity rule for elementwise activations (Eq. 9): relevance
-    passes through, ε-gated. Attach to ``nn.GELU``. (Pure pass-through is
-    zennit's stock ``Pass``.)
+    passes through, ε-gated (``grad_in = grad_out · y/(y+ε)``). Attach to
+    ``nn.GELU``. (Pure pass-through is zennit's stock ``Pass``.)
 
-    ``formula``:
-
-    * ``'relevance'`` (default) — ``grad_in = grad_out · y/(y+ε)``. Correct in
-      zennit's stock relevance-space convention.
-    * ``'grad_times_input'`` — ``grad_in = grad_out · y/(x+ε)`` (the per-element
-      ``f(x)/x``). Correct under ``lxt.efficient.monkey_patch_zennit`` (zennit's
-      ``BasicHook`` reformulated in gradient×input space); matches LXT's
-      ``identity_rule_implicit_fn`` for bit-parity with the LXT vit recipe.
+    Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
+    Transformers', https://proceedings.mlr.press/v235/achtibat24a.html
     """
 
-    def __init__(self, epsilon: float = 1e-6, formula: str = "relevance"):
+    def __init__(self, epsilon: float = 1e-6):
         super().__init__()
         self.epsilon = epsilon
-        self.formula = formula
 
     def forward(self, module, args, kwargs, output):
-        self.stored_tensors["input"] = args[0]
         self.stored_tensors["output"] = output
 
     def backward(self, module, grad_input, grad_output):
         y = self.stored_tensors["output"]
-        if self.formula == "grad_times_input":
-            x = self.stored_tensors["input"]
-            return (grad_output[0] * (y / (x + self.epsilon)),)
         return (grad_output[0] * (y / (y + self.epsilon)),)
 
     def copy(self):
-        return Identity(self.epsilon, self.formula)
+        return Identity(self.epsilon)
 
 
 class SoftmaxAttnLRP(Hook):
-    r"""AttnLRP softmax rule (Achtibat et al. 2024, **Proposition 3.1**) for
-    ``y = softmax(x)`` taken along the last dim.
+    r"""AttnLRP softmax rule (Proposition 3.1) for ``y = softmax(x)`` along the
+    last dim. The softmax-SPECIFIC rule, NOT the generic elementwise identity
+    (:class:`zennit.rules.Pass` / :class:`Identity`): it keeps the cross-term
+    coupling all positions and the input scaling. Map
+    :class:`~zennit_ext.attention_unfolded.SoftmaxAlongLastDim` to this hook.
+    Only fires when the attention weights are differentiable (full AttnLRP); under
+    CP-LRP (StopGradient on Q/K) the softmax is a graph constant.
 
-    .. math::
-        R^{l-1}_i = x_i \,\bigl(R^l_i - s_i \textstyle\sum_j R^l_j\bigr),
-        \qquad s = \mathrm{softmax}(x) = \text{output},\; R^l = \text{grad\_output}
-
-    i.e. the incoming relevance is input-scaled after subtracting ``s_i`` times
-    the *total* incoming relevance — the cross-term ``s_i Σ_j R^l_j`` couples all
-    positions through the softmax denominator. This is the softmax-SPECIFIC rule;
-    it is NOT the generic elementwise identity (:class:`zennit.rules.Pass` /
-    :class:`Identity`), which drops that cross-term and the ``x_i`` factor.
-
-    Select it by mapping :class:`~zennit_ext.attention_unfolded.SoftmaxAlongLastDim`
-    to this hook in a composite ``layer_map`` (replacing the default
-    ``(SoftmaxAlongLastDim, Pass())`` entry). Note it only conducts relevance when
-    the attention weights are differentiable (full AttnLRP, AlphaBeta on the
-    bilinears); under CP-LRP (StopGradient on Q/K) the softmax is a graph constant
-    and this rule never fires.
-
-    Not strictly sum-conserving: ``Σ_i R^{l-1}_i = Σ_i x_i R^l_i −
-    (Σ_i x_i s_i)(Σ_j R^l_j)``, since ``Σ_i x_i s_i`` (the softmax-weighted mean
-    logit) is not 1 — this matches Prop 3.1 as stated; verify conservation
-    empirically against the model before relying on it.
+    Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
+    Transformers', https://proceedings.mlr.press/v235/achtibat24a.html
     """
 
     def forward(self, module, args, kwargs, output):
@@ -283,6 +240,151 @@ class SoftmaxAttnLRP(Hook):
 
     def copy(self):
         return SoftmaxAttnLRP()
+
+
+class MatmulAttnLRP(Hook):
+    """AttnLRP bilinear rule for a 2-input matmul ``y = a @ b`` (Eq. 15): both
+    operands share the ``2·output + ε`` stabiliser, splitting conservation in
+    half between the two factors. Attach to
+    :class:`~zennit_ext.attention_unfolded.BilinearMatmul` (both the ``q@kᵀ`` and
+    ``attn@v`` products). Numerically matches the LXT reference matmul rule.
+
+    Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
+    Transformers', https://proceedings.mlr.press/v235/achtibat24a.html
+    """
+
+    def __init__(self, epsilon: float = 1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, module, args, kwargs, output):
+        self.stored_tensors["a"] = args[0]
+        self.stored_tensors["b"] = args[1]
+        self.stored_tensors["output"] = output
+
+    def backward(self, module, grad_input, grad_output):
+        a, b = self.stored_tensors["a"], self.stored_tensors["b"]
+        s = grad_output[0] / stabilize(2.0 * self.stored_tensors["output"], self.epsilon)
+        grad_a = a * (s @ b.transpose(-1, -2))
+        grad_b = b * (a.transpose(-1, -2) @ s)
+        return (grad_a, grad_b)
+
+    def copy(self):
+        return MatmulAttnLRP(self.epsilon)
+
+
+class EpsilonAdd(Hook):
+    """AttnLRP standard ε add rule for a 2-input residual add ``y = x + branch``:
+    signed proportional split ``R_x = R_y·x/(y+ε)``, ``R_branch = R_y·branch/(y+ε)``
+    (conserves the signed sum). AttnLRP's skip-connection handling; mirrors LXT's
+    ``add2`` rule. Attach to
+    :class:`~zennit_ext.attention_unfolded.ResidualAdd`.
+
+    Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
+    Transformers', https://proceedings.mlr.press/v235/achtibat24a.html
+    """
+
+    def __init__(self, epsilon: float = 1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, module, args, kwargs, output):
+        self.stored_tensors["x"] = args[0]
+        self.stored_tensors["branch"] = args[1]
+        self.stored_tensors["output"] = output
+
+    def backward(self, module, grad_input, grad_output):
+        x, branch = self.stored_tensors["x"], self.stored_tensors["branch"]
+        s = grad_output[0] / stabilize(self.stored_tensors["output"], self.epsilon)
+        return (x * s, branch * s)
+
+    def copy(self):
+        return EpsilonAdd(self.epsilon)
+
+
+def _chefer_normalize(r_u, r_v, rel, epsilon):
+    """Chefer et al. (CVPR 2021) binary-op conservation normalisation (Eq. 9):
+    rescale the two operand relevances so they split the incoming relevance
+    ``rel`` by their absolute mass and conserve the signed sum. Literal paper
+    form ``R̄^u = R^u · |S_u|/(|S_u|+|S_v|) · (Σ rel)/S_u``; every division goes
+    through zennit's :func:`~zennit.core.stabilize`. Per-sample scalars (sum over
+    all but the batch dim).
+    """
+    dims = tuple(range(1, rel.dim()))
+    s_u = r_u.sum(dims, keepdim=True)
+    s_v = r_v.sum(dims, keepdim=True)
+    r_tot = rel.sum(dims, keepdim=True)
+    denom = stabilize(s_u.abs() + s_v.abs(), epsilon)
+    r_u = r_u * (s_u.abs() / denom) * (r_tot / stabilize(s_u, epsilon))
+    r_v = r_v * (s_v.abs() / denom) * (r_tot / stabilize(s_v, epsilon))
+    return (r_u, r_v)
+
+
+class CheferMatmul(Hook):
+    """Chefer et al. (CVPR 2021) relevance rule for a 2-input matmul ``y = a @ b``:
+    the z-rule (gradient×input) decomposition onto each operand followed by the
+    Eq. 9 conservation normalisation. The paper applies this to BOTH attention
+    matmuls and skip-connection adds (matrix multiplication otherwise violates
+    conservation, Lemma 1). Attach to
+    :class:`~zennit_ext.attention_unfolded.BilinearMatmul`.
+
+    NB. The authors' released code normalises only the ``Add`` layer and leaves
+    ``einsum`` (the matmul) un-normalised — a paper/code mismatch; this follows
+    the paper.
+
+    Sourced from 'Transformer Interpretability Beyond Attention Visualization',
+    https://doi.org/10.1109/CVPR46437.2021.00084
+    """
+
+    def __init__(self, epsilon: float = 1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, module, args, kwargs, output):
+        self.stored_tensors["a"] = args[0]
+        self.stored_tensors["b"] = args[1]
+        self.stored_tensors["output"] = output
+
+    def backward(self, module, grad_input, grad_output):
+        a, b = self.stored_tensors["a"], self.stored_tensors["b"]
+        rel = grad_output[0]
+        s = rel / stabilize(self.stored_tensors["output"], self.epsilon)
+        r_a = a * (s @ b.transpose(-1, -2))
+        r_b = b * (a.transpose(-1, -2) @ s)
+        return _chefer_normalize(r_a, r_b, rel, self.epsilon)
+
+    def copy(self):
+        return CheferMatmul(self.epsilon)
+
+
+class CheferAdd(Hook):
+    """Chefer et al. (CVPR 2021) relevance rule for a 2-input add ``y = x + b``:
+    the z-rule split followed by the same Eq. 9 conservation normalisation as
+    :class:`CheferMatmul`. Mirrors their ``Add`` layer. Attach to
+    :class:`~zennit_ext.attention_unfolded.ResidualAdd`.
+
+    Sourced from 'Transformer Interpretability Beyond Attention Visualization',
+    https://doi.org/10.1109/CVPR46437.2021.00084
+    """
+
+    def __init__(self, epsilon: float = 1e-6):
+        super().__init__()
+        self.epsilon = epsilon
+
+    def forward(self, module, args, kwargs, output):
+        self.stored_tensors["x"] = args[0]
+        self.stored_tensors["branch"] = args[1]
+        self.stored_tensors["output"] = output
+
+    def backward(self, module, grad_input, grad_output):
+        rel = grad_output[0]
+        s = rel / stabilize(self.stored_tensors["output"], self.epsilon)
+        r_x = self.stored_tensors["x"] * s
+        r_b = self.stored_tensors["branch"] * s
+        return _chefer_normalize(r_x, r_b, rel, self.epsilon)
+
+    def copy(self):
+        return CheferAdd(self.epsilon)
 
 
 # ─── 3. Forward-method replacements (installed per-instance by Canonizers) ──
@@ -474,6 +576,9 @@ class LayerNormForwardCanonizer(AttributeCanonizer):
 
     AttnLRP §3.2.2 — treats LayerNorm's normalisation as element-wise so
     relevance flows through the affine output unchanged.
+
+    Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
+    Transformers', https://proceedings.mlr.press/v235/achtibat24a.html
     """
 
     def __init__(self):
@@ -490,7 +595,10 @@ class LayerNormForwardCanonizer(AttributeCanonizer):
 
 class DropoutPassthroughCanonizer(AttributeCanonizer):
     """Canonizer that disables ``nn.Dropout`` during attribution (model may
-    be in train mode)."""
+    be in train mode).
+
+    No source paper — infrastructure for disabling dropout during attribution.
+    """
 
     def __init__(self):
         super().__init__(self._attribute_map)
@@ -511,6 +619,8 @@ class TimmBlockResidualCanonizer(AttributeCanonizer):
     hookable. The residual *rule* (ratio / symmetric / L1 / none) is then chosen
     in the composite ``layer_map`` by mapping ``ResidualAdd`` to a hook; this
     canonizer installs only the (single) module type and takes no rule argument.
+
+    No source paper — infrastructure for hookable residual adds.
     """
 
     def __init__(self):
@@ -556,6 +666,8 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
     The residual *rule* is chosen in the composite ``layer_map`` (map
     ``ResidualAdd`` to a hook), not here — this canonizer always installs the
     single ``ResidualAdd`` type.
+
+    No source paper — infrastructure for hookable residual adds (Eva/DINOv3).
     """
 
     def __init__(self, *, layerscale_uniform: bool = False):
@@ -611,6 +723,9 @@ class TorchvisionMHACPLRPCanonizer(AttributeCanonizer):
     composite ``layer_map``) to obtain the zennit-side equivalent of
     LXT-efficient's published vision-transformer recipe
     (``lxt.efficient.models.vit_torch.cp_LRP``).
+
+    Sourced from 'XAI for Transformers: Better Explanations through Conservative
+    Propagation', https://proceedings.mlr.press/v162/ali22a.html
     """
 
     def __init__(self):
@@ -631,7 +746,11 @@ class TorchvisionMHACPLRPCanonizer(AttributeCanonizer):
 class VitPosEmbedPALRPCanonizer(AttributeCanonizer):
     """Canonizer that swaps ``_pos_embed`` on timm ``VisionTransformer``
     instances to apply the PA-LRP uniform rule (Bakish et al. 2025;
-    arXiv:2506.02138). See :func:`vit_pos_embed_palrp`."""
+    arXiv:2506.02138). See :func:`vit_pos_embed_palrp`.
+
+    Sourced from PA-LRP (Bakish et al., 2025),
+    https://openreview.net/forum?id=bZ0MXXoldX
+    """
 
     def __init__(self):
         super().__init__(self._attribute_map)
@@ -671,6 +790,9 @@ class TimmViTCanonizer(CompositeCanonizer):
 
     All mutations are instance-level and reversible (revert on
     ``composite.context()`` exit).
+
+    No source paper — infrastructure aggregator bundling the per-module
+    canonizers.
 
     Parameters
     ----------
@@ -730,7 +852,7 @@ class TimmViTCanonizer(CompositeCanonizer):
 __all__ = [
     # LRP rules as zennit Hook subclasses
     "AlphaBetaMatmul", "ResidualRatio", "ResidualL1", "Uniform", "Identity",
-    "SoftmaxAttnLRP",
+    "SoftmaxAttnLRP", "MatmulAttnLRP", "EpsilonAdd", "CheferMatmul", "CheferAdd",
     "stop_gradient",
     "layer_norm_forward", "dropout_passthrough_forward", "vit_pos_embed_palrp",
     "LayerNormForwardCanonizer", "DropoutPassthroughCanonizer",

@@ -214,7 +214,7 @@ def chefer_transformer_attribution(model, attribution, composite, xn: torch.Tens
       ``get_attn_gradients``).
     * ``cam`` — the attention-map **LRP relevance** ``R_A``, recorded at each
       block's ``attn.softmax`` under our AttnLRP composite (``composite`` must be
-      the full-bilinear recipe, e.g. ``attnlrp_gamma``; the value-path-only
+      a recipe that conducts attention relevance, e.g. ``chefer_lrp``; the value-path-only
       ``cp_lrp_baseline`` StopGradients Q/K, leaving the softmax a graph constant
       with ``R_A ≡ 0``). This is the faithful analogue of the authors'
       ``get_attn_cam`` — LRP relevance of the attention softmax — computed with

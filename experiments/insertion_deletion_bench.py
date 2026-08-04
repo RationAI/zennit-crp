@@ -30,7 +30,7 @@ METHODS (Benchmark run 1)
 -------------------------
 ``lrp``     — CP-LRP (``cp_lrp_baseline``), signed input relevance, max/patch.
 ``chefer``  — Chefer/Gur/Wolf CVPR'21 Transformer Attribution (faithful; the
-              attention-map LRP relevance comes from our ``attnlrp_gamma``).
+              attention-map LRP relevance comes from the ``chefer_lrp`` composite).
 ``rollout`` — Abnar & Zuidema attention rollout.
 ``rise``    — RISE (Petsiuk et al. BMVC'18), N random masks, max/patch.
 ``random``  — mean over ``K`` random saliency maps (theoretical floor).
@@ -105,7 +105,7 @@ RISE_N_MASKS = 2000
 RISE_S = 8
 RISE_P = 0.5
 RANDOM_K = 5
-CHEFER_COMPOSITE = "attnlrp_gamma"     # full-bilinear AttnLRP → attention-map relevance R_A
+CHEFER_COMPOSITE = "chefer_lrp"        # Chefer CVPR'21 LRP → attention-map relevance R_A
 LRP_COMPOSITE = "cp_lrp_baseline"
 
 app = typer.Typer(add_completion=False, help=__doc__)

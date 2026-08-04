@@ -48,8 +48,8 @@ class LRPConfig:
         Default concept probe site for this recipe (one of :data:`SITES`).
     isolates : str
         The single building block this config varies relative to the
-        reference (``attnlrp_gamma``) — used to group results in the
-        variant-ranking table. ``""`` for the reference / baseline itself.
+        published ``attnlrp_baseline`` — used to group results. ``""`` for a
+        reference recipe (``cp_lrp_baseline``, ``attnlrp_baseline``) itself.
     """
 
     name: str

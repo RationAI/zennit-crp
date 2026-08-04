@@ -232,4 +232,142 @@ class AttnLRPCombinedComposite(LayerMapComposite):
         ] + base_map
         super().__init__(layer_map=layer_map, canonizers=canonizers)
 
-__all__ = ["AttnLRPEpsilonComposite", "AttnLRPGammaComposite", "AttnLRPCombinedComposite"]
+class AttnLRPBaselineComposite(LayerMapComposite):
+    """AttnLRP exactly as published (Achtibat et al., ICML 2024) — the faithful
+    reference recipe, one rule per operation from the paper:
+
+    * bilinears ``q@kᵀ`` / ``attn@v`` → :class:`MatmulAttnLRP` (Eq. 15);
+    * softmax → :class:`SoftmaxAttnLRP` (Prop. 3.1);
+    * residual adds → :class:`EpsilonAdd` (standard ε add, LXT ``add2``);
+    * GELU → :class:`Identity` (Eq. 9); LayerNorm → ``Pass`` (Prop. 3.4
+      pass-through, no bias absorbs relevance);
+    * FFN linears (``mlp.*``) → γ-LRP (Table 4, γ=0.05); attention projections
+      ``W_q/W_k/W_v`` (``attn.qkv``) and ``W_o`` (``attn.proj``) and the classifier
+      head → ε-LRP (Table 4); patch-embed conv → γ-LRP (γ=0.25);
+    * LayerScale γ-multiply → :class:`Uniform` (Eq. 14).
+
+    The FFN-γ / projection-ε split is by module name (the paper's Table 4
+    distinguishes them; ``LayerMapComposite`` matches by type alone), so
+    :meth:`mapping` special-cases ``nn.Linear`` before the type map.
+
+    Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
+    Transformers', https://proceedings.mlr.press/v235/achtibat24a.html
+    """
+
+    def __init__(
+        self, *, ffn_gamma: float = 0.05, conv_gamma: float = 0.25,
+        epsilon: float = 1e-6, canonizers=None,
+    ):
+        # Lazy import to avoid the import cycle
+        # (attnlrp_composites → attention_unfolded → attnlrp_rules).
+        from zennit_ext.attention_unfolded import (
+            EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
+            BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
+            LayerScaleMul,
+        )
+        from zennit_ext.attnlrp_rules import (
+            TimmViTCanonizer, MatmulAttnLRP, SoftmaxAttnLRP, Identity, Uniform,
+            EpsilonAdd,
+        )
+        self._ffn_gamma = ffn_gamma
+        self._epsilon = epsilon
+        canonizers = list(canonizers or []) + [
+            TimmViTCanonizer(
+                palrp=False, residual=True, layerscale_uniform=True, epsilon=epsilon),
+            EvaAttentionSubstitutionCanonizer(block_indices=None),
+            TimmAttentionSubstitutionCanonizer(block_indices=None),
+        ]
+        layer_map = [
+            (BilinearMatmul, MatmulAttnLRP(epsilon=epsilon)),
+            (SoftmaxAlongLastDim, SoftmaxAttnLRP()),
+            (ScaleByConstant, Pass()),
+            (ResidualAdd, EpsilonAdd(epsilon=epsilon)),   # PosEmbedAdd inherits this
+            (LayerScaleMul, Uniform(factor=2)),
+            (nn.GELU, Identity(epsilon=epsilon)),
+            (nn.LayerNorm, Pass()),
+            (nn.Dropout, Pass()),
+            (nn.Conv2d, Gamma(gamma=conv_gamma)),
+            (nn.Identity, Pass()),
+        ]
+        super().__init__(layer_map=layer_map, canonizers=canonizers)
+
+    def mapping(self, ctx, name, module):
+        # FFN linears → γ; attention projections (qkv/proj) + head → ε (Table 4).
+        if isinstance(module, nn.Linear):
+            return (Gamma(gamma=self._ffn_gamma) if ".mlp." in name
+                    else Epsilon(epsilon=self._epsilon))
+        return super().mapping(ctx, name, module)
+
+
+class CheferLRPComposite(LayerMapComposite):
+    """Chefer et al. (CVPR 2021) 'Transformer Interpretability Beyond Attention
+    Visualization' — the LRP relevance stage exactly as defined in that paper,
+    the engine for the Chefer attention row of the insertion-deletion benchmark:
+
+    * hidden linears → z⁺ rule (α=1, β=0, positive contributions only; Eq. 4);
+    * bilinears ``q@kᵀ`` / ``attn@v`` → :class:`CheferMatmul` (z-rule + Eq. 9
+      conservation normalisation — the paper normalises attention matmuls too);
+    * softmax → ``Pass``: the paper does NOT propagate LRP through the softmax;
+      attention is aggregated by the gradient×relevance rollout (Eq. 13-14),
+      which lives in the attribution method, not this composite;
+    * residual adds → :class:`CheferAdd` (z-rule + Eq. 9 normalisation, their
+      ``Add`` layer);
+    * GELU / LayerNorm / Dropout → ``Pass``; LayerScale → :class:`Uniform`.
+
+    Standalone input-pixel attribution: the patch-embed conv (the first,
+    pixel-space layer) uses the z^B box rule (:class:`zennit.rules.ZBox`),
+    Chefer's first-layer ``Conv2d`` branch, with pixel bounds ``low`` / ``high``
+    — set these to the min / max of the *normalised* input for exact conservation
+    (defaults ``-3`` / ``3`` cover a standard mean/std normalisation). For the
+    benchmark's Chefer row (which reads ``R_A`` at the softmax, never pixels) the
+    conv rule is irrelevant.
+
+    Sourced from 'Transformer Interpretability Beyond Attention Visualization',
+    https://doi.org/10.1109/CVPR46437.2021.00084
+    """
+
+    def __init__(self, *, epsilon: float = 1e-6, low: float = -3.0,
+                 high: float = 3.0, canonizers=None):
+        from zennit.rules import ZPlus, ZBox
+        from zennit_ext.attention_unfolded import (
+            EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
+            BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
+            LayerScaleMul,
+        )
+        from zennit_ext.attnlrp_rules import (
+            TimmViTCanonizer, CheferMatmul, CheferAdd, Uniform,
+        )
+        self._zbox = ZBox(low=low, high=high)   # first (pixel-space) conv
+        canonizers = list(canonizers or []) + [
+            TimmViTCanonizer(
+                palrp=False, residual=True, layerscale_uniform=True, epsilon=epsilon),
+            EvaAttentionSubstitutionCanonizer(block_indices=None),
+            TimmAttentionSubstitutionCanonizer(block_indices=None),
+        ]
+        layer_map = [
+            (BilinearMatmul, CheferMatmul(epsilon=epsilon)),
+            (SoftmaxAlongLastDim, Pass()),
+            (ScaleByConstant, Pass()),
+            (ResidualAdd, CheferAdd(epsilon=epsilon)),
+            (LayerScaleMul, Uniform(factor=2)),
+            (nn.GELU, Pass()),
+            (nn.LayerNorm, Pass()),
+            (nn.Dropout, Pass()),
+            (nn.Linear, ZPlus()),
+            (nn.Conv2d, ZPlus()),
+            (nn.Identity, Pass()),
+        ]
+        super().__init__(layer_map=layer_map, canonizers=canonizers)
+
+    def mapping(self, ctx, name, module):
+        # Chefer's first-layer (pixel-space) conv uses the z^B box rule; the
+        # patch-embed conv is the only Conv2d in a ViT, so match it by type.
+        if isinstance(module, nn.Conv2d):
+            return self._zbox
+        return super().mapping(ctx, name, module)
+
+
+__all__ = [
+    "AttnLRPEpsilonComposite", "AttnLRPGammaComposite", "AttnLRPCombinedComposite",
+    "AttnLRPBaselineComposite", "CheferLRPComposite",
+]

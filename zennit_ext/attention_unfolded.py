@@ -547,6 +547,8 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
     rule hooks (e.g. :class:`~zennit_ext.attnlrp_rules.AlphaBetaMatmul`) to
     the new ``BilinearMatmul`` / ``SoftmaxAlongLastDim`` / etc. instances.
 
+    No source paper — infrastructure for unfolded attention (Eva/DINOv3).
+
     Parameters
     ----------
     block_indices : tuple[int, ...] | None
@@ -790,6 +792,8 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
     ``isinstance`` filter skips the other's target so there's no
     coupling.
 
+    No source paper — infrastructure for unfolded attention (standard timm ViT).
+
     Parameters
     ----------
     block_indices : tuple[int, ...] | None
@@ -891,7 +895,12 @@ def _extract_block_index(parent_name: str) -> Optional[int]:
 
 
 class StopGradient(Hook):
-    """LRP rule that blocks relevance flow through the module.
+    """LRP rule that blocks relevance flow through the module (CP-LRP: the
+    attention weights are treated as constants, so relevance flows only through
+    the value path).
+
+    Sourced from 'XAI for Transformers: Better Explanations through Conservative
+    Propagation', https://proceedings.mlr.press/v162/ali22a.html
 
     Backward returns a zero tensor in place of every non-``None`` element
     of ``grad_input`` — i.e. the LRP relevance reaching the module on its
