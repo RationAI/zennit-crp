@@ -2,14 +2,13 @@ from timm.models.eva import EvaAttention, EvaBlock
 from timm.models.vision_transformer import Attention as TimmAttention, Block as TimmBlock, VisionTransformer
 from zennit.canonizers import AttributeCanonizer, Canonizer, CompositeCanonizer
 
-from typing import Callable, List, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from zennit_extensions.attention_unfolded import EvaAttentionUnfolded, TimmAttentionUnfolded
 
 
 import torch.nn as nn
 
-from zennit_extensions.attnlrp_rules import LayerNormForwardCanonizer, _bind_forward, _make_mha_cplrp_forward, dropout_passthrough_forward, vit_pos_embed_palrp
 
 
 def _extract_block_index(parent_name: str) -> Optional[int]:
@@ -208,30 +207,6 @@ def _bind_forward(module: nn.Module, fn: Callable, attr: str = "forward") -> dic
 
 
 
-class VitPosEmbedPALRPCanonizer(AttributeCanonizer):
-    """Canonizer that swaps ``_pos_embed`` on timm ``VisionTransformer``
-    instances to apply the PA-LRP uniform rule (Bakish et al. 2025;
-    arXiv:2506.02138). See :func:`vit_pos_embed_palrp`.
-
-    Sourced from PA-LRP (Bakish et al., 2025),
-    https://openreview.net/forum?id=bZ0MXXoldX
-    """
-
-    def __init__(self):
-        super().__init__(self._attribute_map)
-
-    def _attribute_map(self, _name, module):
-        if not isinstance(module, VisionTransformer) or not hasattr(module, "_pos_embed"):
-            return None
-        from zennit_extensions.attention_unfolded import PosEmbedAdd
-        attrs = _bind_forward(module, vit_pos_embed_palrp, attr="_pos_embed")
-        attrs["_lrp_posadd"] = PosEmbedAdd()  # x + pos_embed → its own rule via layer_map
-        return attrs
-
-    def copy(self):
-        return type(self)()
-
-
 def _eva_block_forward(self, x, rope=None, attn_mask=None, is_causal=False):
     """``EvaBlock.forward`` replacement that routes the residual adds (and,
     optionally, the LayerScale γ multiplications) through ``nn.Module`` instances
@@ -374,39 +349,15 @@ class TimmBlockResidualCanonizer(AttributeCanonizer):
         return type(self)()
 
 
-class DropoutPassthroughCanonizer(AttributeCanonizer):
-    """Canonizer that disables ``nn.Dropout`` during attribution (model may
-    be in train mode).
-
-    No source paper — infrastructure for disabling dropout during attribution.
-    """
-
-    def __init__(self):
-        super().__init__(self._attribute_map)
-
-    def _attribute_map(self, _name, module):
-        if not isinstance(module, nn.Dropout):
-            return None
-        return _bind_forward(module, dropout_passthrough_forward)
-
-    def copy(self):
-        return type(self)()
-
-
-class TimmViTCanonizer2(CompositeCanonizer):
+class TimmViTCanonizer(CompositeCanonizer):
     """Aggregator: bundles the per-module canonizers needed for AttnLRP on
     a timm ViT (standard or Eva-stack).
 
-    Combines:
-
-    * :class:`LayerNormForwardCanonizer` — LayerNorm with stop-gradient(std).
-    * :class:`DropoutPassthroughCanonizer` — disable Dropout for backward.
-    * :class:`VitPosEmbedPALRPCanonizer` (when ``palrp=True``) — PA-LRP on
-      the ``x + pos_embed`` step (Bakish et al. 2025).
-    * :class:`TimmBlockResidualCanonizer` and
-      :class:`EvaBlockResidualCanonizer` (when ``residual`` is True) — route the
-      residual adds through ``ResidualAdd`` so the composite ``layer_map`` can
-      apply a residual rule. The rule itself is a ``layer_map`` choice.
+    Combines :class:`TimmBlockResidualCanonizer` and
+    :class:`EvaBlockResidualCanonizer` (when ``residual`` is True) — routing the
+    residual adds through ``ResidualAdd`` so the composite ``layer_map`` can apply
+    a residual rule. LayerNorm / Dropout need no canonizer (mapped to ``Pass``);
+    PA-LRP was removed.
 
     Attention itself is NOT handled here. It is substituted to its
     unfolded form (:class:`TimmAttentionUnfolded` /
@@ -423,9 +374,7 @@ class TimmViTCanonizer2(CompositeCanonizer):
     Parameters
     ----------
     palrp : bool
-        Enable PA-LRP on the absolute pos_embed addition. Only relevant
-        for ViTs with ``self.pos_embed`` (vit_base etc.); no-op for
-        DINOv3 (RoPE only).
+        Deprecated no-op, accepted for back-compat (PA-LRP removed).
     residual : bool
         Route the block residual adds through ``ResidualAdd`` modules so the
         composite ``layer_map`` can apply a residual rule. The rule itself
@@ -446,12 +395,7 @@ class TimmViTCanonizer2(CompositeCanonizer):
         layerscale_uniform: bool = False,
         epsilon: float = 1e-6,
     ):
-        canonizers: List[Canonizer] = [
-            LayerNormForwardCanonizer(),
-            DropoutPassthroughCanonizer(),
-        ]
-        if palrp:
-            canonizers.append(VitPosEmbedPALRPCanonizer())
+        canonizers: List[Canonizer] = []
         if residual:
             canonizers.append(TimmBlockResidualCanonizer())
             canonizers.append(EvaBlockResidualCanonizer(
@@ -462,45 +406,3 @@ class TimmViTCanonizer2(CompositeCanonizer):
             # wrapper lives inside that forward) even without a residual rule.
             canonizers.append(EvaBlockResidualCanonizer(layerscale_uniform=True))
         super().__init__(canonizers)
-
-
-class TorchvisionMHACPLRPCanonizer(AttributeCanonizer):
-    """Canonizer that installs CP-LRP on ``torch.nn.MultiheadAttention``.
-
-    Drop-in zennit replacement for LXT's instance-level patch in
-    :func:`lxt.efficient.patches.cp_multi_head_attention_forward`. Each
-    matched MHA instance gets its forward rebound to a wrapper that
-    calls ``query.detach()`` and ``key.detach()`` before delegating to
-    the original forward — so Q,K paths carry no gradient and only the
-    value path receives relevance.
-
-    Targets ``nn.MultiheadAttention`` (any instance). The intended use
-    is on `torchvision.models.vision_transformer` ViTs (vit_b_16,
-    vit_l_16, etc.); other models using ``nn.MultiheadAttention`` are
-    canonized identically.
-
-    Combine with :class:`LayerNormForwardCanonizer` and
-    :class:`DropoutPassthroughCanonizer` (and ``nn.GELU`` → ``Pass`` in the
-    composite ``layer_map``) to obtain the zennit-side equivalent of
-    LXT-efficient's published vision-transformer recipe
-    (``lxt.efficient.models.vit_torch.cp_LRP``).
-
-    Sourced from 'XAI for Transformers: Better Explanations through Conservative
-    Propagation', https://proceedings.mlr.press/v162/ali22a.html
-    """
-
-    def __init__(self):
-        super().__init__(self._attribute_map)
-
-    def _attribute_map(self, _name, module):
-        if not isinstance(module, nn.MultiheadAttention):
-            return None
-        # Capture the BOUND original forward so the closure has self pre-baked.
-        original_forward = module.forward
-        patched = _make_mha_cplrp_forward(original_forward)
-        return _bind_forward(module, patched)
-
-    def copy(self):
-        return type(self)()
-
-

@@ -33,7 +33,7 @@ from crp.concepts import (
 )
 from zennit_extensions.canonisation.canonizers import (
     EvaAttentionSubstitutionCanonizer,
-    TimmViTCanonizer2,
+    TimmViTCanonizer,
 )
 from crp.attribution import CondAttribution
 from zennit_extensions import (
@@ -101,24 +101,25 @@ def img_batch():
 
 class TestTimmViTCanonizer:
     def test_forward_swap_is_reversible(self, vit_tiny):
-        """TimmViTCanonizer installs forward closures on LayerNorm /
-        GELU / Dropout (attention is now handled by the separate
-        substitution canonizer). After context exit, the original
-        forwards must be restored.
+        """TimmViTCanonizer(residual=True) installs a forward closure on each
+        timm Block (routing the residual adds through ResidualAdd). After context
+        exit the original forwards must be restored. (LayerNorm / Dropout carry no
+        canonizer — they are handled by the ``Pass`` rule; attention is handled by
+        the separate substitution canonizer.)
         """
-        ln = vit_tiny.blocks[0].norm1
-        original_class_forward = type(ln).forward
-        assert "forward" not in ln.__dict__, "test pre-condition: clean state"
-        canonizer = TimmViTCanonizer2()
+        blk = vit_tiny.blocks[0]
+        original_class_forward = type(blk).forward
+        assert "forward" not in blk.__dict__, "test pre-condition: clean state"
+        canonizer = TimmViTCanonizer(residual=True)
         instances = canonizer.apply(vit_tiny)
         try:
-            assert "forward" in ln.__dict__, "canonizer did not swap LayerNorm forward"
-            assert ln.forward.__func__ is not original_class_forward
+            assert "forward" in blk.__dict__, "canonizer did not swap Block forward"
+            assert blk.forward.__func__ is not original_class_forward
         finally:
             for inst in instances:
                 inst.remove()
-        assert "forward" not in ln.__dict__
-        assert type(ln).forward is original_class_forward
+        assert "forward" not in blk.__dict__
+        assert type(blk).forward is original_class_forward
 
 
 # ── Standard timm path: composites instantiate + run ────────────────────────

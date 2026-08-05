@@ -16,7 +16,7 @@ from zennit.rules import Epsilon, Gamma, Pass
 from zennit_extensions.rules.bajger_contrib import (
     AlphaBetaMatmul,
 )
-from zennit_extensions.canonisation.canonizers import EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer, TimmViTCanonizer2
+from zennit_extensions.canonisation.canonizers import EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer, TimmViTCanonizer
 from zennit_extensions.rules.attnlrp import EpsilonAdd, MatmulAttnLRP, SoftmaxAttnLRP, Uniform
 from zennit_extensions.rules.bajger_contrib import ResidualL1
 from zennit_extensions.rules.chefer2021 import CheferAdd, CheferMatmul
@@ -79,7 +79,7 @@ class AttnLRPEpsilonComposite(LayerMapComposite):
         palrp: bool = False, residual_lrp: Optional[str] = None,
     ):
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer2(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
+            TimmViTCanonizer(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
         ]
         super().__init__(layer_map=_epsilon_layer_map(epsilon), canonizers=canonizers)
 
@@ -110,7 +110,7 @@ class AttnLRPGammaComposite(LayerMapComposite):
         palrp: bool = False, residual_lrp: Optional[str] = None,
     ):
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer2(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
+            TimmViTCanonizer(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
         ]
         super().__init__(
             layer_map=_gamma_layer_map(gamma, epsilon), canonizers=canonizers,
@@ -195,7 +195,7 @@ class AttnLRPCombinedComposite(LayerMapComposite):
                 f"residual_lrp must be None or one of {sorted(res_rules)}; "
                 f"got {residual_lrp!r}")
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer2(
+            TimmViTCanonizer(
                 palrp=palrp, residual=residual_lrp is not None,
                 layerscale_uniform=layerscale_uniform,
                 epsilon=epsilon,
@@ -242,7 +242,7 @@ class AttnLRPBaselineComposite(LayerMapComposite):
     * bilinears ``q@kᵀ`` / ``attn@v`` → :class:`MatmulAttnLRP` (Eq. 15);
     * softmax → :class:`SoftmaxAttnLRP` (Prop. 3.1);
     * residual adds → :class:`EpsilonAdd` (standard ε add, LXT ``add2``);
-    * GELU → :class:`Identity` (Eq. 9); LayerNorm → ``Pass`` (Prop. 3.4
+    * GELU → ``Pass`` (Eq. 9 elementwise identity = pure pass-through); LayerNorm → ``Pass`` (Prop. 3.4
       pass-through, no bias absorbs relevance);
     * FFN linears (``mlp.*``) → γ-LRP (Table 4, γ=0.05); attention projections
       ``W_q/W_k/W_v`` (``attn.qkv``) and ``W_o`` (``attn.proj``) and the classifier
@@ -267,13 +267,10 @@ class AttnLRPBaselineComposite(LayerMapComposite):
             BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
             LayerScaleMul,
         )
-        from zennit_extensions.attnlrp_rules import (
-            Identity,
-        )
         self._ffn_gamma = ffn_gamma
         self._epsilon = epsilon
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer2(
+            TimmViTCanonizer(
                 palrp=False, residual=True, layerscale_uniform=True, epsilon=epsilon),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
             TimmAttentionSubstitutionCanonizer(block_indices=None),
@@ -284,7 +281,7 @@ class AttnLRPBaselineComposite(LayerMapComposite):
             (ScaleByConstant, Pass()),
             (ResidualAdd, EpsilonAdd(epsilon=epsilon)),   # PosEmbedAdd inherits this
             (LayerScaleMul, Uniform(factor=2)),
-            (nn.GELU, Identity(epsilon=epsilon)),
+            (nn.GELU, Pass()),   # AttnLRP Eq. 9 identity = pure pass-through
             (nn.LayerNorm, Pass()),
             (nn.Dropout, Pass()),
             (nn.Conv2d, Gamma(gamma=conv_gamma)),
@@ -335,11 +332,11 @@ class CheferLRPComposite(LayerMapComposite):
             LayerScaleMul,
         )
         from zennit_extensions.canonisation.canonizers import (
-            TimmViTCanonizer2,
+            TimmViTCanonizer,
         )
         self._zbox = ZBox(low=low, high=high)   # first (pixel-space) conv
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer2(
+            TimmViTCanonizer(
                 palrp=False, residual=True, layerscale_uniform=True, epsilon=epsilon),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
             TimmAttentionSubstitutionCanonizer(block_indices=None),
