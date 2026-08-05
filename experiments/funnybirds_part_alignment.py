@@ -41,7 +41,7 @@ from PIL import Image
 from timm.data import resolve_data_config, create_transform
 
 from crp.attribution import CondAttribution
-from zennit_extensions import AttnLRPCombinedComposite
+from zennit_extensions import AttnLRPBaselineComposite
 from experiments.datasets import FunnyBirdsDataset
 from experiments.datasets.funny_birds import (
     PART_COLORS_TO_NAME, BACKGROUND_COLOR,
@@ -79,8 +79,6 @@ def main():
                    help="how many test images to evaluate")
     p.add_argument("--layer", type=int, default=12,
                    help="which block index to inspect")
-    p.add_argument("--alpha", type=float, default=0.5)
-    p.add_argument("--beta", type=float, default=0.5)
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -108,10 +106,7 @@ def main():
     )
     print(f"loaded {len(ds)} test images, taking the first {args.n_images}")
 
-    composite = AttnLRPCombinedComposite(
-        alpha=args.alpha, beta=args.beta,
-        layerscale_uniform=True, residual_lrp="ratio",
-    )
+    composite = AttnLRPBaselineComposite()
     attribution = CondAttribution(model)
 
     # Aggregate per-image fractions.

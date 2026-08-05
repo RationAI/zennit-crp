@@ -50,7 +50,16 @@ import typer
 from timm.models.vision_transformer import Block as TimmBlock
 from zennit.canonizers import AttributeCanonizer
 
-from zennit_extensions import AttnLRPCombinedComposite
+import torch.nn as nn
+from zennit.composites import LayerMapComposite
+from zennit.rules import Epsilon, Pass
+from zennit_extensions.attention_unfolded import (
+    BilinearMatmul, ScaleByConstant, SoftmaxAlongLastDim,
+)
+from zennit_extensions.canonisation.canonizers import (
+    EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
+)
+from zennit_extensions.rules.bajger_contrib import AlphaBetaMatmul
 from crp.attribution import CondAttribution
 from experiments.datasets import load as load_dataset
 from experiments.models import build_probe
@@ -203,15 +212,25 @@ def main(
     print(f"dataset: funny_birds test split — using {n_total}/{len(dataset)} imgs")
 
     # ── composite + attribution wiring ──────────────────────────────────
-    # We construct ``AttnLRPCombinedComposite`` with ``residual_lrp=None``
-    # so its ``TimmBlockResidualCanonizer`` is skipped, then bolt on our
-    # ``CapturingBlockCanonizer`` which installs the residual rule AND
-    # the per-junction gradient capture in one go. ``layerscale_uniform``
-    # is a no-op on vit_base (no LayerScale module) so we pass False.
-    composite = AttnLRPCombinedComposite(
-        alpha=0.5, beta=0.5,
-        layerscale_uniform=False, residual_lrp=None,
-        canonizers=[CapturingBlockCanonizer()],
+    # Inline composite: this diagnostic's own recipe (AlphaBeta bilinears,
+    # epsilon linears) with ``CapturingBlockCanonizer`` in place of the stock
+    # block-residual canonizer — it installs the residual rule AND the
+    # per-junction gradient capture in one go.
+    composite = LayerMapComposite(
+        layer_map=[
+            (BilinearMatmul, AlphaBetaMatmul(alpha=0.5, beta=0.5, epsilon=1e-6)),
+            (SoftmaxAlongLastDim, Pass()),
+            (ScaleByConstant, Pass()),
+            (nn.Linear, Epsilon(epsilon=1e-6)),
+            (nn.Conv2d, Epsilon(epsilon=1e-6)),
+            (nn.GELU, Pass()), (nn.LayerNorm, Pass()), (nn.Dropout, Pass()),
+            (nn.Identity, Pass()),
+        ],
+        canonizers=[
+            CapturingBlockCanonizer(),
+            EvaAttentionSubstitutionCanonizer(block_indices=None),
+            TimmAttentionSubstitutionCanonizer(block_indices=None),
+        ],
     )
     attribution = CondAttribution(model)
 

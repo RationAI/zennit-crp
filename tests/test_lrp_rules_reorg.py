@@ -5,11 +5,10 @@ Covers the rules added / touched by the one-file-per-paper reorg:
 * :class:`MatmulAttnLRP` (AttnLRP Eq. 15) — the vectorized backward must equal
   the literal per-index summation and conserve relevance to ε.
 * :class:`EpsilonAdd` (AttnLRP residual add) — signed-sum conservation.
-* ``cp_lrp_baseline`` — a characterization test pinning the attribution on a
-  seeded ``vit_tiny`` so the class moves (rules → ``zennit_ext.rules``) cannot
-  silently change its behaviour.
-* ``attnlrp_baseline`` — builds, attributes, and applies the Table-4 name split
-  (FFN → γ, attention projections → ε).
+* ``CPLRPComposite`` — a characterization test pinning the attribution on a
+  seeded ``vit_tiny`` so relocations cannot silently change its behaviour.
+* ``AttnLRPBaselineComposite`` — builds, attributes, and applies the Table-4
+  name split (FFN → γ, attention projections → ε).
 
 Run::
 
@@ -29,7 +28,9 @@ from zennit.core import stabilize
 from zennit.rules import Gamma, Epsilon
 
 from zennit_extensions.rules.chefer2021 import CheferAdd
-from zennit_extensions.attnlrp_composites import AttnLRPBaselineComposite, CheferLRPComposite
+from zennit_extensions.lrp_composites import (
+    AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite,
+)
 
 
 # ── MatmulAttnLRP: vectorized backward == literal Eq. 15 ─────────────────────
@@ -109,14 +110,12 @@ def test_chefer_add_normalizes_to_conservation():
 def test_cp_lrp_baseline_characterization():
     """Pin cp_lrp_baseline attribution on a seeded vit_tiny. Relocating the rule
     classes (rules → zennit_ext.rules) must not change the numbers."""
-    import lrp_configs
-
     torch.manual_seed(1234)
     model = timm.create_model(
         "vit_tiny_patch16_224", pretrained=False, num_classes=10).eval()
     torch.manual_seed(0)
     x = torch.randn(1, 3, 224, 224, requires_grad=True)
-    comp = lrp_configs.get("cp_lrp_baseline").composite()
+    comp = CPLRPComposite()
     with comp.context(model) as mod:
         out = mod(x)
         cls = int(out.argmax(1))
@@ -130,14 +129,11 @@ def test_cp_lrp_baseline_characterization():
 # ── attnlrp_baseline: builds, attributes, Table-4 name split ─────────────────
 
 
-def test_attnlrp_baseline_registered_and_attributes():
-    import lrp_configs
-
-    assert "attnlrp_baseline" in lrp_configs.names()
+def test_attnlrp_baseline_attributes():
     torch.manual_seed(0)
     model = timm.create_model("vit_tiny_patch16_224", pretrained=False).eval()
     x = torch.randn(1, 3, 224, 224, requires_grad=True)
-    comp = lrp_configs.get("attnlrp_baseline").composite()
+    comp = AttnLRPBaselineComposite()
     with comp.context(model) as mod:
         out = mod(x)
         rel, = torch.autograd.grad(out[0, int(out.argmax(1))], x)
@@ -156,15 +152,13 @@ def test_attnlrp_baseline_ffn_gamma_projection_epsilon():
     assert isinstance(comp.mapping({}, "head", linears["head"]), Epsilon)
 
 
-def test_chefer_lrp_registered_and_attributes():
-    import lrp_configs
+def test_chefer_lrp_attributes():
     from zennit.rules import ZPlus, ZBox
 
-    assert "chefer_lrp" in lrp_configs.names()
     torch.manual_seed(0)
     model = timm.create_model("vit_tiny_patch16_224", pretrained=False).eval()
     x = torch.randn(1, 3, 224, 224, requires_grad=True)
-    comp = lrp_configs.get("chefer_lrp").composite()
+    comp = CheferLRPComposite()
     with comp.context(model) as mod:
         out = mod(x)
         rel, = torch.autograd.grad(out[0, int(out.argmax(1))], x)

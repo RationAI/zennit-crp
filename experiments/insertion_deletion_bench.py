@@ -291,7 +291,8 @@ def run(model: str = typer.Option(..., help="M1|M2|M3|M4"),
         force: bool = typer.Option(False, "--force", help="recompute even if present")):
     """Compute MoRF/LeRF curves + DAPC for the given methods/images, merge into
     the model npz. Skips (method, image) pairs already stored unless --force."""
-    import lrp_configs
+    from zennit_extensions.lrp_composites import CheferLRPComposite, CPLRPComposite
+    composites = {"cp_lrp_baseline": CPLRPComposite, "chefer_lrp": CheferLRPComposite}
     import experiments.xai_methods as xm
     from crp.attribution import CondAttribution
 
@@ -306,8 +307,8 @@ def run(model: str = typer.Option(..., help="M1|M2|M3|M4"),
 
     m, normalize, ds, ncls, label = load(model, device)
     attribution = CondAttribution(m)
-    lrp_comp = lrp_configs.get(LRP_COMPOSITE).composite()
-    chefer_comp = lrp_configs.get(CHEFER_COMPOSITE).composite()
+    lrp_comp = composites[LRP_COMPOSITE]()
+    chefer_comp = composites[CHEFER_COMPOSITE]()
     softmax_layers = xm.softmax_layer_names(m)
     x0, _ = ds[image_ids[0]]
     n_prefix, grid, patch = xm.model_geometry(m, x0[None])
@@ -363,12 +364,13 @@ def verify_chefer(model: str = typer.Option("M1"),
     """Print, for one image, the correlation between our faithful CVPR'21 Chefer
     (grad ⊙ R_A) and the ICCV'21 generic variant (grad ⊙ raw-attention) so the
     documented difference is quantified."""
-    import lrp_configs
+    from zennit_extensions.lrp_composites import CheferLRPComposite, CPLRPComposite
+    composites = {"cp_lrp_baseline": CPLRPComposite, "chefer_lrp": CheferLRPComposite}
     import experiments.xai_methods as xm
     from crp.attribution import CondAttribution
     m, normalize, ds, ncls, label = load(model, device)
     attribution = CondAttribution(m)
-    chefer_comp = lrp_configs.get(CHEFER_COMPOSITE).composite()
+    chefer_comp = composites[CHEFER_COMPOSITE]()
     softmax_layers = xm.softmax_layer_names(m)
     store = load_store(model)
     ids = list(map(int, store["image_ids"]))[:8] if "image_ids" in store else list(range(8))

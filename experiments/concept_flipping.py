@@ -21,7 +21,7 @@ sign crossing is informative, not a bug.
 
 Everything is measured in PROBABILITY space (the logit ratio is ill-defined when
 the target logit is small/negative). Relevance propagation is pluggable: pass any
-recipe from :mod:`lrp_configs` via ``--config`` (default ``cp_lrp_baseline``, the
+recipe from ``COMPOSITES`` via ``--config`` (default ``cp_lrp_baseline``, the
 LXT value-path recipe). Detectors are read at the config's probe site
 (``proj_drop``). Perturbation is ``zero`` / ``mean`` / ``sign_flip``.
 
@@ -51,7 +51,18 @@ import torch.nn as nn
 import typer
 from timm.data import resolve_data_config, create_transform
 
-import lrp_configs
+from zennit_extensions.lrp_composites import (
+    AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite,
+)
+
+# The composites this experiment uses, tracked explicitly by name. Gathered
+# data references these name strings only; the definitions live in
+# zennit_extensions.lrp_composites and their provenance in the experiment journal.
+COMPOSITES = {
+    "cp_lrp_baseline": CPLRPComposite,
+    "attnlrp_baseline": AttnLRPBaselineComposite,
+    "chefer_lrp": CheferLRPComposite,
+}
 from crp.attribution import CondAttribution
 from crp.concepts import HeadConcept, EmbeddingDimConcept
 # Model + data loading is shared in experiments.model_io; re-exported here so
@@ -236,7 +247,6 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
     """Run the concept-flipping experiment for one (config, concept, dataset,
     site) and write a long-format parquet. Stages are marked inline below."""
     methods = list(methods)
-    cfg = lrp_configs.get(config_name)
     method_ids = np.array([PERTURBATIONS[m] for m in methods])
     need_mean = "mean" in methods
     amp = torch.autocast("cuda", dtype=torch.bfloat16,
@@ -251,7 +261,7 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
     # site / splice → record-layer names, hook modules, feature dim (m for sae).
     sites, hook_mods, feat_dim, fvu = setup_sites(model, site, concept_name, key, device, sae_m=sae_m)
     attribution = CondAttribution(model)
-    composite = cfg.composite()
+    composite = COMPOSITES[config_name]()
     concept, D, n_grid = concept_detectors(concept_name, num_heads, feat_dim, device, max_steps)
     K = len(n_grid)
     grid_rows = np.asarray(n_grid, dtype=np.int64) - 1            # rows into the
@@ -395,7 +405,7 @@ app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
 def main(
     datasets: List[str] = typer.Option(list(DATASETS), "--datasets", help="dataset keys"),
     config: List[str] = typer.Option(["cp_lrp_baseline"], "--config",
-                                     help=f"LRP recipe(s): {lrp_configs.names()}"),
+                                     help=f"LRP recipe(s): {sorted(COMPOSITES)}"),
     concept: List[str] = typer.Option(["head"], "--concept", help="head | embed_dim | sae"),
     site: List[str] = typer.Option(["proj_drop"], "--site", help="proj_drop | residual"),
     perturbation: List[str] = typer.Option(["zero"], "--perturbation",

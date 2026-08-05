@@ -40,7 +40,7 @@ from torch.utils.data import DataLoader
 from timm.data import resolve_data_config, create_transform
 
 from crp.attribution import CondAttribution
-from zennit_extensions import AttnLRPCombinedComposite
+from zennit_extensions import AttnLRPBaselineComposite
 from crp.concepts import HeadConcept
 from experiments.datasets import load as load_dataset
 from experiments.models import build_probe
@@ -121,10 +121,7 @@ def compute(args, device):
     if short:
         print(f"  WARNING {len(short)} classes under target: {short}")
 
-    composite = AttnLRPCombinedComposite(
-        alpha=args.alpha, beta=args.beta,
-        layerscale_uniform=True, residual_lrp="ratio",
-    )
+    composite = AttnLRPBaselineComposite()
     attribution = CondAttribution(model)
     concept = HeadConcept(num_heads=num_heads)
 
@@ -159,7 +156,7 @@ def compute(args, device):
     meta = dict(
         probe=str(args.probe), split=args.split, num_classes=num_classes,
         num_heads=num_heads, block=block, layer=layer,
-        n_images=args.n_images, alpha=args.alpha, beta=args.beta,
+        n_images=args.n_images,
         counts=counts,
     )
     (out / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -264,8 +261,6 @@ def main():
     p.add_argument("--n-images", type=int, default=30)
     p.add_argument("--block", type=int, default=-1, help="block index (-1 = last)")
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--alpha", type=float, default=0.5)
-    p.add_argument("--beta", type=float, default=0.5)
     p.add_argument("--out", type=Path, default=REPO_ROOT / "data" / "head_relevance" / "run")
     p.add_argument("--from-cache", type=Path, default=None,
                    help="skip compute; re-plot from this run dir")

@@ -3,12 +3,12 @@
 Covers:
 
 * Standard timm ViT path (vit_tiny) under
-  :class:`AttnLRPEpsilonComposite`, :class:`AttnLRPGammaComposite`,
-  :class:`AttnLRPCombinedComposite` — attention is always unfolded
+  :class:`AttnLRPBaselineComposite`, :class:`CheferLRPComposite`,
+  :class:`CPLRPComposite` — attention is always unfolded
   (:class:`TimmAttentionUnfolded` swaps in via the substitution
   canonizer).
 * Eva-stack path (untrained, fast) under
-  :class:`AttnLRPCombinedComposite` — substitutes EvaAttention with
+  :class:`AttnLRPBaselineComposite` — substitutes EvaAttention with
   EvaAttentionUnfolded and runs concept-conditioned attribution via
   :class:`HeadConcept`, :class:`QConcept`, :class:`AttnOutputDimConcept`.
 
@@ -37,9 +37,9 @@ from zennit_extensions.canonisation.canonizers import (
 )
 from crp.attribution import CondAttribution
 from zennit_extensions import (
-    AttnLRPEpsilonComposite,
-    AttnLRPGammaComposite,
-    AttnLRPCombinedComposite,
+    AttnLRPBaselineComposite,
+    CheferLRPComposite,
+    CPLRPComposite,
 )
 
 
@@ -125,39 +125,17 @@ class TestTimmViTCanonizer:
 # ── Standard timm path: composites instantiate + run ────────────────────────
 
 
-def test_epsilon_composite_runs(vit_tiny, img_batch):
-    composite = AttnLRPEpsilonComposite()
-    with composite.context(vit_tiny) as modified:
-        out = modified(img_batch)
-    assert out.shape == (1, 1000)
-
-
-def test_gamma_composite_runs(vit_tiny, img_batch):
-    composite = AttnLRPGammaComposite()
-    with composite.context(vit_tiny) as modified:
-        out = modified(img_batch)
-    assert out.shape == (1, 1000)
-
-
-def test_gamma_composite_attribution_end_to_end(vit_tiny, img_batch):
-    composite = AttnLRPGammaComposite(gamma=0.25)
+@pytest.mark.parametrize("Composite", [
+    AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite,
+])
+def test_composite_attribution_end_to_end(vit_tiny, img_batch, Composite):
+    """Each of the three paper composites attributes a standard timm ViT —
+    attention substituted to TimmAttentionUnfolded; Eva canonizer no-ops."""
+    composite = Composite()
     attribution = CondAttribution(vit_tiny)
     res = attribution(img_batch, [{"y": [42]}], composite)
     assert res.heatmap.shape == (1, 224, 224)
-
-
-def test_combined_composite_runs_on_standard_timm(vit_tiny, img_batch):
-    """Combined composite must attribute standard timm ViTs without
-    crashing — attention is substituted to TimmAttentionUnfolded; the
-    Eva substitution canonizer no-ops on stock timm Attention."""
-    composite = AttnLRPCombinedComposite(
-        alpha=0.5, beta=0.5,
-        residual_lrp="ratio",
-    )
-    attribution = CondAttribution(vit_tiny)
-    res = attribution(img_batch, [{"y": [42]}], composite)
-    assert res.heatmap.shape == (1, 224, 224)
-    assert torch.isfinite(res.heatmap).all(), "combined recipe NaN'd on vit_tiny"
+    assert torch.isfinite(res.heatmap).all()
 
 
 # ── Conservation diagnostic (standard timm path) ────────────────────────────
@@ -165,16 +143,14 @@ def test_combined_composite_runs_on_standard_timm(vit_tiny, img_batch):
 
 def test_conservation_combined_recipe(vit_tiny):
     """sum(R_input) / target_logit should be O(1)–O(100) under the
-    AttnLRP-correct combined recipe — not blow up to NaN. Loose bound;
+    published AttnLRP recipe — not blow up to NaN. Loose bound;
     diagnostic, not gating."""
     torch.manual_seed(0)
     data = torch.randn(1, 3, 224, 224, requires_grad=True)
     target = 42
     with torch.no_grad():
         logit_val = vit_tiny(data)[0, target].item()
-    composite = AttnLRPCombinedComposite(
-        alpha=0.5, beta=0.5, residual_lrp="ratio",
-    )
+    composite = AttnLRPBaselineComposite()
     attribution = CondAttribution(vit_tiny)
     attribution(data, [{"y": [target]}], composite)
     sum_R = data.grad.sum().item()
@@ -218,11 +194,7 @@ class TestEvaUnfoldedIntegration:
             )
 
     def test_combined_composite_with_unfolded_runs_on_eva(self, eva_tiny, img224):
-        composite = AttnLRPCombinedComposite(
-            alpha=0.5, beta=0.5,
-            layerscale_uniform=True,
-            residual_lrp="ratio",
-        )
+        composite = AttnLRPBaselineComposite()
         # Resize input if needed.
         H = W = eva_tiny.default_cfg.get("input_size", (3, 224, 224))[-1]
         if H != 224:
@@ -232,9 +204,7 @@ class TestEvaUnfoldedIntegration:
         assert res.heatmap.shape[-1] == H
 
     def test_head_concept_attribution_on_eva(self, eva_tiny, img224):
-        composite = AttnLRPCombinedComposite(
-            alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
-        )
+        composite = AttnLRPBaselineComposite()
         # HeadConcept now operates on 3D `(B, N, embed_dim)` tensors
         # at any LRP inspection site. Hookable at q_lrp_probe / k_lrp_probe
         # / v_lrp_probe (post-qkv-split, pre-reshape) or at proj_drop
@@ -258,9 +228,7 @@ class TestEvaUnfoldedIntegration:
         """HeadConcept at the q_lrp_probe site — same shape contract as
         proj_drop, different semantic interpretation (which heads' query
         subspace was populated by which input pixels)."""
-        composite = AttnLRPCombinedComposite(
-            alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
-        )
+        composite = AttnLRPBaselineComposite()
         num_heads = int(eva_tiny.blocks[0].attn.num_heads)
         concept = HeadConcept(num_heads=num_heads)
         n_blocks = len(eva_tiny.blocks)
@@ -276,9 +244,7 @@ class TestEvaUnfoldedIntegration:
         assert res.heatmap.shape[-1] == H
 
     def test_embedding_dim_concept_at_proj_drop(self, eva_tiny, img224):
-        composite = AttnLRPCombinedComposite(
-            alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
-        )
+        composite = AttnLRPBaselineComposite()
         num_heads = int(eva_tiny.blocks[0].attn.num_heads)
         concept = EmbeddingDimConcept(num_heads=num_heads)
         n_blocks = len(eva_tiny.blocks)
@@ -298,9 +264,7 @@ class TestEvaUnfoldedIntegration:
         """TokenConcept addresses individual token positions at proj_drop.
         Model-free constructor; concept ids index positions in the
         post-filter universe (default = all tokens)."""
-        composite = AttnLRPCombinedComposite(
-            alpha=0.5, beta=0.5, layerscale_uniform=True, residual_lrp="ratio",
-        )
+        composite = AttnLRPBaselineComposite()
         concept = TokenConcept()
         n_blocks = len(eva_tiny.blocks)
         target_block = n_blocks // 2

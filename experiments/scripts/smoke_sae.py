@@ -17,7 +17,7 @@ from experiments.concept_flipping import load_probe, DATASETS, REPO_ROOT
 from experiments import sae as sae_mod
 from crp.attribution import CondAttribution
 from crp.concepts import EmbeddingDimConcept
-import lrp_configs
+from zennit_extensions.lrp_composites import CPLRPComposite
 from timm.data import resolve_data_config, create_transform
 from experiments.datasets import load as load_dataset
 
@@ -62,7 +62,7 @@ def main():
     rel_err = (ahat - a0[0]).norm().item() / (a0[0].norm().item() + 1e-12)
     print(f"splice recon on image: ||â−a||/||a|| = {rel_err:.4f}")
 
-    composite = lrp_configs.get("cp_lrp_baseline").composite()
+    composite = CPLRPComposite()
     attribution = CondAttribution(model)
     xg = x.clone().requires_grad_(True)
     res = attribution(xg, [{"y": [0]}], composite, record_layer=[rec_feat, rec_out])

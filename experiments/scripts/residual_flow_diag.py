@@ -303,7 +303,7 @@ def record_residual_flow(attribution, cfg, ds, idxs, normalize, sites, model,
         x = torch.stack(list(xs)).to(device)
         xin = normalize(x).requires_grad_(True)
         rec = record_layers + (check_layers if i0 == 0 else [])
-        res = attribution(xin, [{"y": [y]} for y in ys], cfg.composite(),
+        res = attribution(xin, [{"y": [y]} for y in ys], composite_cls(),
                           record_layer=rec)
         missing = [l for l in record_layers if l not in res.relevances]
         if missing:
@@ -359,7 +359,7 @@ def build_metadata(args, ck_path, model, cfg, ds_kw, idxs,
         "checkpoint": str(ck_path), "n_samples": len(idxs),
         "n_blocks": len(model.backbone.blocks),
         "embed_dim": int(model.backbone.embed_dim), "seed": args.seed,
-        "composite_desc": cfg.description,
+        "composite_desc": (composite_cls.__doc__ or "").strip().splitlines()[0],
         "block_type": "EvaBlock" if is_eva_block(model) else "Block",
         "branch_endpoints": [ep_attn, ep_mlp],
         "num_prefix_tokens_excluded": n_prefix,
@@ -403,7 +403,9 @@ def save_npz(args, sites, idxs, store: RecordedFlow, meta: dict) -> Path:
 
 
 def compute(args) -> Path:
-    import lrp_configs
+    from zennit_extensions.lrp_composites import AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite
+    composites = {"cp_lrp_baseline": CPLRPComposite, "attnlrp_baseline": AttnLRPBaselineComposite,
+                  "chefer_lrp": CheferLRPComposite}
     from crp.attribution import CondAttribution
     from experiments.datasets import load as load_dataset
     from experiments.model_io import DATASETS, backbone_transforms
@@ -423,7 +425,7 @@ def compute(args) -> Path:
           f"model={ck['base']}·{ck['head']}, D={int(model.backbone.embed_dim)}")
 
     sites = list_residual_sites(model)
-    cfg = lrp_configs.get(args.config)
+    composite_cls = composites[args.config]
     attribution = CondAttribution(model)
     store = record_residual_flow(attribution, cfg, ds, idxs, normalize, sites,
                                  model, device, args.batch_size)

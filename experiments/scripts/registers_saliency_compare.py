@@ -33,7 +33,7 @@ forward boundary):
                    0.5*A + 0.5*I per block, row-renormalized, chained; CLS row;
    * ``attn``    — raw last-block CLS attention row, averaged over heads;
    * ``lrp``     — reference CP-LRP heatmap (``CondAttribution`` +
-                   ``lrp_configs.get("cp_lrp_baseline")``, condition
+                   ``CPLRPComposite`` (cp_lrp_baseline), condition
                    ``[{"y": [target]}]``), |R| summed per patch.
 
 3. ``analyze`` (CPU, no GPU needed) — colocation metrics per method:
@@ -265,14 +265,14 @@ def saliency(
     device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu"),
 ):
     """Compute the five patch-aggregated saliency maps for the selected images."""
-    import lrp_configs
+    from zennit_extensions.lrp_composites import CPLRPComposite
     from crp.attribution import CondAttribution
 
     sel = np.load(SELECT_NPZ)
     ds_indices, targets = sel["ds_indices"].tolist(), sel["targets"].tolist()
     model, normalize, ds = _load_model_ds(device)
     attribution = CondAttribution(model)
-    cfg = lrp_configs.get("cp_lrp_baseline")
+    composite_cls = CPLRPComposite
 
     out = {m: [] for m in METHODS}
     pix = {m: [] for m in ("gxi", "ig", "lrp")}             # keep pixel maps for panels
@@ -312,7 +312,7 @@ def saliency(
         # reference LRP heatmap (class-conditional, cp_lrp_baseline)
         xl = xn.clone().requires_grad_(True)
         conds = [{"y": [int(t)]} for t in tg]
-        res = attribution(xl, conds, cfg.composite())
+        res = attribution(xl, conds, composite_cls())
         lrp = res.heatmap.detach().cpu()                      # (B, 224, 224) signed
         out["lrp"].append(_to_patch(lrp))
         pix["lrp"].append(lrp)

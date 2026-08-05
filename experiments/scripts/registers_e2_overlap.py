@@ -334,17 +334,17 @@ def lrp(model: str = typer.Option(...), batch: int = typer.Option(8),
         limit: Optional[int] = typer.Option(None),
         device: str = typer.Option("cuda")):
     """Full-model class-conditional cp_lrp_baseline input heatmap, sum|R|/patch."""
-    import lrp_configs
+    from zennit_extensions.lrp_composites import CPLRPComposite
     from crp.attribution import CondAttribution
     mdl, normalize, ds, _ = _load_model_ds(model, device)
     attribution = CondAttribution(mdl)
-    cfg = lrp_configs.get("cp_lrp_baseline")
+    composite_cls = CPLRPComposite
     maps = []
     for s, x, tg in _sel_batches(model, ds, batch):
         if limit is not None and s >= limit:
             break
         xn = normalize(x.to(device)).requires_grad_(True)
-        res = attribution(xn, [{"y": [int(t)]} for t in tg], cfg.composite())
+        res = attribution(xn, [{"y": [int(t)]} for t in tg], composite_cls())
         maps.append(_to_patch(res.heatmap.detach().cpu()))
         print(f"  lrp batch @{s} done", flush=True)
     _save_sal(model, "lrp", torch.cat(maps),

@@ -13,7 +13,7 @@ spatially-local parts (FunnyBirds, segmentation-like benchmarks).
 forwards; autograd's standard backward applies during ``loss.backward()``,
 so this head trains with correct chain-rule gradients.
 
-For attribution, a composite (e.g. :class:`~zennit_ext.AttnLRPCombinedComposite`)
+For attribution, a composite (e.g. :class:`~zennit_extensions.AttnLRPBaselineComposite`)
 assigns the AttnLRP rules to these submodule types via its ``layer_map`` —
 zennit ``Hook``s (``AlphaBetaMatmul`` on ``BilinearMatmul``, ``Pass`` on
 ``SoftmaxAlongLastDim`` / ``ScaleByConstant``) that fire during the

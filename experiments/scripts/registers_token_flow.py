@@ -187,7 +187,8 @@ def cmd_select(args):
 
 def cmd_flow(args):
     import torch
-    import lrp_configs
+    from zennit_extensions.lrp_composites import AttnLRPBaselineComposite, CPLRPComposite
+    composites = {"cp_lrp_baseline": CPLRPComposite, "attnlrp_baseline": AttnLRPBaselineComposite}
     from crp.attribution import CondAttribution
 
     device = args.device
@@ -196,7 +197,7 @@ def cmd_flow(args):
     ys_all = sel["targets"][args.start:args.stop]
     model, ck, ck_path, ds, normalize = load_model_and_data(device)
     n_blocks = len(model.backbone.blocks)
-    cfg = lrp_configs.get(args.config)
+    composite_cls = composites[args.config]
     attribution = CondAttribution(model)
     sites = sites_for(n_blocks)
     record = sorted({l for _, _, a, br in sites for l in (a, br)})
@@ -222,7 +223,7 @@ def cmd_flow(args):
         xin = normalize(x).requires_grad_(True)
         conds = [{"y": [y]} for y in ys]
         rec = record + (check_layers if (i0 == 0 and args.start == 0) else [])
-        res = attribution(xin, conds, cfg.composite(), record_layer=rec)
+        res = attribution(xin, conds, composite_cls(), record_layer=rec)
         missing = [l for l in record if l not in res.relevances]
         if missing:
             raise RuntimeError(f"recording failed for layers: {missing}")
@@ -253,7 +254,7 @@ def cmd_flow(args):
     meta = {"config": args.config, "checkpoint": str(ck_path),
             "start": args.start, "stop": args.start + S,
             "n_blocks": n_blocks, "endpoint_identity_err": endpoint_err,
-            "composite_desc": cfg.description, "generated": _now()}
+            "composite_desc": (composite_cls.__doc__ or "").strip().splitlines()[0], "generated": _now()}
     out = OUT_DIR / f"flow_{args.config}_part{args.start:03d}.npz"
     np.savez_compressed(
         out, branch_abs=branch_abs, skip_abs=skip_abs,
@@ -393,14 +394,15 @@ def cmd_outliers(args):
 
 def cmd_ablate(args):
     import torch
-    import lrp_configs
+    from zennit_extensions.lrp_composites import AttnLRPBaselineComposite, CPLRPComposite
+    composites = {"cp_lrp_baseline": CPLRPComposite, "attnlrp_baseline": AttnLRPBaselineComposite}
     from crp.attribution import CondAttribution
 
     device = args.device
     ab = json.loads((OUT_DIR / "ablate_selection.json").read_text())
     idxs, ys_all = ab["ds_indices"], ab["targets"]
     model, ck, ck_path, ds, normalize = load_model_and_data(device)
-    cfg = lrp_configs.get(args.config)
+    composite_cls = composites[args.config]
     attribution = CondAttribution(model)
 
     M = len(idxs)
@@ -414,7 +416,7 @@ def cmd_ablate(args):
         x = torch.stack(xs).to(device)
         xin = normalize(x).requires_grad_(True)
         conds = [{"y": [y]} for y in ys]
-        res = attribution(xin, conds, cfg.composite())
+        res = attribution(xin, conds, composite_cls())
         heat[i0:i0 + len(chunk)] = res.heatmap.detach().cpu().numpy()
         imgs[i0:i0 + len(chunk)] = x.detach().cpu().numpy()
         print(f"  batch {i0 // bs + 1}/{(M + bs - 1) // bs} done", flush=True)

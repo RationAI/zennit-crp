@@ -203,12 +203,12 @@ def cmd_select(blocks_arg: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cmd_lrp(device: str):
-    import lrp_configs
+    from zennit_extensions.lrp_composites import CPLRPComposite
     from crp.attribution import CondAttribution
     model, ds, normalize = load_everything(device)
     sel = np.load(SEL_NPZ)
     attribution = CondAttribution(model)
-    composite = lrp_configs.get("cp_lrp_baseline").composite()
+    composite = CPLRPComposite()
     rel = np.zeros((len(sel["ds_idx"]), GRID, GRID), np.float32)
     for i, (di, t) in enumerate(zip(sel["ds_idx"], sel["target"])):
         x = ds[int(di)][0][None].to(device)

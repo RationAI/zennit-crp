@@ -3,7 +3,7 @@
 This is the single, idiomatic generator behind the static gallery at
 ``webapp/crp_gallery/`` (served via ``webshare``). Given a model (backbone+head,
 the systematic ``experiments.models`` way), an LRP/CRP recipe from
-:mod:`lrp_configs`, a probe site and a set of blocks, it produces — per concept
+``COMPOSITES``, a probe site and a set of blocks, it produces — per concept
 detector — the standard CRP-paper presentation: the top reference images and
 their *conditional* relevance/saliency maps, as matplotlib figures (png + pdf),
 exactly like the notebooks.
@@ -54,7 +54,18 @@ import typer
 
 from torchvision.transforms.functional import gaussian_blur
 
-import lrp_configs
+from zennit_extensions.lrp_composites import (
+    AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite,
+)
+
+# The composites this experiment uses, tracked explicitly by name. Gathered
+# data + web manifests reference these name strings only; definitions live in
+# zennit_extensions.lrp_composites, provenance in the experiment journal.
+COMPOSITES = {
+    "cp_lrp_baseline": CPLRPComposite,
+    "attnlrp_baseline": AttnLRPBaselineComposite,
+    "chefer_lrp": CheferLRPComposite,
+}
 from experiments import storage
 from crp.attribution import CondAttribution
 from crp.concepts import HeadConcept, EmbeddingDimConcept
@@ -243,20 +254,19 @@ def rank_scores(rank_mode: str, *, attribution, ds, sel, layer, concept, composi
 # Output tree: composite meta, per-entry figures, jobs, manifest
 # ─────────────────────────────────────────────────────────────────────────────
 
-def composite_meta(cfg) -> dict:
-    """Human-readable summary + hyperparameters of a config, pulled straight from
-    the source (no duplication): registry fields + the build() source text."""
+def composite_meta(name: str, comp_cls, site: str) -> dict:
+    """Human-readable summary of a composite, pulled straight from the source
+    (no duplication): class docstring first line + the class source text."""
     try:
-        build_source = inspect.getsource(cfg.build).strip()
+        build_source = inspect.getsource(comp_cls).strip()
     except (OSError, TypeError):
         build_source = ""
-    comp_class = type(cfg.composite()).__name__
+    doc = (comp_cls.__doc__ or "").strip()
     return {
-        "name": cfg.name,
-        "class": comp_class,
-        "description": cfg.description,
-        "isolates": cfg.isolates,
-        "site": cfg.site,
+        "name": name,
+        "class": comp_cls.__name__,
+        "description": doc.splitlines()[0] if doc else "",
+        "site": site,
         "build_source": build_source,
     }
 
@@ -908,7 +918,7 @@ def run_spec(spec: dict, device: str) -> None:
     ds_extra = {"n_per_class": 10} if dataset == "imagenet" else None
     ds = load_eval_dataset(dataset, transform, ds_extra)
     concept = make_concept(concept_kind, num_heads)
-    cfg = lrp_configs.get(config)
+    comp_cls = COMPOSITES[config]
 
     md = f"{base}_{dataset}"
     # 'sae': splice the trained dictionary at each block and record its .features
@@ -942,7 +952,7 @@ def run_spec(spec: dict, device: str) -> None:
     if need_fv:
         # Build on scratch, mirror to the persistent root. Refill scratch from the
         # mirror first so an index built before a bounce is reused, not recomputed.
-        fv_dir = Path(cfg.fv_path(CACHE_ROOT, model_tag))
+        fv_dir = Path(CACHE_ROOT) / "fv" / model_tag / config
         rel = fv_dir.relative_to(CACHE_ROOT)                 # fv/<model_tag>/<config>
         storage.sync(CACHE_MIRROR / rel, fv_dir)             # hydrate (no-op if scratch already has it)
         fv = FeatureVisualization(attribution, ds, {ln: concept for ln in layer_names},
@@ -952,7 +962,7 @@ def run_spec(spec: dict, device: str) -> None:
         if not have:
             end = fv_end if fv_end > 0 else len(ds)
             print(f"[{md}/{config}] building FV index over {end} samples for {len(layer_names)} layer(s)…")
-            fv.run(cfg.composite(), 0, end, batch_size=32)
+            fv.run(comp_cls(), 0, end, batch_size=32)
             storage.sync(fv_dir, CACHE_MIRROR / rel)         # persist the fresh build
 
     # Correctly-classified sample for class-conditional ranking.
@@ -964,7 +974,7 @@ def run_spec(spec: dict, device: str) -> None:
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir.parent / "model.json").write_text(json.dumps(
         {"base": base, "head": head_name, "dataset": dataset, "label": label}, indent=2))
-    (config_dir / "composite.json").write_text(json.dumps(composite_meta(cfg), indent=2))
+    (config_dir / "composite.json").write_text(json.dumps(composite_meta(config, comp_cls, site), indent=2))
 
     # Fixed comparison images (shown across every layer of this instance). Saved
     # once at md level; their raw thumbnail goes to the web. Empty ⇒ aggregate-only.
@@ -973,7 +983,7 @@ def run_spec(spec: dict, device: str) -> None:
     for s in samples:
         save_sample_image(ds, s, config_dir.parent / "_samples" / f"{s['key']}.png")
         save_sample_heat(attribution, ds[s["ds_index"]][0], s["target"],
-                         composite=cfg.composite(), normalize=normalize, device=device,
+                         composite=comp_cls(), normalize=normalize, device=device,
                          out_path=heat_dir / f"{s['key']}.png")
     if samples:
         print(f"[{md}/{config}] {len(samples)} single-image sample(s): "
@@ -985,7 +995,7 @@ def run_spec(spec: dict, device: str) -> None:
     # shared across every instance of this model (composite-independent). Written
     # once at md level; idempotent for normal jobs, force-refreshed by sample-xai.
     try:
-        generate_sample_extras(model, attribution, ds, samples, composite=cfg.composite(),
+        generate_sample_extras(model, attribution, ds, samples, composite=comp_cls(),
                                normalize=normalize, device=device, md_dir=config_dir.parent,
                                force=only_extras)
     except Exception as e:                       # extras must never block the CRP render
@@ -995,7 +1005,7 @@ def run_spec(spec: dict, device: str) -> None:
 
     for b, layer in layers:
         scores = rank_scores(rank_mode, attribution=attribution, ds=ds, sel=sel, layer=layer,
-                             concept=concept, composite=cfg.composite(), normalize=normalize,
+                             concept=concept, composite=comp_cls(), normalize=normalize,
                              device=device, fv=fv)
         order = list(np.argsort(scores)[::-1])               # descending
         rank_of = {int(cid): r for r, cid in enumerate(order)}
@@ -1008,7 +1018,7 @@ def run_spec(spec: dict, device: str) -> None:
             for cid in ids:
                 out_dir = config_dir / site / f"block{b}" / concept_kind / str(cid)
                 render_entry(fv, attribution, ds, layer, cid, mode=mode, n_ref=n_ref,
-                             composite=cfg.composite(), concept=concept, normalize=normalize,
+                             composite=comp_cls(), concept=concept, normalize=normalize,
                              device=device, crop=crop, plot=plot, out_dir=out_dir, meta_extra={
                                  **base_meta, "sample": "aggregate", "sample_label": "Aggregate",
                                  "rank": rank_of.get(int(cid)), "relevance": float(scores[int(cid)]),
@@ -1020,12 +1030,12 @@ def run_spec(spec: dict, device: str) -> None:
             shutil.rmtree(img_root / s["key"], ignore_errors=True)   # drop stale detectors
             x = ds[s["ds_index"]][0]
             det = local_relevances(attribution, x, s["target"], layer, concept=concept,
-                                   composite=cfg.composite(), normalize=normalize, device=device)
+                                   composite=comp_cls(), normalize=normalize, device=device)
             l_ids = list(dict.fromkeys([int(c) for c in np.argsort(det)[::-1][:n]] + detectors))
             print(f"[{md}/{config}] block {b} · {s['key']}: local detectors → {l_ids}")
             for r_local, cid in enumerate(l_ids):
                 render_local_entry(fv, attribution, ds, x, s["target"], layer, cid, mode=mode,
-                                   n_ref=n_ref, composite=cfg.composite(), concept=concept,
+                                   n_ref=n_ref, composite=comp_cls(), concept=concept,
                                    normalize=normalize, device=device, crop=crop, plot=plot,
                                    out_dir=img_root / s["key"] / str(cid), meta_extra={
                                        **base_meta, "sample": s["key"],
@@ -1040,7 +1050,7 @@ def run_spec(spec: dict, device: str) -> None:
 def compute(
     base: str = typer.Option("vit_small", "--base", help=f"backbone: {sorted(BASES)}"),
     dataset: str = typer.Option(..., "--dataset", help=f"dataset key: {sorted(DATASETS)}"),
-    config: str = typer.Option("cp_lrp_baseline", "--config", help="lrp_configs recipe name"),
+    config: str = typer.Option("cp_lrp_baseline", "--config", help=f"composite name: {sorted(COMPOSITES)}"),
     site: str = typer.Option("proj_drop", "--site", help=f"probe site: {SITES}"),
     blocks: List[int] = typer.Option(..., "--blocks", help="block indices (repeat the flag)"),
     concept: str = typer.Option("embed_dim", "--concept", help=f"concept kind: {CONCEPTS}"),
