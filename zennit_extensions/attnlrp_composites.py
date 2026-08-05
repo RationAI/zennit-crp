@@ -1,9 +1,9 @@
-"""AttnLRP composites — ε / γ / combined recipes.
+"""AttnLRP composites — ε / γ / combined / baseline / Chefer recipes.
 
-Split out of the former ``transformer_patches.py``. Each composite is a
-``LayerMapComposite`` pre-bundled with the ViT canonizers (from
-:mod:`zennit_ext.attnlrp_rules`) and, for the combined recipe, the
-attention-substitution canonizers from :mod:`zennit_ext.attention_unfolded`.
+Each composite is a ``LayerMapComposite`` pre-bundled with the ViT canonizers
+from :mod:`zennit_extensions.canonisation.canonizers`; LRP rules live in
+:mod:`zennit_extensions.rules`, the hookable attention modules in
+:mod:`zennit_extensions.attention_unfolded`.
 """
 from __future__ import annotations
 
@@ -11,18 +11,25 @@ from typing import Optional
 
 import torch.nn as nn
 from zennit.composites import LayerMapComposite
-from zennit.rules import Epsilon, Gamma, Pass
+from zennit.rules import Epsilon, Gamma, Pass, ZBox, ZPlus
 
-from zennit_extensions.rules.bajger_contrib import (
-    AlphaBetaMatmul,
+from zennit_extensions.attention_unfolded import (
+    BilinearMatmul,
+    LayerScaleMul,
+    PosEmbedAdd,
+    ResidualAdd,
+    ScaleByConstant,
+    SoftmaxAlongLastDim,
 )
-from zennit_extensions.canonisation.canonizers import EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer, TimmViTCanonizer
+from zennit_extensions.canonisation.canonizers import (
+    EvaAttentionSubstitutionCanonizer,
+    TimmAttentionSubstitutionCanonizer,
+    TimmViTCanonizer,
+)
 from zennit_extensions.rules.attnlrp import EpsilonAdd, MatmulAttnLRP, SoftmaxAttnLRP, Uniform
-from zennit_extensions.rules.bajger_contrib import ResidualL1
+from zennit_extensions.rules.bajger_contrib import AlphaBetaMatmul, ResidualL1
 from zennit_extensions.rules.chefer2021 import CheferAdd, CheferMatmul
 from zennit_extensions.rules.residuals_otsuki2024 import ResidualRatio
-
-# ─── 6. Composites — one per recipe (3 total after cleanup) ──────────────────
 
 
 def _epsilon_layer_map(epsilon: float):
@@ -36,7 +43,7 @@ def _epsilon_layer_map(epsilon: float):
     ]
 
 
-def _gamma_layer_map(gamma: float, epsilon: float):
+def _gamma_layer_map(gamma: float):
     return [
         (nn.Linear, Gamma(gamma=gamma)),
         (nn.Conv2d, Gamma(gamma=gamma)),
@@ -54,11 +61,9 @@ class AttnLRPEpsilonComposite(LayerMapComposite):
 
     Layer map:
 
-    * ``nn.Linear`` → :class:`zennit.rules.Epsilon` (ε-LRP).
-    * ``nn.Conv2d`` → :class:`zennit.rules.Epsilon` (covers the patch-embed Conv2d).
+    * ``nn.Linear`` / ``nn.Conv2d`` → :class:`zennit.rules.Epsilon`.
     * ``nn.GELU`` / ``nn.LayerNorm`` / ``nn.Dropout`` / ``nn.Identity``
-      → :class:`zennit.rules.Pass` (LayerNorm's std stop-gradient is a
-      forward rewrite installed by :class:`TimmViTCanonizer`).
+      → :class:`zennit.rules.Pass`.
 
     :class:`TimmViTCanonizer` is pre-bundled. Pass extra canonizers via
     the ``canonizers`` kwarg if you also need (for example) a
@@ -67,11 +72,13 @@ class AttnLRPEpsilonComposite(LayerMapComposite):
     Parameters
     ----------
     palrp : bool
-        Pass ``True`` to enable PA-LRP on the additive ``x + pos_embed``
-        step (Bakish et al. 2025). Default False.
+        Deprecated no-op (the PA-LRP canonizer was removed); accepted for
+        back-compat.
     residual_lrp : {None, 'symmetric', 'ratio'}
-        Pass to install a conservative residual rule on Block additions.
-        See :class:`TimmBlockResidualCanonizer`.
+        Non-None installs the block-level :class:`TimmBlockResidualCanonizer`
+        so residual adds become hookable ``ResidualAdd`` modules; note this
+        composite's layer map assigns them no rule (plain add remains).
+        See :class:`AttnLRPCombinedComposite` for actual residual rules.
     """
 
     def __init__(
@@ -100,9 +107,12 @@ class AttnLRPGammaComposite(LayerMapComposite):
     gamma : float
         γ scaling. Default 0.25 per AttnLRP §3.2.1.
     epsilon : float
-        ε-stabilizer in the LRP denominator. Default 1e-6.
+        Unused (γ-LRP needs no stabilizer); kept for signature parity with
+        :class:`AttnLRPEpsilonComposite`.
     canonizers : list[Canonizer] | None
         Extra canonizers to apply alongside :class:`TimmViTCanonizer`.
+    palrp, residual_lrp :
+        As on :class:`AttnLRPEpsilonComposite` (see its docs).
     """
 
     def __init__(
@@ -112,9 +122,7 @@ class AttnLRPGammaComposite(LayerMapComposite):
         canonizers = list(canonizers or []) + [
             TimmViTCanonizer(palrp=palrp, residual=residual_lrp is not None, epsilon=epsilon),
         ]
-        super().__init__(
-            layer_map=_gamma_layer_map(gamma, epsilon), canonizers=canonizers,
-        )
+        super().__init__(layer_map=_gamma_layer_map(gamma), canonizers=canonizers)
 
 
 class AttnLRPCombinedComposite(LayerMapComposite):
@@ -148,17 +156,17 @@ class AttnLRPCombinedComposite(LayerMapComposite):
     epsilon : float
         ε for ε-stabilised rules. Default 1e-6.
     palrp : bool
-        PA-LRP on the ``x + pos_embed`` step (Bakish et al. 2025).
-        Only relevant for ViTs with absolute pos_embed; no-op on DINOv3
-        (RoPE only).
+        When True, map :class:`~zennit_extensions.attention_unfolded.PosEmbedAdd`
+        to ``Uniform(factor=2)`` (PA-LRP on ``x + pos_embed``). Currently a
+        no-op: no canonizer installs ``PosEmbedAdd`` (the PA-LRP canonizer
+        was removed), so the entry only applies if you add the module
+        yourself.
     residual_lrp : {None, 'symmetric', 'ratio', 'l1'}
-        Block-level residual rule. ``'ratio'`` recommended (Otsuki |x|/|branch|
-        split). ``'l1'`` is the sign-preserving split (``R=R_y·z/(|x|+|branch|)``):
-        bounded, continuous, sign follows the operand, conserves ABSOLUTE mass
-        locally (``|R_x|+|R_branch|=|R_y|``) instead of the signed sum — so it
-        drops LRP's global "sums to the logit" guarantee. Kept for manual
-        inspection / research only (see RESEARCH note); ``'ratio'`` is the
-        production default. See :class:`~zennit_ext.attnlrp_rules.ResidualL1`.
+        Block-level residual rule on ``ResidualAdd``. ``'ratio'`` (Otsuki
+        |x|/|branch| split) is the production default. ``'l1'`` conserves
+        absolute mass (``|R_x|+|R_branch|=|R_y|``) instead of the signed sum —
+        research only. ``None`` leaves the add unmapped (non-conservative).
+        See :class:`~zennit_extensions.rules.bajger_contrib.ResidualL1`.
     """
 
     def __init__(
@@ -172,16 +180,6 @@ class AttnLRPCombinedComposite(LayerMapComposite):
         residual_lrp: Optional[str] = None,
         canonizers=None,
     ):
-        # Lazy import to avoid the import cycle
-        # (attnlrp_composites → attention_unfolded → attnlrp_rules).
-        from zennit_extensions.attention_unfolded import (
-            BilinearMatmul,
-            SoftmaxAlongLastDim,
-            ScaleByConstant,
-            ResidualAdd,
-            PosEmbedAdd,
-            LayerScaleMul,
-        )
         # The residual rule is a LAYER_MAP choice on the single ``ResidualAdd``
         # module — NOT a separate module per rule. ``residual_lrp`` just picks
         # which hook this composite maps ``ResidualAdd`` to.
@@ -200,15 +198,14 @@ class AttnLRPCombinedComposite(LayerMapComposite):
                 layerscale_uniform=layerscale_uniform,
                 epsilon=epsilon,
             ),
-            # Substitute attention to its unfolded form (forward rewrite).
-            # Both canonizers are always registered — each one's isinstance
-            # filter no-ops on the other's target class. The per-rule LRP
-            # rules below are assigned as zennit Hooks via the layer_map.
+            # Substitute attention to its unfolded form. Both canonizers'
+            # isinstance filters no-op on the other's target class; the LRP
+            # rules below are Hooks assigned via the layer_map.
             EvaAttentionSubstitutionCanonizer(block_indices=None),
             TimmAttentionSubstitutionCanonizer(block_indices=None),
         ]
         base_map = (
-            _gamma_layer_map(linear_gamma, epsilon)
+            _gamma_layer_map(linear_gamma)
             if linear_gamma is not None
             else _epsilon_layer_map(epsilon)
         )
@@ -234,6 +231,7 @@ class AttnLRPCombinedComposite(LayerMapComposite):
             *residual_entries,
         ] + base_map
         super().__init__(layer_map=layer_map, canonizers=canonizers)
+
 
 class AttnLRPBaselineComposite(LayerMapComposite):
     """AttnLRP exactly as published (Achtibat et al., ICML 2024) — the faithful
@@ -261,12 +259,6 @@ class AttnLRPBaselineComposite(LayerMapComposite):
         self, *, ffn_gamma: float = 0.05, conv_gamma: float = 0.25,
         epsilon: float = 1e-6, canonizers=None,
     ):
-        # Lazy import to avoid the import cycle
-        # (attnlrp_composites → attention_unfolded → attnlrp_rules).
-        from zennit_extensions.attention_unfolded import (
-            BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
-            LayerScaleMul,
-        )
         self._ffn_gamma = ffn_gamma
         self._epsilon = epsilon
         canonizers = list(canonizers or []) + [
@@ -326,14 +318,6 @@ class CheferLRPComposite(LayerMapComposite):
 
     def __init__(self, *, epsilon: float = 1e-6, low: float = -3.0,
                  high: float = 3.0, canonizers=None):
-        from zennit.rules import ZPlus, ZBox
-        from zennit_extensions.attention_unfolded import (
-            BilinearMatmul, SoftmaxAlongLastDim, ScaleByConstant, ResidualAdd,
-            LayerScaleMul,
-        )
-        from zennit_extensions.canonisation.canonizers import (
-            TimmViTCanonizer,
-        )
         self._zbox = ZBox(low=low, high=high)   # first (pixel-space) conv
         canonizers = list(canonizers or []) + [
             TimmViTCanonizer(

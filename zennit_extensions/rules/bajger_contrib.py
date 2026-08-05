@@ -6,7 +6,7 @@ class ResidualL1(Hook):
     ``y = x + branch``: ``R_x = R_y·x/S``, ``R_branch = R_y·branch/S`` with
     ``S = |x|+|branch|+ε``. Keeps each operand's sign, bounded (``|R_x|≤|R_y|``),
     no cancellation pole. Conserves L1 mass, not the signed sum. Attach to
-    :class:`~zennit_ext.attention_unfolded.ResidualAdd`.
+    :class:`~zennit_extensions.attention_unfolded.ResidualAdd`.
     """
 
     def __init__(self, epsilon: float = 1e-6):
@@ -31,7 +31,7 @@ class AlphaBetaMatmul(Hook):
     """Own contribution — AlphaBeta LRP rule generalised to a 2-input bilinear
     matmul ``y = a @ b`` (separate positive/negative pre-activation paths, ``α+β=1``
     ⇒ exact conservation modulo ε). Attach to
-    :class:`~zennit_ext.attention_unfolded.BilinearMatmul` via a composite
+    :class:`~zennit_extensions.attention_unfolded.BilinearMatmul` via a composite
     ``layer_map``.
     """
 

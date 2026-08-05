@@ -1,14 +1,11 @@
-from timm.models.eva import EvaAttention, EvaBlock
-from timm.models.vision_transformer import Attention as TimmAttention, Block as TimmBlock, VisionTransformer
-from zennit.canonizers import AttributeCanonizer, Canonizer, CompositeCanonizer
-
 from typing import Callable, List, Optional, Sequence
 
-from zennit_extensions.attention_unfolded import EvaAttentionUnfolded, TimmAttentionUnfolded
-
-
 import torch.nn as nn
+from timm.models.eva import EvaAttention, EvaBlock
+from timm.models.vision_transformer import Attention as TimmAttention, Block as TimmBlock
+from zennit.canonizers import AttributeCanonizer, Canonizer, CompositeCanonizer
 
+from zennit_extensions.attention_unfolded import EvaAttentionUnfolded, TimmAttentionUnfolded
 
 
 def _extract_block_index(parent_name: str) -> Optional[int]:
@@ -26,32 +23,18 @@ def _extract_block_index(parent_name: str) -> Optional[int]:
 class EvaAttentionSubstitutionCanonizer(Canonizer):
     """Replace ``EvaAttention`` instances with :class:`EvaAttentionUnfolded`.
 
-    Lifecycle
-    ---------
-    * ``apply(root)`` walks ``root`` for ``EvaAttention`` modules whose
-      block index is in ``block_indices`` (or all, if ``block_indices``
-      is None). For each one it constructs a vanilla
-      :class:`EvaAttentionUnfolded` around the original and re-binds the
-      parent ``EvaBlock``'s ``.attn`` attribute to the unfolded version.
-    * ``remove()`` re-binds the parent's ``.attn`` to the original
-      module reference. Weight-sharing means no parameter state is lost.
-
-    This canonizer makes NO LRP-rule decisions — it just exposes the
-    attention as named submodules so a composite ``layer_map`` can assign
-    rule hooks (e.g. :class:`~zennit_ext.attnlrp_rules.AlphaBetaMatmul`) to
-    the new ``BilinearMatmul`` / ``SoftmaxAlongLastDim`` / etc. instances.
-
-    No source paper — infrastructure for unfolded attention (Eva/DINOv3).
+    ``apply(root)`` substitutes every ``EvaAttention`` whose block index is
+    in ``block_indices`` (all, if None); ``remove()`` re-binds the original.
+    Weight-sharing means no parameter state is lost. No LRP-rule decisions —
+    it only exposes named submodules so a composite ``layer_map`` can assign
+    rule hooks to them.
 
     Parameters
     ----------
     block_indices : tuple[int, ...] | None
-        Indices of blocks to substitute. ``None`` (default) means
-        substitute all attention blocks.
+        Blocks to substitute; ``None`` (default) substitutes all.
     rope_detach : bool
         Forwarded to :class:`EvaAttentionUnfolded` → :class:`RotaryEmbedding`.
-        Structural (whether RoPE owns parameters in the autograd graph),
-        not an LRP rule. Default False.
     """
 
     def __init__(
@@ -92,11 +75,10 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         attr_name: str,
         original: nn.Module,
     ) -> None:
-        # Signature intentionally differs from ``Canonizer.register(self)``;
-        # zennit's own canonizers (e.g. ``MergeBatchNorm.register(linears,
-        # batch_norm)``) do the same — ABC enforces method NAME, not
-        # signature, and zennit's lifecycle calls ``apply()`` which then
-        # dispatches to this overload.
+        # Signature intentionally differs from ``Canonizer.register(self)`` —
+        # zennit's lifecycle dispatches through ``apply()`` (the ABC enforces
+        # the method name, not its signature), and zennit's own canonizers
+        # do the same.
         self.parent = parent
         self.attr_name = attr_name
         self.original_module = original
@@ -119,20 +101,13 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
 
 class TimmAttentionSubstitutionCanonizer(Canonizer):
     """Replace standard timm ``Attention`` instances with :class:`TimmAttentionUnfolded`.
-
-    Mirror of :class:`EvaAttentionSubstitutionCanonizer` for the
-    standard timm `vision_transformer.Attention` class. Both canonizers
-    are typically bundled into the same composite — each one's
-    ``isinstance`` filter skips the other's target so there's no
-    coupling.
-
-    No source paper — infrastructure for unfolded attention (standard timm ViT).
+    Mirror of :class:`EvaAttentionSubstitutionCanonizer`; each canonizer's
+    ``isinstance`` filter skips the other's target, so both can be bundled.
 
     Parameters
     ----------
     block_indices : tuple[int, ...] | None
-        Indices of blocks to substitute. ``None`` (default) means
-        substitute all attention blocks.
+        Blocks to substitute; ``None`` (default) substitutes all.
     """
 
     def __init__(
@@ -151,11 +126,9 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
         self.unfolded_module: Optional[TimmAttentionUnfolded] = None
 
     def apply(self, root_module: nn.Module) -> List["TimmAttentionSubstitutionCanonizer"]:
-        # Stock timm `Attention` does not carry `num_prefix_tokens`. The
-        # value lives on the top-level `VisionTransformer` instance and the
-        # canonizer is the right place to read it once and mediate it down
-        # to each unfolded replacement. ``getattr`` with a fallback to 1
-        # handles bare attentions used in tests.
+        # Stock timm ``Attention`` does not carry ``num_prefix_tokens``; it
+        # lives on the top-level VisionTransformer, read once here and passed
+        # down. Fallback 1 covers bare attentions in tests.
         num_prefix_tokens = int(getattr(root_module, "num_prefix_tokens", 1))
 
         instances: List[TimmAttentionSubstitutionCanonizer] = []
@@ -180,9 +153,7 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
         *,
         num_prefix_tokens: int = 1,
     ) -> None:
-        # See note on ``EvaAttentionSubstitutionCanonizer.register`` —
-        # zennit's lifecycle dispatches through ``apply()``; the ABC
-        # only requires the method name.
+        # See note on ``EvaAttentionSubstitutionCanonizer.register``.
         self.parent = parent
         self.attr_name = attr_name
         self.original_module = original
@@ -210,16 +181,11 @@ def _bind_forward(module: nn.Module, fn: Callable, attr: str = "forward") -> dic
 def _eva_block_forward(self, x, rope=None, attn_mask=None, is_causal=False):
     """``EvaBlock.forward`` replacement that routes the residual adds (and,
     optionally, the LayerScale γ multiplications) through ``nn.Module`` instances
-    so a composite ``layer_map`` can attach an LRP rule to them.
-
-    The residual *rule* is NOT chosen here — it is selected by mapping
-    :class:`~zennit_ext.attention_unfolded.ResidualAdd` to a hook in the
-    composite ``layer_map``. The canonizer always installs the same
-    ``ResidualAdd`` type.
+    so a composite ``layer_map`` can attach an LRP rule to them. The rule is a
+    ``layer_map`` decision, not a property of this module.
     """
     # ``self._lrp_res{1,2}`` = ResidualAdd, ``self._lrp_ls{1,2}`` = LayerScaleMul,
-    # attached by :class:`EvaBlockResidualCanonizer`; the composite ``layer_map``
-    # assigns each its LRP rule as a zennit Hook.
+    # attached by :class:`EvaBlockResidualCanonizer`.
     attn_branch = self.attn(
         self.norm1(x), rope=rope, attn_mask=attn_mask, is_causal=is_causal,
     )
@@ -243,24 +209,18 @@ def _eva_block_forward(self, x, rope=None, attn_mask=None, is_causal=False):
 
 
 class EvaBlockResidualCanonizer(AttributeCanonizer):
-    """Canonizer that swaps ``forward`` on timm ``eva.EvaBlock`` (DINOv3 etc.)
-    for the residual-LRP variant. Handles the optional
-    ``gamma_1``/``gamma_2`` LayerScale parameters and (optionally) wraps
-    them under the AttnLRP uniform rule.
+    """Swap ``forward`` on timm ``eva.EvaBlock`` so the two residual adds
+    route through :class:`~zennit_extensions.attention_unfolded.ResidualAdd`
+    modules — making them hookable. The residual *rule* is a ``layer_map``
+    decision; this canonizer installs only the (single) module type.
 
     Parameters
     ----------
     layerscale_uniform : bool
-        When True, route the LayerScale γ multiplications through
-        :class:`~zennit_ext.attention_unfolded.LayerScaleMul` modules, which
-        the composite ``layer_map`` gives the :class:`Uniform` (factor-2)
-        rule (AttnLRP Eq. 7, treating γ as a constant operand). Default False.
-
-    The residual *rule* is chosen in the composite ``layer_map`` (map
-    ``ResidualAdd`` to a hook), not here — this canonizer always installs the
-    single ``ResidualAdd`` type.
-
-    No source paper — infrastructure for hookable residual adds (Eva/DINOv3).
+        Also route the LayerScale γ multiplications through
+        :class:`~zennit_extensions.attention_unfolded.LayerScaleMul` modules
+        (typically mapped to ``Uniform(factor=2)``, AttnLRP Eq. 7).
+        Default False.
     """
 
     def __init__(self, *, layerscale_uniform: bool = False):
@@ -298,10 +258,9 @@ class EvaBlockResidualCanonizer(AttributeCanonizer):
 
 def _timm_block_forward(self, x, attn_mask=None, is_causal=False):
     """timm ``Block.forward`` replacement that routes the two residual adds
-    through ``self._lrp_res{1,2}`` (:class:`~zennit_ext.attention_unfolded.ResidualAdd`)
-    so a composite ``layer_map`` can attach the chosen residual rule. The rule is
-    a ``layer_map`` decision, not a property of this module. LayerScale on standard
-    timm Blocks is its own ``nn.Module`` (``ls1``/``ls2``), handled transparently.
+    through ``self._lrp_res{1,2}`` (:class:`~zennit_extensions.attention_unfolded.ResidualAdd`)
+    so a composite ``layer_map`` can attach the chosen residual rule. LayerScale
+    on standard timm Blocks is already an ``nn.Module`` (``ls1``/``ls2``).
     """
     branch1 = self.drop_path1(
         self.ls1(self.attn(self.norm1(x), attn_mask=attn_mask, is_causal=is_causal))
@@ -313,14 +272,10 @@ def _timm_block_forward(self, x, attn_mask=None, is_causal=False):
 
 
 class TimmBlockResidualCanonizer(AttributeCanonizer):
-    """Canonizer that swaps ``forward`` on timm ``vision_transformer.Block`` so
-    each residual addition routes through a
-    :class:`~zennit_ext.attention_unfolded.ResidualAdd` module — making the add
-    hookable. The residual *rule* (ratio / symmetric / L1 / none) is then chosen
-    in the composite ``layer_map`` by mapping ``ResidualAdd`` to a hook; this
-    canonizer installs only the (single) module type and takes no rule argument.
-
-    No source paper — infrastructure for hookable residual adds.
+    """Swap ``forward`` on timm ``vision_transformer.Block`` so each residual
+    add routes through a :class:`~zennit_extensions.attention_unfolded.ResidualAdd`
+    module — making the add hookable. The residual *rule* is a ``layer_map``
+    decision; this canonizer installs only the (single) module type.
     """
 
     def __init__(self):
@@ -350,26 +305,12 @@ class TimmBlockResidualCanonizer(AttributeCanonizer):
 
 
 class TimmViTCanonizer(CompositeCanonizer):
-    """Aggregator: bundles the per-module canonizers needed for AttnLRP on
-    a timm ViT (standard or Eva-stack).
-
-    Combines :class:`TimmBlockResidualCanonizer` and
-    :class:`EvaBlockResidualCanonizer` (when ``residual`` is True) — routing the
-    residual adds through ``ResidualAdd`` so the composite ``layer_map`` can apply
-    a residual rule. LayerNorm / Dropout need no canonizer (mapped to ``Pass``);
-    PA-LRP was removed.
-
-    Attention itself is NOT handled here. It is substituted to its
-    unfolded form (:class:`TimmAttentionUnfolded` /
-    :class:`EvaAttentionUnfolded`) by their respective substitution
-    canonizers, applied automatically by
-    :class:`AttnLRPCombinedComposite`.
-
-    All mutations are instance-level and reversible (revert on
-    ``composite.context()`` exit).
-
-    No source paper — infrastructure aggregator bundling the per-module
-    canonizers.
+    """Bundles the block-level canonizers for AttnLRP on a timm ViT
+    (standard or Eva stack): with ``residual=True``, the
+    Timm/Eva ``BlockResidualCanonizer`` pair. LayerNorm / Dropout need no
+    canonizer (mapped to ``Pass`` in the layer_map), and attention substitution
+    is handled separately by the ``*AttentionSubstitutionCanonizer``. All
+    mutations are instance-level and revert on ``composite.context()`` exit.
 
     Parameters
     ----------
@@ -377,14 +318,12 @@ class TimmViTCanonizer(CompositeCanonizer):
         Deprecated no-op, accepted for back-compat (PA-LRP removed).
     residual : bool
         Route the block residual adds through ``ResidualAdd`` modules so the
-        composite ``layer_map`` can apply a residual rule. The rule itself
-        (ratio / symmetric / L1 / none) is selected in the ``layer_map``, not
-        here.
+        composite ``layer_map`` can apply a residual rule.
     layerscale_uniform : bool
-        Apply the uniform allocation rule to LayerScale γ
-        multiplications (CaiT / Eva blocks only).
+        Also route Eva LayerScale γ multiplications through ``LayerScaleMul``.
     epsilon : float
-        ε for ε-stabilised rules.
+        Unused (rules are configured by the composite); accepted for
+        back-compat.
     """
 
     def __init__(

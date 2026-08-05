@@ -1,69 +1,22 @@
-"""Atomic ``nn.Module`` kernels for AttnLRP-aware attention — VANILLA forwards.
+"""Vanilla (standard-autograd) attention atomics + unfolded timm-attention containers.
 
-Every module here is a plain PyTorch op with autograd's standard backward.
-LRP behaviour (custom backward = relevance flow, not Jacobian-vector
-product) is injected EXCLUSIVELY at attribution time by the zennit ``Hook``
-rules in :mod:`zennit_ext.attnlrp_rules` (``AlphaBetaMatmul`` on
-:class:`BilinearMatmul`, a selectable residual rule on :class:`ResidualAdd`
-(and its :class:`PosEmbedAdd` alias), ``Uniform`` on :class:`LayerScaleMul`,
-``Pass`` on :class:`SoftmaxAlongLastDim` / :class:`ScaleByConstant`), assigned
-by module type through the composite's ``layer_map``. zennit hooks fire in the single
-backward pass and detach on ``composite.context()`` exit, so these modules
-stay vanilla outside attribution.
+Everything here is an ``nn.Module`` with a plain PyTorch forward. LRP
+behaviour is injected only at attribution time by zennit ``Hook`` rules
+(:mod:`zennit_extensions.rules`), assigned by module type through a
+composite ``layer_map`` and detached on ``composite.context()`` exit — so
+these modules also work inside trainable heads, receiving correct
+chain-rule gradients.
 
-This separation matters because these modules are also used inside
-trainable classification heads (``AttentiveHead``, ``BlockHead``). At
-training time no composite is active, so the modules behave like normal
-PyTorch ops and the optimizer receives correct chain-rule gradients.
+:class:`EvaAttentionUnfolded` / :class:`TimmAttentionUnfolded` compose the
+atomics into forward-parity replacements for timm attention modules,
+referencing (not copying) the original parameters so checkpoint loading
+still works. They are installed by the substitution canonizers in
+:mod:`zennit_extensions.canonisation.canonizers`.
 
-Module catalogue (all vanilla forwards)
----------------------------------------
-
-Bilinear / multi-input modules:
-
-* :class:`BilinearMatmul` — ``a @ b``.
-* :class:`AddBias` — ``x + bias`` (bias may be None → identity).
-* :class:`ResidualAdd` — ``x + branch``.
-
-Single-input modules:
-
-* :class:`SoftmaxAlongLastDim` — ``F.softmax(x, dim=-1)``.
-* :class:`RotaryEmbedding` — RoPE; optional prefix-tokens skip and
-  optional ``rope.detach()`` (structural choice — RoPE has no learnable
-  parameters, not an LRP rule).
-* :class:`ScaleByConstant` — ``x * value``.
-* :class:`ChunkAlongLastDim` — ``x.chunk(n, dim=-1)``.
-* :class:`ReshapeMergeHeads` — ``x.transpose(1, 2).reshape(B, N, out_dim)``.
-* :class:`LayerScaleMul` — ``γ * x`` (γ is a learnable per-channel
-  parameter from the parent ``EvaBlock``).
-* :class:`LRPInspectionLayer` (base) + role-specific subclasses
-  :class:`QInspectionLayer` / :class:`KInspectionLayer` /
-  :class:`VInspectionLayer` — ``nn.Identity`` placeholders marking
-  hookable LRP probe sites. Subclassing lets layer_map composites target
-  Q vs K vs V independently.
-
-Container modules:
-
-* :class:`EvaAttentionUnfolded` — composes the vanilla atomics into a
-  forward-parity replacement for ``timm.models.eva.EvaAttention``.
-* :class:`TimmAttentionUnfolded` — same idea for the standard
-  ``timm.models.vision_transformer.Attention`` (no RoPE, no LayerScale,
-  ``num_prefix_tokens=1``).
-
-Substitution canonizers:
-
-* :class:`EvaAttentionSubstitutionCanonizer` — swaps ``EvaAttention`` for
-  :class:`EvaAttentionUnfolded` on ``apply()``, restores on ``remove()``.
-* :class:`TimmAttentionSubstitutionCanonizer` — same for standard timm
-  ``Attention``. Both canonizers coexist cleanly; each one's
-  ``isinstance`` filter skips the other's target class.
-
-LRP rules are NOT canonizers here — they are zennit ``Hook`` subclasses in
-:mod:`zennit_ext.attnlrp_rules`, assigned by module type via a composite
-``layer_map`` (see :mod:`zennit_ext.attnlrp_composites`). The only ``Hook``
-defined in this file is :class:`StopGradient` (zeros backward relevance;
-layer-map onto :class:`QInspectionLayer` / :class:`KInspectionLayer` for the
-CP-LRP attention rule — relevance flows through the value path only).
+:class:`LRPInspectionLayer` (and its Q/K/V subclasses) = identity probe
+sites on the ``(B, N, embed_dim)`` tensors for concept hooking, targetable
+per-role by a ``layer_map`` — e.g. Q/K →
+:class:`~zennit_extensions.cp_lrp.StopGradient` for value-path-only CP-LRP.
 """
 from __future__ import annotations
 
@@ -72,42 +25,36 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Function
 
 from timm.layers import apply_rot_embed_cat
 
-from zennit.canonizers import AttributeCanonizer
 
-
+__all__ = [
+    "AddBias", "BilinearMatmul", "ChunkAlongLastDim", "EvaAttentionUnfolded",
+    "KInspectionLayer", "LRPInspectionLayer", "LayerScaleMul", "PosEmbedAdd",
+    "QInspectionLayer", "ReshapeMergeHeads", "ResidualAdd", "RotaryEmbedding",
+    "ScaleByConstant", "SoftmaxAlongLastDim", "TimmAttentionUnfolded",
+    "VInspectionLayer",
+]
 
 
 # ─── 1. Vanilla atomic modules ──────────────────────────────────────────────
 
 
 class BilinearMatmul(nn.Module):
-    """``y = a @ b``. Vanilla bilinear matmul; autograd's standard backward.
-
-    Used inside :class:`EvaAttentionUnfolded` and :class:`TimmAttentionUnfolded`
-    for ``q @ kᵀ`` and ``weights @ v``, and inside classification heads
-    that want these matmuls exposed as named submodules. To enable the
-    AttnLRP AlphaBeta rule on backward at attribution time, assign the
-    :class:`~zennit_ext.attnlrp_rules.AlphaBetaMatmul` hook to this type via a
-    composite ``layer_map``.
-    """
+    """``y = a @ b``. Layer-map target for a bilinear LRP rule — e.g.
+    :class:`~zennit_extensions.rules.bajger_contrib.AlphaBetaMatmul` or
+    :class:`~zennit_extensions.rules.attnlrp.MatmulAttnLRP` (both the
+    ``q@kᵀ`` and ``attn@v`` products)."""
 
     def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a @ b
 
 
 class AddBias(nn.Module):
-    """``y = x + bias`` where ``bias`` is a leaf constant or ``None``.
-
-    When ``bias is None`` forward is identity (no add). Vanilla; autograd
-    handles the ``+`` correctly under any LRP composite's layer_map for
-    standard adds. (No dedicated rule canonizer because the typical use
-    site is the resolved attention mask, which is a constant — autograd
-    routes ``grad_x = grad_y`` and discards the unused ``grad_bias``.)
-    """
+    """``y = x + bias`` (identity when ``bias is None``). No dedicated rule:
+    the typical bias is a constant mask, so autograd already routes
+    relevance correctly (``grad_x = grad_y``; ``grad_bias`` discarded)."""
 
     def forward(self, x: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
         if bias is None:
@@ -116,16 +63,14 @@ class AddBias(nn.Module):
 
 
 class ResidualAdd(nn.Module):
-    """``y = x + branch``. Vanilla addition — the **single** module type for a
-    residual skip merge.
+    """``y = x + branch`` — the single module type for a residual skip merge.
 
-    The LRP behaviour is **not** encoded in the module: pick the residual rule
-    in the composite ``layer_map`` by mapping this type to the desired hook —
-    :class:`~zennit_ext.attnlrp_rules.ResidualRatio` (Otsuki ``|x|``/``|branch|``
-    split), :class:`~zennit_ext.attnlrp_rules.Uniform` (½ each, symmetric), or
-    :class:`~zennit_ext.attnlrp_rules.ResidualL1` (sign-preserving, L1-conserving).
-    Mapping it to nothing leaves the plain (non-conservative) add. Do NOT create
-    a separate module type per rule — one module, many selectable rules.
+    The residual *rule* is a ``layer_map`` choice on this one type:
+    :class:`~zennit_extensions.rules.residuals_otsuki2024.ResidualRatio`
+    (``|x|``/``|branch|`` split), :class:`~zennit_extensions.rules.attnlrp.Uniform`
+    (½ each), or :class:`~zennit_extensions.rules.bajger_contrib.ResidualL1`
+    (sign-preserving). Unmapped = plain (non-conservative) add. Do NOT create
+    a module type per rule — one module, many selectable rules.
     """
 
     def forward(self, x: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
@@ -133,49 +78,29 @@ class ResidualAdd(nn.Module):
 
 
 class PosEmbedAdd(ResidualAdd):
-    """Alias of :class:`ResidualAdd` (same ``x + branch`` op) kept as a distinct
-    dispatch type *only* so the ``x + pos_embed`` PA-LRP merge can take its own
-    ``layer_map`` rule (the uniform ½ split) independently of the residual skips.
-    Different graph role, not a different rule for the same module. Order it
-    BEFORE ``ResidualAdd`` in a ``layer_map`` (zennit matches by ``isinstance``,
-    first hit wins)."""
+    """Alias of :class:`ResidualAdd` kept as a distinct dispatch type only so
+    the ``x + pos_embed`` merge can take its own ``layer_map`` rule (the PA-LRP
+    uniform ½ split). Order it BEFORE ``ResidualAdd`` in a map (zennit matches
+    by ``isinstance``, first hit wins)."""
 
 
 class SoftmaxAlongLastDim(nn.Module):
-    """``y = F.softmax(x, dim=-1)``. Vanilla.
-
-    For the AttnLRP identity rule (``R_in = R_out``, AttnLRP Eq. 9), assign
-    zennit's stock ``Pass`` rule to this type via a composite ``layer_map``.
-    """
+    """``y = softmax(x, dim=-1)``. For the AttnLRP identity rule (Eq. 9),
+    assign zennit's stock ``Pass`` rule; the full cross-term rule is
+    :class:`~zennit_extensions.rules.attnlrp.SoftmaxAttnLRP`."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.softmax(x, dim=-1)
 
 
 class RotaryEmbedding(nn.Module):
-    """Apply RoPE to a Q or K tensor with optional prefix-tokens skip.
+    """RoPE via ``timm.layers.apply_rot_embed_cat`` with optional
+    prefix-token skip (DINOv3/EVA cls+register tokens are not rotated).
 
-    Wraps ``timm.layers.apply_rot_embed_cat`` and handles the
-    ``num_prefix_tokens`` skip used by DINOv3 / EVA-style models (cls +
-    register tokens at the front of the sequence are NOT rotated).
-
-    Parameters
-    ----------
-    num_prefix_tokens : int
-        Number of leading positions left un-rotated.
-    rotate_half : bool
-        Layout flag passed to ``apply_rot_embed_cat``. Mirrors
-        ``EvaAttention.rotate_half``.
-    detach_rope : bool
-        When True, ``rope.detach()`` before the rotary op. RoPE has no
-        learnable parameters (Su et al. 2021, arXiv:2104.09864), so
-        cos/sin can be treated as graph constants and gradients route
-        purely through the rotated tensor. This is a structural choice
-        about whether RoPE owns parameters in the autograd graph — it
-        is NOT an LRP rule and is safe at training time. Default False
-        for forward parity with stock ``EvaAttention``.
-
-    Forward signature: ``(q, rope)``. ``rope`` may be ``None`` (identity).
+    ``rope=None`` → identity. ``detach_rope=True`` detaches cos/sin so
+    gradients route purely through the rotated tensor; structural choice
+    (RoPE has no learnable parameters), not an LRP rule, safe at training
+    time. Default False for forward parity with stock ``EvaAttention``.
     """
 
     def __init__(
@@ -211,12 +136,8 @@ class RotaryEmbedding(nn.Module):
 
 
 class ScaleByConstant(nn.Module):
-    """``y = x * value`` where ``value`` is a graph constant.
-
-    For the AttnLRP graph-constant identity rule on backward (constant
-    absorbs no relevance), assign zennit's stock ``Pass`` rule to this type
-    via a composite ``layer_map``.
-    """
+    """``y = x * value`` with ``value`` a graph constant. AttnLRP treats it
+    as absorbing no relevance → stock zennit ``Pass`` via the ``layer_map``."""
 
     def __init__(self, value: float):
         super().__init__()
@@ -230,12 +151,8 @@ class ScaleByConstant(nn.Module):
 
 
 class ChunkAlongLastDim(nn.Module):
-    """Split a tensor into ``n`` equal chunks along the last dim.
-
-    Backward is ``torch.cat`` along the same dim — identity in LRP terms
-    (each chunk's relevance returns to its original slice). No canonizer
-    needed; bare autograd routes relevance correctly.
-    """
+    """Split into ``n`` chunks along the last dim. Backward is ``torch.cat``
+    — LRP-identity; no rule needed."""
 
     def __init__(self, n: int):
         super().__init__()
@@ -251,11 +168,8 @@ class ChunkAlongLastDim(nn.Module):
 
 
 class ReshapeMergeHeads(nn.Module):
-    """Merge per-head context back into ``(B, N, C)``.
-
-    Forward: ``x.transpose(1, 2).reshape(B, N, out_dim)``. Identity in
-    LRP terms — pure reshape preserves ``sum(R)``; no canonizer needed.
-    """
+    """``x.transpose(1, 2).reshape(B, N, out_dim)`` — merge per-head context.
+    Pure reshape preserves ``sum(R)``; no rule needed."""
 
     def __init__(self, out_dim: Optional[int] = None):
         super().__init__()
@@ -274,25 +188,19 @@ class ReshapeMergeHeads(nn.Module):
 
 
 class LayerScaleMul(nn.Module):
-    """``y = γ * x`` (CaiT-style LayerScale; Touvron et al. 2021).
-
-    γ is a learnable per-channel parameter. For the AttnLRP uniform rule
-    on backward (Eq. 7 — γ absorbs half the relevance, branch gets the
-    other half), assign the :class:`~zennit_ext.attnlrp_rules.Uniform` rule
-    to this type via a composite ``layer_map``.
+    """``y = γ * x`` (CaiT LayerScale). For the AttnLRP uniform rule on
+    backward (γ absorbs half the relevance), assign
+    :class:`~zennit_extensions.rules.attnlrp.Uniform` via the ``layer_map``.
 
     Parameters
     ----------
     gamma : nn.Parameter
-        The LayerScale parameter from the parent ``EvaBlock``. Shared by
-        reference; not copied.
+        The parent ``EvaBlock``'s LayerScale parameter, referenced without
+        re-registering so weight loading still flows through the parent.
     """
 
     def __init__(self, gamma: nn.Parameter):
         super().__init__()
-        # NB: ``gamma`` is a Parameter on the parent module; we reference
-        # it without re-registering, so weight loading still flows through
-        # the parent.
         self.gamma = gamma
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -300,93 +208,50 @@ class LayerScaleMul(nn.Module):
 
 
 class LRPInspectionLayer(nn.Identity):
-    """Identity placeholder marking a hookable site for LRP relevance
-    inspection.
-
-    Mathematically a no-op (just :class:`nn.Identity`). The reason it has
-    its own class name is so graphviz / torchview renders ``LRPInspectionLayer``
-    instead of an anonymous ``Identity`` node, and so
-    ``get_layer_names(model, [LRPInspectionLayer])`` can enumerate the
-    sites that concept classes are designed to hook.
-
-    Three role-specific subclasses (:class:`QInspectionLayer`,
-    :class:`KInspectionLayer`, :class:`VInspectionLayer`) are used on the
-    unfolded attention containers. Subclassing lets ``LayerMapComposite``
-    target Q vs K vs V independently (e.g. mapping
-    ``QInspectionLayer → StopGradient()`` for CP-LRP-style attention)
-    while ``isinstance(m, LRPInspectionLayer)`` enumeration still catches
-    all three for concept hooking.
-    """
+    """Named ``nn.Identity`` marking a hookable relevance-inspection site —
+    named so graphviz renders it and ``get_layer_names(model,
+    [LRPInspectionLayer])`` can enumerate probe sites. The Q/K/V subclasses
+    let a ``layer_map`` target roles independently while
+    ``isinstance(m, LRPInspectionLayer)`` still enumerates all three."""
     pass
 
 
 class QInspectionLayer(LRPInspectionLayer):
-    """Identity probe at the Q slot of an unfolded attention container.
-
-    Layer-map target for Q-specific LRP rules — e.g. :class:`StopGradient`
-    for the CP-LRP attention rule (block relevance flow through the Q
-    projection).
-    """
+    """Q-slot probe. Pair with :class:`~zennit_extensions.cp_lrp.StopGradient`
+    for CP-LRP (block relevance flow through the Q projection)."""
     pass
 
 
 class KInspectionLayer(LRPInspectionLayer):
-    """Identity probe at the K slot of an unfolded attention container.
-
-    See :class:`QInspectionLayer`. Pair with :class:`StopGradient` in the
-    composite layer_map for CP-LRP attention.
-    """
+    """K-slot probe. See :class:`QInspectionLayer`."""
     pass
 
 
 class VInspectionLayer(LRPInspectionLayer):
-    """Identity probe at the V slot of an unfolded attention container.
-
-    See :class:`QInspectionLayer`. Under CP-LRP, the V probe stays as a
-    pure identity so relevance flows through the value path unchanged.
-    """
+    """V-slot probe. Under CP-LRP stays a pure identity so relevance flows
+    through the value path unchanged."""
     pass
 
 
-# ─── 2. Shared reshape helper ───────────────────────────────────────────────
+# ─── 2. Unfolded attention containers (vanilla forwards) ────────────────────
 
 
 def _to_heads(t: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
-    """``(B, N, num_heads * head_dim) → (B, num_heads, N, head_dim)``.
-
-    Per-head reshape shared by :class:`EvaAttentionUnfolded` and
-    :class:`TimmAttentionUnfolded` forwards.
-    """
+    """``(B, N, num_heads * head_dim) → (B, num_heads, N, head_dim)``."""
     B, N, _ = t.shape
     return t.reshape(B, N, num_heads, head_dim).transpose(1, 2)
 
 
 class TimmAttentionUnfolded(nn.Module):
-    """Unfolded ``timm.models.vision_transformer.Attention`` analogue.
+    """Unfolded ``timm.models.vision_transformer.Attention`` — forward-parity
+    replacement composed of the vanilla atomics. References (not copies) the
+    original's parameter-bearing submodules, so checkpoint loading is
+    unaffected.
 
-    Constructor takes a real ``Attention`` instance, references
-    its parameter-bearing submodules (``qkv``, ``q_norm``, ``k_norm``,
-    ``proj``, ``attn_drop``, ``proj_drop``, optional ``norm``) by
-    attribute, and exposes hookable atomic ops for zennit canonizers.
-
-    Forward signature mirrors
-    stock ``timm.models.vision_transformer.Attention.forward``
-    The block keeps invoking ``self.attn(x, attn_mask=…, is_causal=…)`` with no signature break.
-    For ViT image classification ``is_causal`` is always ``False``; the
-    kwarg is accepted but trivially unused on that path.
-
-    Parameters
-    ----------
-    orig : timm.models.vision_transformer.Attention
-        Source module to wrap.
-    num_prefix_tokens : int
-        Number of leading (non-spatial) tokens in the model's sequence —
-        ``1`` for the standard ``cls``-only setup, more if the model was
-        built with ``reg_tokens > 0``. Stock timm ``Attention`` does not
-        carry this attribute (only the top-level ``VisionTransformer``
-        does), so the substitution canonizer is responsible for passing
-        it in at construction time. Default ``1`` matches the most common
-        case but the canonizer always overrides it.
+    Stock timm ``Attention`` does not carry ``num_prefix_tokens`` (it lives
+    only on the top-level ``VisionTransformer``), so the substitution
+    canonizer passes it in at construction. ``is_causal`` is accepted for
+    signature parity; always False on the ViT classification path.
     """
 
     def __init__(self, orig, *, num_prefix_tokens: int = 1) -> None:
@@ -424,8 +289,7 @@ class TimmAttentionUnfolded(nn.Module):
         self.proj = orig.proj
         self.proj_drop = orig.proj_drop
 
-        # Atomic vanilla submodules. LRP rules are layered in by the
-        # per-module canonizers at composite-context-entry time.
+        # Atomic vanilla submodules; a composite layer_map assigns LRP rules.
         self.split = ChunkAlongLastDim(3)
         self.scale_q = ScaleByConstant(self.scale)
         self.qk_scores = BilinearMatmul()
@@ -433,13 +297,10 @@ class TimmAttentionUnfolded(nn.Module):
         self.softmax = SoftmaxAlongLastDim()
         self.context = BilinearMatmul()
         self.reshape = ReshapeMergeHeads()
-        # LRP inspection sites. Placed AFTER ``split``, BEFORE
-        # ``_to_heads`` — tensor shape is ``(B, N, embed_dim)``, identical
-        # to ``proj_drop`` output. HeadConcept slices embed_dim per-head
-        # internally; q_norm / k_norm and the per-head reshape are
-        # downstream and not inspected through these probes. Distinct
-        # subclasses (Q/K/V) so a LayerMapComposite can target them
-        # independently with different LRP rules.
+        # Probe sites on the (B, N, embed_dim) tensors (same shape as
+        # ``proj_drop`` output): HeadConcept slices embed_dim per-head
+        # internally, so the downstream per-head reshape is irrelevant to
+        # attribution. Distinct Q/K/V subclasses → independent layer_map rules.
         self.q_lrp_probe = QInspectionLayer()
         self.k_lrp_probe = KInspectionLayer()
         self.v_lrp_probe = VInspectionLayer()
@@ -480,12 +341,9 @@ class TimmAttentionUnfolded(nn.Module):
         return out
 
     def _resolve_and_add_mask(self, scores, attn_mask, is_causal, N):
-        # Standard timm Attention's explicit-math path does
-        #   if attn_mask is not None: attn = attn + attn_mask
-        # and ignores is_causal on this path (it only applies to the
-        # F.scaled_dot_product_attention dispatch). We still honour
-        # is_causal=True by building a triangular mask for consistency
-        # with the Eva unfolded variant.
+        # Stock timm adds attn_mask on this explicit-math path and handles
+        # is_causal only on the F.scaled_dot_product_attention dispatch; we
+        # build the triangular mask explicitly for parity with the Eva variant.
         attn_bias = attn_mask
         if is_causal:
             causal = torch.triu(
@@ -504,59 +362,14 @@ class TimmAttentionUnfolded(nn.Module):
         )
 
 
-# ─── 3. Container: EvaAttentionUnfolded (vanilla forward) ───────────────────
-
-
-# ─── 3. Substitution canonizer (no LRP knobs) ───────────────────────────────
-
-
-# ─── 3b. Timm-standard unfolded attention + substitution canonizer ──────────
-
-
-# ─── 4. Autograd Function kernels for the LRP rules ─────────────────────────
-# These are used ONLY by the canonizers below — never by the modules' own
-# forwards. They live here (not in transformer_patches) because their sole
-# consumers are the per-module canonizers right below them.
-
-
-# ─── 5. LRP-rule canonizers (one per rule, vanilla ↔ rule-aware swap) ───────
-#
-# Each canonizer rebinds the forward of a specific module class with a
-# wrapper that routes through an autograd Function whose backward
-# implements the LRP rule. On ``apply()`` the wrapper is bound; on
-# ``remove()`` the original ``forward`` is restored. Forward output is
-# numerically identical to vanilla in every case (Functions do
-# ``a @ b`` / ``F.softmax`` / ``x * scalar`` etc. — only backward differs).
-
-
-# ─── 6. Internal helpers ────────────────────────────────────────────────────
-
-
-
 class EvaAttentionUnfolded(nn.Module):
-    """Unfolded ``timm.models.eva.EvaAttention`` analogue — vanilla forward.
+    """Unfolded ``timm.models.eva.EvaAttention`` — forward-parity replacement
+    composed of the vanilla atomics, with RoPE and a prefix-token skip.
+    References the original's parameters, so checkpoint keys
+    (``blocks.{i}.attn.qkv.weight``, …) keep resolving.
 
-    Constructor takes a *real* ``EvaAttention`` instance and stores
-    references to its parameters / sub-modules. The container does NOT
-    copy weights — the original module's parameters live on, accessible
-    via ``self.qkv``, ``self.proj`` etc. So when this container is
-    swapped in by :class:`EvaAttentionSubstitutionCanonizer`, weight
-    loading from a checkpoint Just Works (the checkpoint targets
-    ``blocks.{i}.attn.qkv.weight`` and we still have an ``attn.qkv``
-    submodule).
-
-    Forward signature matches ``EvaAttention.forward`` exactly:
-    ``(self, x, rope=None, attn_mask=None, is_causal=False)``. All atomic
-    submodules are vanilla (see module docstrings)..
-
-    Parameters
-    ----------
-    orig : timm.models.eva.EvaAttention
-        Source module to wrap. Its parameters become this container's
-        parameters by reference.
-    rope_detach : bool
-        Forwarded to :class:`RotaryEmbedding`. Structural choice (RoPE
-        has no parameters), not an LRP rule. Default False.
+    Variants with separate per-Q/K/V biases (``vit_*_dinov3_qkvb``) are not
+    supported; ``rope_detach`` is forwarded to :class:`RotaryEmbedding`.
     """
 
     def __init__(
@@ -575,9 +388,6 @@ class EvaAttentionUnfolded(nn.Module):
             raise TypeError(
                 "EvaAttentionUnfolded expects a timm EvaAttention-like instance"
             )
-        # The DINOv3 ViT-L variant: q_bias=k_bias=v_bias=None, qkv.bias=False.
-        # Variants with separate per-Q/K/V biases (vit_*_dinov3_qkvb) need
-        # a different qkv path; not handled here.
         if getattr(orig, "q_bias", None) is not None:
             raise NotImplementedError(
                 "EvaAttentionUnfolded does not support per-Q/K/V bias "
@@ -602,8 +412,7 @@ class EvaAttentionUnfolded(nn.Module):
         self.proj = orig.proj
         self.proj_drop = orig.proj_drop
 
-        # Atomic vanilla submodules. LRP rules are layered in by the
-        # per-module canonizers at composite-context-entry time.
+        # Atomic vanilla submodules; a composite layer_map assigns LRP rules.
         self.split = ChunkAlongLastDim(3)
         self.rope_q = RotaryEmbedding(
             self.num_prefix_tokens, rotate_half=rotate_half, detach_rope=rope_detach,
@@ -617,13 +426,7 @@ class EvaAttentionUnfolded(nn.Module):
         self.softmax = SoftmaxAlongLastDim()
         self.context = BilinearMatmul()
         self.reshape = ReshapeMergeHeads()
-        # LRP inspection sites for HeadConcept / EmbeddingDimConcept hooking.
-        # Placed AFTER ``split``, BEFORE ``_to_heads`` — tensor shape is
-        # ``(B, N, embed_dim)``, identical to ``proj_drop`` output. One
-        # shape contract everywhere: HeadConcept slices embed_dim per-head
-        # internally; the per-head reshape is downstream and irrelevant
-        # to attribution. Distinct subclasses (Q/K/V) so a LayerMapComposite
-        # can target them independently with different LRP rules.
+        # Probe sites — same placement and rationale as TimmAttentionUnfolded.
         self.q_lrp_probe = QInspectionLayer()
         self.k_lrp_probe = KInspectionLayer()
         self.v_lrp_probe = VInspectionLayer()

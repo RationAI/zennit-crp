@@ -25,7 +25,7 @@ class CheferMatmul(Hook):
     Eq. 9 conservation normalisation. The paper applies this to BOTH attention
     matmuls and skip-connection adds (matrix multiplication otherwise violates
     conservation, Lemma 1). Attach to
-    :class:`~zennit_ext.attention_unfolded.BilinearMatmul`.
+    :class:`~zennit_extensions.attention_unfolded.BilinearMatmul`.
 
     NB. The authors' released code normalises only the ``Add`` layer and leaves
     ``einsum`` (the matmul) un-normalised — a paper/code mismatch; this follows
@@ -60,7 +60,7 @@ class CheferAdd(Hook):
     """Chefer et al. (CVPR 2021) relevance rule for a 2-input add ``y = x + b``:
     the z-rule split followed by the same Eq. 9 conservation normalisation as
     :class:`CheferMatmul`. Mirrors their ``Add`` layer. Attach to
-    :class:`~zennit_ext.attention_unfolded.ResidualAdd`.
+    :class:`~zennit_extensions.attention_unfolded.ResidualAdd`.
 
     Sourced from 'Transformer Interpretability Beyond Attention Visualization',
     https://doi.org/10.1109/CVPR46437.2021.00084

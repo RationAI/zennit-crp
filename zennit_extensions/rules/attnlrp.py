@@ -28,7 +28,7 @@ class SoftmaxAttnLRP(Hook):
     last dim. The softmax-SPECIFIC rule, NOT the generic elementwise identity
     (:class:`zennit.rules.Pass` / :class:`Identity`): it keeps the cross-term
     coupling all positions and the input scaling. Map
-    :class:`~zennit_ext.attention_unfolded.SoftmaxAlongLastDim` to this hook.
+    :class:`~zennit_extensions.attention_unfolded.SoftmaxAlongLastDim` to this hook.
     Only fires when the attention weights are differentiable (full AttnLRP); under
     CP-LRP (StopGradient on Q/K) the softmax is a graph constant.
 
@@ -54,7 +54,7 @@ class MatmulAttnLRP(Hook):
     """AttnLRP bilinear rule for a 2-input matmul ``y = a @ b`` (Eq. 15): both
     operands share the ``2·output + ε`` stabiliser, splitting conservation in
     half between the two factors. Attach to
-    :class:`~zennit_ext.attention_unfolded.BilinearMatmul` (both the ``q@kᵀ`` and
+    :class:`~zennit_extensions.attention_unfolded.BilinearMatmul` (both the ``q@kᵀ`` and
     ``attn@v`` products). Numerically matches the LXT reference matmul rule.
 
     Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
@@ -86,7 +86,7 @@ class EpsilonAdd(Hook):
     signed proportional split ``R_x = R_y·x/(y+ε)``, ``R_branch = R_y·branch/(y+ε)``
     (conserves the signed sum). AttnLRP's skip-connection handling; mirrors LXT's
     ``add2`` rule. Attach to
-    :class:`~zennit_ext.attention_unfolded.ResidualAdd`.
+    :class:`~zennit_extensions.attention_unfolded.ResidualAdd`.
 
     Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
     Transformers', https://proceedings.mlr.press/v235/achtibat24a.html

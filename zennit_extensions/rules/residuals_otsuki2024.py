@@ -4,7 +4,7 @@ from zennit.core import Hook
 class ResidualRatio(Hook):
     """Otsuki ratio-split residual rule for a 2-input add ``y = x + branch``:
     distribute ``R_y`` ∝ ``|x|`` vs ``|branch|``. Attach to
-    :class:`~zennit_ext.attention_unfolded.ResidualAdd`.
+    :class:`~zennit_extensions.attention_unfolded.ResidualAdd`.
 
     Sourced from 'Layer-Wise Relevance Propagation with Conservation Property for
     ResNet', https://doi.org/10.1007/978-3-031-72775-7_20
