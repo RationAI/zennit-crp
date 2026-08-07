@@ -10,7 +10,7 @@
     body { max-width: 1100px; margin: 0 auto; padding: 1rem; }
     .selects { display: grid; gap: 0.75rem; grid-template-columns: 1fr; }
     @media (min-width: 640px) { .selects { grid-template-columns: 1fr 1fr; } }
-    @media (min-width: 900px) { .selects { grid-template-columns: 1fr 1fr 1fr 1fr; } }
+    @media (min-width: 900px) { .selects { grid-template-columns: 1fr 1fr 1fr 1fr 1fr; } }
     #sample-figs { display: flex; gap: 0.75rem; margin: 0 0 0.4rem; flex-wrap: wrap; }
     #sample-figs figure { margin: 0; }
     #sample-figs img { max-width: 160px; height: auto; border: 1px solid var(--pico-muted-border-color);
@@ -46,6 +46,11 @@
       or query), <strong>relevance</strong> (its conditional CRP heatmap), and <strong>RF crop</strong>
       — the image clipped to the heatmap's high-relevance region with low-relevance pixels faded,
       showing which part of the image the concept latches onto.</p>
+    <p class="meta-line"><strong>FV index</strong> picks how the reference index was conditioned:
+      <em>original</em> = stock CRP, every dataset image attributed on its ground-truth label;
+      <em>condition-class-aligned</em> = every image attributed on its top-3 predicted classes with
+      p&nbsp;&gt;&nbsp;10% (one pass per class), references stored per conditioning class and served
+      only when the explanation conditions on the same class.</p>
     <p class="meta-line">Heatmaps are <strong>class-conditional</strong>, per the CRP paper: relevance
       is initialised at the output on the sample's true class, masked at the concept, and propagated
       to the input (condition set <em>θ = {L:class, l:concept}</em>). This differs from
@@ -58,8 +63,11 @@
     <label>Model + dataset
       <select id="sel-model"></select>
     </label>
-    <label>Experiment instance
+    <label>LRP composite
       <select id="sel-instance"></select>
+    </label>
+    <label>FV index
+      <select id="sel-fvclass"></select>
     </label>
     <label>Image sample
       <select id="sel-sample"></select>

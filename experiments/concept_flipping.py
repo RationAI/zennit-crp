@@ -66,9 +66,7 @@ COMPOSITES = {
 from crp.attribution import CondAttribution
 from crp.concepts import HeadConcept, EmbeddingDimConcept
 # Model + data loading is shared in experiments.model_io; re-exported here so
-# existing imports (sae.py, scripts) keep working.
-from experiments.model_io import DATASETS, load_probe, select_correct, site_layer_names
-from experiments import sae as sae_mod
+from experiments.model_io import site_modules, DATASETS, load_probe, select_correct, site_layer_names
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = REPO_ROOT / "data" / "results" / "concept_flipping"
@@ -95,7 +93,7 @@ def _subsample_grid(n_det: int, max_steps: Optional[int]) -> List[int]:
     ``max_steps`` caps it, in which case ~``max_steps`` evenly-spaced unique
     counts spanning ``1..n_det`` (always including the last). The AOPC metric is
     a mean over the normalised fraction ``n/N``, so a coarse grid still estimates
-    it — this keeps large bases (SAE ``m=3072``) tractable."""
+    it — this keeps large concept bases tractable."""
     if not max_steps or n_det <= max_steps:
         return list(range(1, n_det + 1))
     return sorted(set(int(round(x)) for x in np.linspace(1, n_det, max_steps)))
@@ -110,10 +108,9 @@ def concept_detectors(concept_name: str, num_heads: int, feat_dim: int,
       per-detector relevance from a recorded ``(B, N, feat_dim)`` tensor.
     * ``D`` — a ``(n_detectors, feat_dim)`` bool matrix mapping each detector
       to the feature components it owns (a head → its contiguous ``head_dim``
-      slice; an embedding dim / SAE latent → a single index). Drives the masks.
+      slice; an embedding dim → a single index). Drives the masks.
     * ``n_grid`` — cumulative flip counts (see :func:`_subsample_grid`).
 
-    ``sae`` is per-latent like ``embed_dim`` but over the spliced SAE feature
     space, so ``feat_dim`` is the dictionary size ``m`` (not ``embed_dim``).
     """
     if concept_name == "head":
@@ -122,7 +119,7 @@ def concept_detectors(concept_name: str, num_heads: int, feat_dim: int,
         for h in range(num_heads):
             D[h, h * head_dim:(h + 1) * head_dim] = True
         return HeadConcept(num_heads=num_heads), D, list(range(1, num_heads + 1))
-    if concept_name in ("embed_dim", "sae"):
+    if concept_name == "embed_dim":
         D = torch.eye(feat_dim, dtype=torch.bool, device=device)
         return (EmbeddingDimConcept(num_heads=num_heads), D,
                 _subsample_grid(feat_dim, max_steps))
@@ -186,54 +183,13 @@ def forward_prob(model, x, c: int, hooks, masks: torch.Tensor, method_t: torch.T
 
 
 def setup_sites(model, site: str, concept_name: str, dataset_key: str, device,
-                sae_m: Optional[int] = None,
                 ) -> Tuple[List[str], List[nn.Module], int, Optional[List[float]]]:
-    """Resolve probe site + (optional) SAE splice into the pieces ``run_dataset``
-    needs, per block:
-
-    * ``record_layers[b]`` — layer name whose recorded relevance feeds
-      ``concept.attribute`` (and which is perturbed).
-    * ``hook_mods[b]`` — module to attach the :class:`PerturbHook` / capture to;
-      its OUTPUT is the perturbed tensor (B, N, feat_dim).
-    * ``feat_dim`` — ``embed_dim`` for axis-aligned concepts, the SAE dictionary
-      size ``m`` for ``--concept sae``.
-    * ``fvu`` — per-block reconstruction FVU when an SAE is spliced (else None),
-      reported as the splice-faithfulness control.
-
-    For ``--concept sae`` the trained SAE is spliced in as a reconstruction
-    pass-through (``experiments.sae.SAESplice``) at the site, exposing the
-    feature tensor at a ``features`` sublayer; record/perturb point there. At
-    the ``residual`` site the splice wraps the whole block (``inner=block``); at
-    ``proj_drop`` it replaces the dropout module.
-    """
-    blocks = model.backbone.blocks
-    n_blocks = len(blocks)
-    is_sae = concept_name == "sae"
-    fvu = [] if is_sae else None
-
-    base_name = site_layer_names(model, site)  # canonical site → layer-name map
-
-    if not is_sae:
-        mods = sae_mod.site_modules(model, site)
-        return base_name, mods, model.backbone.embed_dim, None
-
-    record_layers, hook_mods, m = [], [], None
-    for b in range(n_blocks):
-        ck = torch.load(sae_mod.sae_path(site, dataset_key, b, m=sae_m), map_location=device,
-                        weights_only=False)
-        raw = {k: ck["raw"][k].to(device) for k in ("W_enc", "b_enc", "W_dec", "b_dec")}
-        fvu.append(float(ck["fvu"]))
-        if site == "proj_drop":
-            splice = sae_mod.SAESplice(raw, inner=None).to(device).eval()
-            blocks[b].attn.proj_drop = splice
-            record_layers.append(f"backbone.blocks.{b}.attn.proj_drop.features")
-        else:  # residual: wrap the block
-            splice = sae_mod.SAESplice(raw, inner=blocks[b]).to(device).eval()
-            blocks[b] = splice
-            record_layers.append(f"backbone.blocks.{b}.features")
-        m = splice.m
-        hook_mods.append(splice.features)
-    return record_layers, hook_mods, m, fvu
+    """Resolve the probe site into the pieces ``run_dataset`` needs, per block:
+    record-layer names, hook modules, and the feature dimension (``embed_dim``).
+    The trailing ``None`` keeps the (record_layers, hook_mods, feat_dim, fvu)
+    return shape stable."""
+    return (site_layer_names(model, site), site_modules(model, site),
+            model.backbone.embed_dim, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,7 +199,7 @@ def setup_sites(model, site: str, concept_name: str, dataset_key: str, device,
 def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence[str],
                 classes: Optional[Sequence[int]], n_images: int,
                 device: str, chunk_size: int, precision: str, site: str = "proj_drop",
-                max_steps: Optional[int] = None, sae_m: Optional[int] = None) -> Tuple[Path, dict]:
+                max_steps: Optional[int] = None) -> Tuple[Path, dict]:
     """Run the concept-flipping experiment for one (config, concept, dataset,
     site) and write a long-format parquet. Stages are marked inline below."""
     methods = list(methods)
@@ -253,13 +209,13 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
                          enabled=(precision == "bf16" and device == "cuda"))
 
     # ── Stage 1 · model, dataset, relevance composite, concept detectors ──────
-    # Read geometry BEFORE any SAE splice (which replaces site modules).
+    # Read geometry before wiring the probe sites.
     model, ck, probe_path = load_probe(DATASETS[key][2], device)
     num_heads = model.backbone.blocks[0].attn.num_heads
     embed_dim = model.backbone.embed_dim
     n_blocks = len(model.backbone.blocks)
-    # site / splice → record-layer names, hook modules, feature dim (m for sae).
-    sites, hook_mods, feat_dim, fvu = setup_sites(model, site, concept_name, key, device, sae_m=sae_m)
+    # site → record-layer names, hook modules, feature dim.
+    sites, hook_mods, feat_dim, fvu = setup_sites(model, site, concept_name, key, device)
     attribution = CondAttribution(model)
     composite = COMPOSITES[config_name]()
     concept, D, n_grid = concept_detectors(concept_name, num_heads, feat_dim, device, max_steps)
@@ -275,8 +231,8 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
     # ── Stage 2 · pick N correctly-classified images per (chosen) class ───────
     target_classes = sorted(set(classes) & set(range(int(ck["num_classes"])))) if classes \
         else list(range(int(ck["num_classes"])))
-    # Cap the scan: an SAE splice can break a class's predictions (esp. dSprites,
-    # 737k imgs), which would otherwise crawl the whole dataset (~20 min). 30k is
+    # Cap the scan: an unfillable class would otherwise crawl the whole dataset (esp. dSprites,
+    # 737k imgs — ~20 min of decoding). 30k is
     # ample to fill healthy classes; unfillable ones return partial (handled below).
     sel = select_correct(model, ds, target_classes, n_images, device,
                          max_scan=min(len(ds), 30000))
@@ -284,7 +240,7 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
     print(f"[{config_name}/{key}/{concept_name}/{site}] heads={num_heads} embed={embed_dim} "
           f"feat_dim={feat_dim} blocks={n_blocks} detectors={D.shape[0]} steps={K} "
           f"methods={methods} classes={len(sel)} imgs/class={min(counts.values())}..{max(counts.values())}"
-          + (f" sae_fvu={np.mean(fvu):.3f}" if fvu else ""))
+          )
 
     # ── Stage 3 · config grid for the two orderings. Every
     #    (method, ordering∈{most,least}, block, n) is one batch element
@@ -384,14 +340,13 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
     df = pl.concat(img_dfs).with_columns(
         delta_prob=pl.col("prob_target") / pl.col("prob_baseline"))
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    msuff = f"_m{int(feat_dim)}" if concept_name == "sae" else ""
-    out_path = OUT_DIR / f"flipping_{config_name}_{concept_name}{msuff}_{site}_{key}.parquet"
+    out_path = OUT_DIR / f"flipping_{config_name}_{concept_name}_{site}_{key}.parquet"
     df.write_parquet(out_path)
     print(f"[{config_name}/{key}/{concept_name}/{site}] wrote {len(df)} rows → {out_path}")
     return out_path, dict(probe=str(probe_path), config=config_name, site=site,
                           concept=concept_name, feat_dim=int(feat_dim),
                           n_detectors=int(D.shape[0]), n_blocks=n_blocks, n_grid=n_grid,
-                          sae_fvu=fvu, counts=counts)
+                          counts=counts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -406,28 +361,23 @@ def main(
     datasets: List[str] = typer.Option(list(DATASETS), "--datasets", help="dataset keys"),
     config: List[str] = typer.Option(["cp_lrp_baseline"], "--config",
                                      help=f"LRP recipe(s): {sorted(COMPOSITES)}"),
-    concept: List[str] = typer.Option(["head"], "--concept", help="head | embed_dim | sae"),
+    concept: List[str] = typer.Option(["head"], "--concept", help="head | embed_dim"),
     site: List[str] = typer.Option(["proj_drop"], "--site", help="proj_drop | residual"),
     perturbation: List[str] = typer.Option(["zero"], "--perturbation",
                                            help="zero | mean | sign_flip"),
     classes: List[int] = typer.Option([], "--classes",
                                       help="class subset (default: all classes of each dataset)"),
     n_images: int = typer.Option(50, "--n-images", help="correctly-classified images per class"),
-    max_steps: int = typer.Option(0, "--max-steps", help="cap cumulative-flip grid (0=one-by-one; "
-                                  "use e.g. 48 for the large SAE basis)"),
+    max_steps: int = typer.Option(0, "--max-steps", help="cap cumulative-flip grid (0=one-by-one)"),
     chunk_size: int = typer.Option(4096, "--chunk-size", help="configs per GPU forward"),
     precision: str = typer.Option("bf16", "--precision", help="bf16 (model-native) | fp32"),
-    sae_m: List[int] = typer.Option([], "--sae-m", help="SAE dictionary size(s) for --concept sae; "
-                                    "selects which trained SAE to splice (empty=legacy m=3072). "
-                                    "Pass several to sweep dimensionality."),
     device: Optional[str] = typer.Option(None, "--device"),
 ):
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     ms = max_steps or None
-    sae_ms: List[Optional[int]] = list(sae_m) or [None]
     print(f"device={dev} configs={config} datasets={datasets} concepts={concept} sites={site} "
           f"perturbations={perturbation} classes={classes or 'all'} n_images={n_images} "
-          f"max_steps={ms} sae_m={sae_ms} precision={precision}")
+          f"max_steps={ms} precision={precision}")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     meta_path = OUT_DIR / "meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
@@ -442,22 +392,17 @@ def main(
             runs[cfg_name].setdefault(cname, {})
             for s in site:
                 runs[cfg_name][cname].setdefault(s, {})
-                # SAE dim sweep only applies to --concept sae; other concepts run once.
-                dims = sae_ms if cname == "sae" else [None]
-                for m in dims:
-                    for key in datasets:
-                        # Resume across pod bounces: skip a run whose parquet exists.
-                        msuff = f"_m{m}" if (cname == "sae" and m is not None) else ""
-                        out_p = OUT_DIR / f"flipping_{cfg_name}_{cname}{msuff}_{s}_{key}.parquet"
-                        if out_p.is_file():
-                            print(f"[skip] {out_p.name} exists")
-                            continue
-                        _, dmeta = run_dataset(key, cfg_name, cname, perturbation, classes or None,
-                                               n_images, dev, chunk_size, precision, site=s,
-                                               max_steps=ms, sae_m=m)
-                        rkey = key if m is None else f"{key}_m{dmeta['feat_dim']}"
-                        runs[cfg_name][cname][s][rkey] = dmeta
-                        meta_path.write_text(json.dumps(meta, indent=2))  # checkpoint per dataset
+                for key in datasets:
+                    # Resume across pod bounces: skip a run whose parquet exists.
+                    out_p = OUT_DIR / f"flipping_{cfg_name}_{cname}_{s}_{key}.parquet"
+                    if out_p.is_file():
+                        print(f"[skip] {out_p.name} exists")
+                        continue
+                    _, dmeta = run_dataset(key, cfg_name, cname, perturbation, classes or None,
+                                           n_images, dev, chunk_size, precision, site=s,
+                                           max_steps=ms)
+                    runs[cfg_name][cname][s][key] = dmeta
+                    meta_path.write_text(json.dumps(meta, indent=2))  # checkpoint per dataset
     print(f"meta → {meta_path}")
 
 

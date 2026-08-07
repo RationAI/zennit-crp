@@ -44,7 +44,7 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from .base import ImageClassDataset
 
 
 # Official upstream npz from the deepmind/dsprites-dataset release.
@@ -79,7 +79,7 @@ def _download(url: str, dest: Path, *, log=print) -> None:
 
 
 @dataclass
-class DSpritesDataset(Dataset):
+class DSpritesDataset(ImageClassDataset):
     """Class-API loader for the dsprites dataset.
 
     Parameters
@@ -163,46 +163,25 @@ class DSpritesDataset(Dataset):
         target_col = LATENT_NAMES.index(self.target)
         self.labels = latents[:, target_col].astype(np.int64)
 
-        # Optional per-class subsampling.
-        if self.n_per_class is not None:
-            rng = np.random.default_rng(self.seed)
-            keep_indices: List[int] = []
-            for c in np.unique(self.labels):
-                cls_idx = np.where(self.labels == c)[0]
-                rng.shuffle(cls_idx)
-                keep_indices.extend(cls_idx[:self.n_per_class].tolist())
-            keep_indices = sorted(keep_indices)
-            self.images = self.images[keep_indices]
-            self.labels = self.labels[keep_indices]
+        self.items = self.subsample_per_class(
+            list(zip(range(len(self.labels)), (int(c) for c in self.labels))),
+            self.n_per_class, self.seed)
 
         self.log(
-            f"  dsprites target='{self.target}': {len(self.images)} images, "
+            f"  dsprites target='{self.target}': {len(self.items)} images, "
             f"{LATENT_SIZES[self.target]} classes"
         )
 
-    # ── torch.utils.data.Dataset interface ──────────────────────────────────
-
-    def __len__(self) -> int:
-        return len(self.images)
-
-    def __getitem__(self, i: int):
+    def _decode(self, source: int) -> Image.Image:
         # The npz stores 0/1 binary masks per pixel; convert to a 0-255 uint8
         # PIL image for transform compatibility.
-        arr = (self.images[i] * 255).astype(np.uint8)  # (64, 64)
+        arr = (self.images[source] * 255).astype(np.uint8)  # (64, 64)
         img = Image.fromarray(arr, mode="L")
         if self.upsample_to is not None and self.upsample_to != arr.shape[0]:
             img = img.resize((self.upsample_to, self.upsample_to), Image.NEAREST)
         if self.image_mode == "RGB":
             img = img.convert("RGB")
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, int(self.labels[i])
-
-    # ── CuratedDataset-compatible properties ────────────────────────────────
-
-    @property
-    def class_indices(self) -> list[int]:
-        return sorted(set(int(c) for c in np.unique(self.labels)))
+        return img
 
     @property
     def num_classes(self) -> int:

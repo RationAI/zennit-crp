@@ -104,7 +104,7 @@ def collect(dataset: str, device: str):
         model, _, _ = load_probe("imagenet", device, base="vit_base")
         transform, normalize = backbone_transforms(model.backbone)
         ds = load_dataset("imagenet_val_hf", root=REPO_ROOT / "data",
-                          transform=transform, n_per_class=10)
+                          transform=transform).subsample(10)
     else:
         raise SystemExit(f"unknown dataset {dataset!r}")
 

@@ -45,7 +45,7 @@ class _TimmFullProbe(nn.Module):
     """Adapter exposing a *full* timm classifier (with its pretrained head) under
     the same surface the experiments expect from a :class:`Probe`: a ``backbone``
     submodule carrying ``.blocks`` / ``.embed_dim`` (so ``backbone.blocks.{b}``
-    attribution layer-names and the SAE site modules resolve) and a ``forward``
+    attribution layer-names and the site modules resolve) and a ``forward``
     that returns class logits directly. Unlike ``Probe`` the classification head
     lives *inside* ``backbone`` (timm's ``norm`` + ``head``); the LRP composite is
     type-based so it handles those modules the same way."""
@@ -106,7 +106,7 @@ def select_correct(model, ds, classes: Sequence[int], n_per_class: int, device,
     quickly) and stops once every target class is filled.
 
     ``max_scan`` caps how many images are examined: if a class is unfillable
-    (e.g. an SAE splice has broken that class's predictions) the scan would
+    (e.g. a class the model never predicts correctly) the scan would
     otherwise crawl the *entire* dataset — for dSprites (737k images) that is
     ~20 min of CPU image decoding. With a cap the scan stops early and returns
     whatever filled (partial classes are expected and handled downstream).
@@ -149,7 +149,18 @@ def site_layer_names(model, site: str) -> List[str]:
     raise ValueError(f"unknown site {site!r}; pick from {SITES}")
 
 
+def site_modules(model, site: str) -> list:
+    """Per-block module objects for a probe ``site`` (module-object counterpart
+    of :func:`site_layer_names`)."""
+    blocks = model.backbone.blocks
+    if site == "proj_drop":
+        return [blocks[b].attn.proj_drop for b in range(len(blocks))]
+    if site == "residual":
+        return [blocks[b] for b in range(len(blocks))]
+    raise ValueError(f"unknown site {site!r}; pick from {SITES}")
+
+
 __all__ = [
     "REPO_ROOT", "DATASETS", "SITES",
-    "load_probe", "select_correct", "site_layer_names", "backbone_transforms",
+    "load_probe", "select_correct", "site_layer_names", "site_modules", "backbone_transforms",
 ]

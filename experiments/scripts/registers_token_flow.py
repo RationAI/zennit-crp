@@ -79,7 +79,7 @@ def load_model_and_data(device: str):
     transform, normalize = backbone_transforms(model.backbone)
     ds_name, ds_kw, _ = DATASETS["imagenet"]
     ds = load_dataset(ds_name, root=REPO_ROOT / "data", transform=transform,
-                      **{**ds_kw, "n_per_class": 10})
+                      **ds_kw).subsample(10)
     return model, ck, ck_path, ds, normalize
 
 

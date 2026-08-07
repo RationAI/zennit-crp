@@ -38,7 +38,8 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+
+from .base import ImageClassDataset
 
 # Official download from the TU Darmstadt visinf mirror. ~1.5 GB zip.
 FUNNY_BIRDS_URL = (
@@ -140,7 +141,7 @@ def _extract_zip(zip_path: Path, dest_dir: Path, *, log=print) -> Path:
 
 
 @dataclass
-class FunnyBirdsDataset(Dataset):
+class FunnyBirdsDataset(ImageClassDataset):
     """Class-API loader for the FunnyBirds dataset.
 
     Parameters
@@ -158,7 +159,7 @@ class FunnyBirdsDataset(Dataset):
         part_map)`` where ``part_map`` is a ``(3, H, W)`` uint8 tensor
         with pixel codes per :data:`PART_COLORS_TO_NAME`. Default False
         — yields the standard ``(image, class_idx)`` pair so the
-        dataset is a drop-in for ``CuratedDataset`` consumers.
+        dataset is a drop-in for ``ImageClassDataset`` consumers.
     auto_download : bool
         If True (default), download + extract if missing. If False,
         raise if the dataset isn't already on disk under the expected
@@ -225,8 +226,8 @@ class FunnyBirdsDataset(Dataset):
             self.log(f"FunnyBirds: setting up dataset under {cache_root}")
             _stream_download(self.download_url, zip_path, log=self.log)
             _extract_zip(zip_path, cache_root, log=self.log)
-            # Optionally clean up the zip to save disk (uncomment to enable).
-            # zip_path.unlink(missing_ok=True)
+            # Clean up the zip to save disk
+            zip_path.unlink(missing_ok=True)
 
         # Load metadata.
         with open(self.data_dir / f"dataset_{self.split}.json") as f:
@@ -258,52 +259,29 @@ class FunnyBirdsDataset(Dataset):
                 f"({100*len(items)/len(params):.1f}%); ablated samples dropped."
             )
 
-        # Optional per-class subsampling.
-        if self.n_per_class is not None:
-            import random
-            rng = random.Random(self.seed)
-            per_class: dict[int, list[Path]] = {}
-            for path, c in items:
-                per_class.setdefault(c, []).append(path)
-            sampled: List[Tuple[Path, int]] = []
-            for c, paths in per_class.items():
-                rng.shuffle(paths)
-                sampled.extend((p, c) for p in paths[:self.n_per_class])
-            items = sampled
-
-        self.items = items
+        self.items = self.subsample_per_class(items, self.n_per_class, self.seed)
         self.log(
             f"  FunnyBirds {self.split}: {len(self.items)} images, "
             f"{len(self.classes)} classes"
         )
 
-    # ── torch.utils.data.Dataset interface ──────────────────────────────────
-
-    def __len__(self) -> int:
-        return len(self.items)
+    def _decode(self, source: Path) -> Image.Image:
+        # The PNGs are RGBA; drop the alpha channel for standard 3-channel use.
+        return Image.open(source).convert("RGB")
 
     def __getitem__(self, i: int):
-        path, cls = self.items[i]
-        # The PNGs are RGBA; drop the alpha channel for standard 3-channel use.
-        image = Image.open(path).convert("RGB")
-        if self.transform is not None:
-            image = self.transform(image)
         if not self.with_part_map:
-            return image, cls
-        # Return part map alongside.
-        idx = int(path.stem)  # 6-digit filename = sample index
+            return super().__getitem__(i)
+        image, cls = super().__getitem__(i)
+        # Return part map alongside; 6-digit filename = sample index.
+        path, _ = self.items[i]
+        idx = int(path.stem)
         pm_path = self.data_dir / f"{self.split}_part_map" / str(cls) / f"{idx:06d}.png"
         part_map = Image.open(pm_path).convert("RGB")
-        # Convert to a uint8 tensor of shape (3, H, W) with pixel codes preserved.
+        # uint8 tensor of shape (3, H, W) with pixel codes preserved.
         import numpy as np
         pm = torch.from_numpy(np.array(part_map, dtype=np.uint8)).permute(2, 0, 1)
         return image, cls, pm
-
-    # ── CuratedDataset-compatible properties ────────────────────────────────
-
-    @property
-    def class_indices(self) -> list[int]:
-        return sorted({c for _, c in self.items})
 
     @property
     def num_classes(self) -> int:

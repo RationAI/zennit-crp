@@ -50,17 +50,6 @@ def _grid_sources(grid_h, grid_w, x_off, y_off, cell_w, cell_h):
     )
 
 
-def _quad_source(grid_h, grid_w, x_off, y_off, cell_w, cell_h, img_label):
-    x, y, w, h, labels = [], [], [], [], []
-    for i in range(grid_h):
-        for j in range(grid_w):
-            x.append(x_off + (j + 0.5) * cell_w)
-            y.append(y_off + (i + 0.5) * cell_h)
-            w.append(cell_w)
-            h.append(cell_h)
-            labels.append(f"{img_label} [{i},{j}]")
-    return dict(x=x, y=y, width=w, height=h, label=labels)
-
 
 def attention_lol(
     attention: np.ndarray,

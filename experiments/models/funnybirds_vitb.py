@@ -56,7 +56,7 @@ class FunnyBirdsViTB(nn.Module):
     """FunnyBirds authors' ViT-B/16, wrapped to match the experiments' surface.
 
     Exposes the full timm classifier under ``self.backbone`` (so
-    ``backbone.blocks.{i}`` attribution layer-names and SAE site modules resolve,
+    ``backbone.blocks.{i}`` attribution layer-names and site modules resolve,
     identical to :class:`experiments.model_io._TimmFullProbe`), and a ``forward``
     that returns 50-way class logits directly after downscaling the input to
     224×224 — reproducing the authors' ``ViTModel`` wrapper.

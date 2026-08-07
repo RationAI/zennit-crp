@@ -5,9 +5,7 @@ This fork extends CRP from CNNs to **vision transformers** (AttnLRP). Everything
 already implemented — **find the tool below before writing new code.**
 
 **Authoritative source = the code in `crp/` + `zennit_ext/` + the two upstream notebooks**
-(`tutorials/attributions.ipynb`, `tutorials/feature_visualization.ipynb`). The prose
-notes in `research/` (CURRENT_STATE, UNFOLDING_ATTENTION_REFACTOR, …) are historical
-record and contain stale API names — do not copy APIs from them.
+(`tutorials/attributions.ipynb`, `tutorials/feature_visualization.ipynb`).
 
 ---
 
@@ -21,41 +19,16 @@ record and contain stale API names — do not copy APIs from them.
 4. **FeatureVisualization** = sweep a dataset once to **index** the top reference
    samples per concept, then retrieve/plot them (RelMax/ActMax, concept atlas).
 
----
-
-## 1. Composites (the LRP rules) — zennit + `zennit_ext/attnlrp_composites.py`
-
-- **CNN / generic:** use zennit composites directly, e.g.
-  `EpsilonPlusFlat([SequentialMergeBatchNorm()])`. Canonizers go in the list.
-- **ViT:** use this fork's composites (canonizers incl. attention-unfolding are
-  pre-bundled — no manual setup). Three, all in `zennit_ext/attnlrp_composites.py`:
-
-  | Composite | Use when |
-  |---|---|
-  | `AttnLRPEpsilonComposite(epsilon=1e-6, *, palrp=False, residual_lrp=None)` | baseline ε-LRP |
-  | `AttnLRPGammaComposite(gamma=0.25, *, palrp=…, residual_lrp=…)` | paper γ default |
-  | `AttnLRPCombinedComposite(*, alpha=.5, beta=.5, layerscale_uniform=False, linear_gamma=None, palrp=False, residual_lrp=None)` | **canonical recipe-builder** — used by the walkthrough |
-
-  Kwargs `palrp` (pos-embed PA-LRP) and `residual_lrp ∈ {None,'symmetric','ratio','l1'}`
-  are opt-in remedies (AUC trade-offs documented in `research/CURRENT_STATE.md`). All
-  rules/canonizers are scoped to `composite.context(model)` — no global mutation.
 
 **Design rules for LRP rule wiring (read before adding modules/rules):**
 - **One module type, many rules — pick the rule in the `layer_map`, never via a
   module-per-rule.** If a module can take different LRP rules (e.g. a residual
   `x+branch`), define it ONCE (`ResidualAdd`) and select the rule in the composite
   `layer_map`: `(ResidualAdd, ResidualRatio | Uniform | ResidualL1)`. Do NOT create
-  a separate module class per rule (the old `UniformAdd`/`L1ResidualAdd` were removed
-  for exactly this anti-pattern). A canonizer installs the single module type so the
+  a separate module class per rule. 
+- A canonizer installs the single module type so the
   add is hookable; it does NOT choose the rule.
-- **A different graph ROLE that needs its own rule → alias, not a re-defined module.**
-  e.g. the `x+pos_embed` merge is `PosEmbedAdd(ResidualAdd): pass` (subclass alias, no
-  re-defined `forward`), ordered BEFORE `ResidualAdd` in the `layer_map` (zennit matches
-  by `isinstance`, first hit wins). A genuinely different op (e.g. `LayerScaleMul`, a
-  multiply) is its own module.
-- **Never predefine Composite variants unprompted.** Do not ship new `lrp_configs/*`
-  recipes or composite presets unless explicitly asked — expose the knob (a rule in the
-  `layer_map`, or a composite kwarg) and let the user assemble their own recipe.
+- **Never predefine Composite variants unprompted.**
 
 ---
 
@@ -80,14 +53,6 @@ attr.heatmap, attr.prediction, attr.activations[lname], attr.relevances[lname]
 - **`attribution.generate(data, conditions, composite, batch_size=…)`** = generator
   that expands many conditions over one forward pass (≈2× faster than looping calls).
   Use it to score all channels of a layer.
-
-**Rank concepts:** `ChannelConcept().attribute(attr.relevances[lname], abs_norm=True)`
-→ `(B, C)` per-channel relevance; `torch.topk`/`argsort` for the top concepts.
-
-**Cross-layer decomposition:** `crp/graph.py` `trace_model_graph(model, sample, layer_names)`
-→ `ModelGraph`; feed to `AttributionGraph(attribution, graph, layer_map)` and call with
-`(sample, composite, concept_id, layer_name, target, width=[5,2])` → `(nodes, connections)`
-hierarchy. Use for "which lower-layer concepts build this one".
 
 ---
 
@@ -173,8 +138,7 @@ paper, not a throwaway:
   dataset / n), axis labels with units, a labelled legend, and the metric/band
   meaning in the title or subtitle — a reader should not need a notebook caption
   to understand the figure.
-- Notebooks are for interactive exploration; the committed export *script* is the
-  reproducible generator that writes the png+pdf pair.
+- Notebooks are for interactive exploration
 
 ---
 
@@ -206,7 +170,7 @@ which is **declared per-deployment, never detected at runtime** — two env knob
 
 Rules:
 - **Durable outputs** — results, checkpoints, figures, and anything a web page
-  references (parquet, SAE `.pt`, `figures/`, `webapp/*/figures/`, `public/`) — go
+  references (parquets, `figures/`, `webapp/*/figures/`, `public/`) — go
   under the persistent root / repo. Web presentations reference that copy. **Never
   leave the only copy of a result on scratch.** (The repo tree is already the
   persistent root here, so writing repo-relative is correct by default.)
@@ -217,11 +181,20 @@ Rules:
   `storage.hydrate(...)` so a post-bounce run reuses the index instead of
   recomputing. See the FV cache wiring in `experiments/crp_gallery.py` (`CACHE_ROOT`
   = scratch, `CACHE_MIRROR` = persistent; `storage.sync` around `fv.run`).
-- **venv** is ephemeral (local overlay): after a bounce, `UV_PROJECT_ENVIRONMENT=
-  /home/claude/venvs/zennit-crp UV_LINK_MODE=copy uv sync`, then invoke the
-  interpreter directly (`.../bin/python`; `uv run` deadlocks on this venv).
 - Do **not** add filesystem-type probing (`findmnt`, mount parsing) to choose
   locations — the roots are configuration, not something to discover.
+
+## Environment (uv-managed)
+- The venv is `.venv/` at the repo root, managed by **uv**: `UV_LINK_MODE=copy uv sync`
+  creates/updates it from `pyproject.toml` + `uv.lock` (copy mode because the repo sits
+  on NFS — hardlinks from the uv cache cross devices). It lives on the persistent
+  workspace, so it **survives pod bounces** — no per-bounce recreation.
+- ALL dependencies are tracked in `pyproject.toml` (`[project.dependencies]` for
+  runtime, `[dependency-groups] dev` for tooling — uv installs dev by default).
+  Never `pip install` ad hoc; add to `pyproject.toml` and `uv sync`.
+- Run things with `uv run <cmd>` or `.venv/bin/python -m …` — both work.
+- Notebooks: the IDE auto-detects `.venv` as the kernel — no per-project
+  kernelspec registration needed (or wanted).
 
 ## Pointers & gotchas
 - Start from `tutorials/attributions.ipynb` then `feature_visualization.ipynb` (CNN
@@ -230,4 +203,3 @@ Rules:
 - `experiments/` = faithfulness sweeps/audits (not needed to use the lib). `research/` =
   historical design notes (stale APIs). `tests/`: `uv run pytest tests/` (the ViT suite;
   legacy `test_attribution.py`/`test_integration.py` predate this branch).
-- Env: `uv run python …` / `uv sync`. ViT extras in `pyproject.toml` `vit` group.

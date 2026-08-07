@@ -1,109 +1,75 @@
 """Per-dataset loaders for tutorials and experiments.
 
-Each dataset has its own module under this package and exposes a class
-that handles **download / extract / setup automatically** on construction.
-The user never has to do manual setup steps.
+Each dataset is **self-contained in its own module** under this package and
+exposes a class that handles download / extract / setup automatically on
+construction.
 
-Modules
--------
-
-* ``imagenette`` — fast.ai's 10-class ImageNet subset (~98 MB).
-* ``imagenet`` — :class:`ImagenetValHFDataset`. Un-gated HF mirror
-  ``evanarlian/imagenet_1k_resized_256``, auto-downloaded (~830 MB).
-* ``funny_birds`` — :class:`FunnyBirdsDataset`. Auto-downloads the
-  ~1.5 GB synthetic-birds zip (Hesse et al. ICCV 2023).
-* ``dsprites`` — :class:`DSpritesDataset`. Auto-downloads ~26 MB
-  parquet (Higgins et al. 2017).
-* ``colored_mnist`` — :class:`ColoredMNISTDataset`. Reproduces the
-  IEEE-dataport ColoredMNIST scheme (digit ↔ hue correlation, broken
-  at test time) from torchvision MNIST (~12 MB).
-
-The flat ``load(name, ...)`` dispatcher and ``load_imagenette`` /
-``load_imagenet_val_hf`` functions are re-exported here.
 
 Adding a new dataset
 --------------------
 
-Create ``experiments/datasets/<name>.py``:
+Create ``experiments/datasets/<name>.py``, fully self-contained:
 
-1. Define ``<NAME>_DOWNLOAD_URL`` and a ``data_root: Path`` arg.
-2. Subclass ``torch.utils.data.Dataset`` (or use a similar shape).
+1. Define the download URL(s) and a ``root: Path`` arg.
+2. Subclass :class:`base.ImageClassDataset` — provide ``items`` +
+   ``_decode(source)``; the base supplies len/getitem/props + the shared
+   class-filter and per-class-subsampling helpers.
 3. In ``__init__``, check the local cache; download + extract if missing.
-4. Re-export the class from this ``__init__.py``.
-5. Add a ``DATASETS["<name>"] = <name>_loader`` entry to make it
-   discoverable via :func:`load`.
+4. Re-export the class here and add a ``DATASETS`` entry.
 """
 
 from pathlib import Path as _Path
 from typing import Optional as _Optional
 
-from ._legacy import (  # noqa: F401
-    CuratedDataset,
-    DATASETS as _LEGACY_DATASETS,
-    IMAGENETTE_TO_IMAGENET,
+from .base import ImageClassDataset  # noqa: F401
+from .imagenette import (  # noqa: F401
+    ImagenetteDataset,
     IMAGENETTE_CLASS_NAMES,
-    _default_data_dir,
-    load_imagenette,
-    load_imagenet_val_hf,
+    IMAGENETTE_TO_IMAGENET,
 )
-
-from .imagenette import ImagenetteDataset  # noqa: F401
 from .imagenet import ImagenetValHFDataset  # noqa: F401
 from .funny_birds import FunnyBirdsDataset  # noqa: F401
 from .dsprites import DSpritesDataset  # noqa: F401
 from .colored_mnist import ColoredMNISTDataset  # noqa: F401
 
-
-# Bridge: register the new class-based loaders so ``load(name)`` works for
-# them too. Each entry is ``(name, factory)``.
-def _funny_birds_factory(root, *, split="train", transform=None, **kw):
-    return FunnyBirdsDataset(
-        root=root, split=split, transform=transform, **kw,
-    )
-
-
-def _dsprites_factory(root, *, target="shape", transform=None, **kw):
-    return DSpritesDataset(
-        root=root, target=target, transform=transform, **kw,
-    )
+# Registry name → dataset class. Names are stable identifiers used in job
+# specs, cache paths and result keys — do not rename them.
+DATASETS = {
+    "imagenette": ImagenetteDataset,
+    "imagenet_val_hf": ImagenetValHFDataset,
+    "funny_birds": FunnyBirdsDataset,
+    "dsprites": DSpritesDataset,
+    "colored_mnist": ColoredMNISTDataset,
+}
 
 
-def _colored_mnist_factory(root, *, split="train", transform=None, **kw):
-    return ColoredMNISTDataset(
-        root=root, split=split, transform=transform, **kw,
-    )
-
-
-DATASETS = dict(_LEGACY_DATASETS)
-DATASETS["funny_birds"] = _funny_birds_factory
-DATASETS["dsprites"] = _dsprites_factory
-DATASETS["colored_mnist"] = _colored_mnist_factory
+def _default_data_dir() -> _Path:
+    """``<repo>/data`` — walk up from this file until ``pyproject.toml``."""
+    p = _Path(__file__).resolve()
+    while p != p.parent:
+        if (p / "pyproject.toml").is_file():
+            return p / "data"
+        p = p.parent
+    raise RuntimeError("repo root with pyproject.toml not found above this module")
 
 
 def load(name: str, *, root: _Optional[_Path] = None, **kwargs):
-    """Dispatch to one of the per-dataset loaders by name. Default ``root``
-    is ``<repo>/data``.
-
-    Available names: ``imagenette``, ``imagenet_val_hf``, ``funny_birds``,
-    ``dsprites``, ``colored_mnist``.
-    """
+    """Construct one of the registered datasets by name. Default ``root``
+    is ``<repo>/data``."""
     if name not in DATASETS:
         raise ValueError(
-            f"unknown dataset {name!r}; choose from {sorted(DATASETS)}"
-        )
+            f"unknown dataset {name!r}; choose from {sorted(DATASETS)}")
     if root is None:
         root = _default_data_dir()
     return DATASETS[name](root=root, **kwargs)
 
 
 __all__ = [
-    "CuratedDataset",
+    "ImageClassDataset",
     "DATASETS",
     "IMAGENETTE_TO_IMAGENET",
     "IMAGENETTE_CLASS_NAMES",
     "load",
-    "load_imagenette",
-    "load_imagenet_val_hf",
     "ImagenetteDataset",
     "ImagenetValHFDataset",
     "FunnyBirdsDataset",

@@ -1,6 +1,7 @@
 // Static CRP gallery — reads manifest.json and drives cascading selects.
 // No build step, no framework. Empty manifest ⇒ empty selects.
-// Cascade: model+dataset → instance (composite × basis) → image sample → layer.
+// Cascade: model+dataset → instance (composite × basis) → FV index class
+//          → image sample → layer.
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -26,7 +27,16 @@ function fillSelect(sel, items, labelFn) {
 
 function curModel() { return MANIFEST.models[$("sel-model").value]; }
 function curInstance() { const m = curModel(); return m && m.instances[$("sel-instance").value]; }
-function curSample() { const i = curInstance(); return i && i.samples[$("sel-sample").value]; }
+function curFv() { const i = curInstance(); return i && i.fv && i.fv[$("sel-fvclass").value]; }
+function curSample() { const f = curFv(); return f && f.samples[$("sel-sample").value]; }
+
+// "original" first, then "aligned", then anything else alphabetically.
+const FV_ORDER = { original: 0, aligned: 1 };
+function fvOrder(inst) {
+  const keys = Object.keys(inst.fv || {});
+  keys.sort((a, b) => (FV_ORDER[a] ?? 9) - (FV_ORDER[b] ?? 9) || a.localeCompare(b));
+  return keys;
+}
 
 // "aggregate" first, then the fixed images in insertion order.
 function sampleOrder(inst) {
@@ -45,8 +55,15 @@ function onModelChange() {
 function onInstanceChange() {
   const inst = curInstance();
   renderComposite(inst);
-  const samples = inst ? sampleOrder(inst) : [];
-  fillSelect($("sel-sample"), samples, (k) => inst.samples[k].label);
+  const fvs = inst ? fvOrder(inst) : [];
+  fillSelect($("sel-fvclass"), fvs, (k) => (inst.fv[k].label || k));
+  onFvClassChange();
+}
+
+function onFvClassChange() {
+  const f = curFv();
+  const samples = f ? sampleOrder(f) : [];
+  fillSelect($("sel-sample"), samples, (k) => f.samples[k].label);
   onSampleChange();
 }
 
@@ -175,6 +192,7 @@ async function main() {
   fillSelect($("sel-model"), models, (md) => (MANIFEST.models[md].label || md));
   $("sel-model").addEventListener("change", onModelChange);
   $("sel-instance").addEventListener("change", onInstanceChange);
+  $("sel-fvclass").addEventListener("change", onFvClassChange);
   $("sel-sample").addEventListener("change", onSampleChange);
   $("sel-layer").addEventListener("change", onLayerChange);
   onModelChange();

@@ -26,7 +26,7 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from experiments.datasets import load_imagenet_val_hf
+from experiments.datasets import ImagenetValHFDataset
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -72,8 +72,9 @@ def main(
         transforms.ToTensor(),
         transforms.Normalize(cfg["mean"], cfg["std"]),
     ])
-    ds = load_imagenet_val_hf(root=REPO_ROOT / "data",
-                              n_per_class=n_per_class, transform=tf)
+    ds = ImagenetValHFDataset(root=REPO_ROOT / "data", transform=tf)
+    if n_per_class:
+        ds.subsample(n_per_class)
     loader = DataLoader(ds, batch_size=batch_size, num_workers=0)
 
     top1 = top5 = n = 0

@@ -37,7 +37,7 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from .base import ImageClassDataset
 from torchvision.datasets import MNIST
 
 
@@ -49,7 +49,7 @@ def _hsv_palette(n: int) -> np.ndarray:
 
 
 @dataclass
-class ColoredMNISTDataset(Dataset):
+class ColoredMNISTDataset(ImageClassDataset):
     """Class-API loader for ColoredMNIST.
 
     Parameters
@@ -119,6 +119,7 @@ class ColoredMNISTDataset(Dataset):
         else:
             color_idx = rng.integers(0, 10, size=n)
         self.colors = palette[color_idx]  # (N, 3) uint8
+        self.items = [(i, int(c)) for i, c in enumerate(self.labels)]
 
         n_aligned = int(((color_idx == self.labels).sum()) if self.split == "train" else 0)
         self.log(
@@ -127,31 +128,13 @@ class ColoredMNISTDataset(Dataset):
             f"{f', aligned={n_aligned}/{n}' if self.split == 'train' else ''}"
         )
 
-    # ── torch.utils.data.Dataset interface ──────────────────────────────────
-
-    def __len__(self) -> int:
-        return len(self.images)
-
-    def __getitem__(self, i: int):
+    def _decode(self, source: int) -> Image.Image:
         # Tint the grayscale digit with its assigned colour: each pixel
         # (intensity ∈ [0, 1]) is multiplied by the RGB triple. The
         # background stays black; the digit takes the colour.
-        gray = self.images[i].astype(np.float32) / 255.0  # (28, 28)
-        rgb = (gray[..., None] * self.colors[i]).astype(np.uint8)  # (28, 28, 3)
-        img = Image.fromarray(rgb, mode="RGB")
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, int(self.labels[i])
-
-    # ── CuratedDataset-compatible properties ────────────────────────────────
-
-    @property
-    def class_indices(self) -> list[int]:
-        return list(range(10))
-
-    @property
-    def num_classes(self) -> int:
-        return 10
+        gray = self.images[source].astype(np.float32) / 255.0  # (28, 28)
+        rgb = (gray[..., None] * self.colors[source]).astype(np.uint8)  # (28, 28, 3)
+        return Image.fromarray(rgb, mode="RGB")
 
     @property
     def name(self) -> str:

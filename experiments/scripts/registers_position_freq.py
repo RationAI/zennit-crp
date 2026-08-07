@@ -171,7 +171,7 @@ def cmd_collect(args):
         model, ck, ck_path = load_probe("imagenet", device, base="vit_base")
         transform, normalize = backbone_transforms(model.backbone)
         ds = load_dataset("imagenet_val_hf", root=REPO_ROOT / "data",
-                          transform=transform, n_per_class=10)
+                          transform=transform).subsample(10)
         label = "vit_base · imagenet val (10/class)"
     else:
         raise SystemExit(f"unknown dataset {args.dataset!r}")

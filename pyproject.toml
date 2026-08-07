@@ -44,6 +44,8 @@ dependencies = [
   "bokeh>=3.0",
   "scipy>=1.15.3",
   "scikit-learn>=1.7.2",
+  "polars>=1.0",
+  "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -55,17 +57,12 @@ fast_img = ["Pillow-SIMD"]
 vit = [
   "transformers>=4.40",
 ]
-dev = [
-  "pytest>=8",
-  "pytest-cov",
-  "ruff",
-]
 
 [project.urls]
 Homepage = "https://github.com/RationAI/zennit-crp"
 
 [tool.setuptools.packages.find]
-include = ["crp*", "experiments*", "zennit_ext*"]
+include = ["crp*", "experiments*", "zennit_extensions*"]
 
 [project.scripts]
 # Console-script entry points so users don't need to remember the file
@@ -78,8 +75,12 @@ train-probe = "experiments.train_probe:app"
 testpaths = ["tests"]
 addopts = "-ra"
 
+# uv installs the dev group by default on `uv sync`. Runtime deps (polars,
+# safetensors, …) live in [project.dependencies]; only tooling goes here.
 [dependency-groups]
 dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "ruff",
     "pyright>=1.1.409",
-    "polars>=1.0",
 ]

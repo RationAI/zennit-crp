@@ -4894,7 +4894,9 @@ dependencies = [
     { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pillow" },
     { name = "plotly" },
+    { name = "polars" },
     { name = "pyarrow" },
+    { name = "safetensors" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -4911,11 +4913,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
 fast-img = [
     { name = "pillow-simd" },
 ]
@@ -4925,8 +4922,10 @@ vit = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "polars" },
     { name = "pyright" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
@@ -4945,10 +4944,9 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pillow-simd", marker = "extra == 'fast-img'" },
     { name = "plotly", specifier = ">=5.0,<6.0" },
+    { name = "polars", specifier = ">=1.0" },
     { name = "pyarrow", specifier = ">=24.0.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "pytest-cov", marker = "extra == 'dev'" },
-    { name = "ruff", marker = "extra == 'dev'" },
+    { name = "safetensors", specifier = ">=0.4" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
     { name = "scipy", specifier = ">=1.15.3" },
     { name = "timm", specifier = ">=1.0.26" },
@@ -4961,10 +4959,12 @@ requires-dist = [
     { name = "typer", specifier = ">=0.12" },
     { name = "zennit", specifier = ">=0.5.1" },
 ]
-provides-extras = ["fast-img", "vit", "dev"]
+provides-extras = ["fast-img", "vit"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "polars", specifier = ">=1.0" },
     { name = "pyright", specifier = ">=1.1.409" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
 ]

@@ -25,8 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def test_imports():
     """All expected classes + functions importable from the package."""
     from experiments.datasets import (
-        CuratedDataset, DATASETS, IMAGENETTE_TO_IMAGENET,
-        load, load_imagenette, load_imagenet_val_hf,
+        ImageClassDataset, DATASETS, IMAGENETTE_TO_IMAGENET,
+        load,
         ImagenetteDataset, ImagenetValHFDataset,
         FunnyBirdsDataset, DSpritesDataset, ColoredMNISTDataset,
     )

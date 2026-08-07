@@ -67,6 +67,7 @@ COMPOSITES = {
     "chefer_lrp": CheferLRPComposite,
 }
 from experiments import storage
+from experiments import fv_aligned
 from crp.attribution import CondAttribution
 from crp.concepts import HeadConcept, EmbeddingDimConcept
 from crp.helper import load_maximization
@@ -92,7 +93,15 @@ MANIFEST_PATH = GALLERY_DIR / "manifest.json"
 CACHE_ROOT = Path(os.environ.get("CRP_GALLERY_CACHE", str(storage.SCRATCH_ROOT / "crp_gallery_cache")))
 CACHE_MIRROR = storage.PERSIST_ROOT / "crp_gallery_cache"
 
-CONCEPTS = ("head", "embed_dim", "sae")
+CONCEPTS = ("head", "embed_dim")
+# FV index flavours: "original" conditions every image on its ground-truth label
+# (stock CRP); "aligned" conditions on the top-3 predicted classes with p > 0.10
+# and serves representatives only under a matching conditioning class (see
+# experiments.fv_aligned).
+FV_CLASS_LABELS = {
+    "original": "original (ground-truth conditioning)",
+    "aligned": "condition-class-aligned (top-3 predicted)",
+}
 
 app = typer.Typer(add_completion=False, help=__doc__)
 
@@ -156,13 +165,24 @@ def load_model(base: str, dataset: str, *, model_source: str, checkpoint: Option
 
 def load_eval_dataset(dataset: str, transform, extra_kwargs: Optional[dict] = None):
     """Un-normalized eval dataset for the given key (reuses the dataset registry).
-    ``extra_kwargs`` is merged into the loader kwargs — used to restrict ImageNet
-    (50k val) to the gallery's ranking classes so the FV index stays small (the
-    full-dataset index for a vit_base ``m=1536`` SAE is huge and stalls on NFS)."""
+    ``extra_kwargs`` is merged into the loader kwargs. ``ImagenetValHFDataset``
+    always loads the FULL 50k val — an ``n_per_class`` / ``classes`` entry for
+    imagenet is applied AFTER construction (``ds.subsample`` / ``filter_classes``,
+    identical pools to the old in-constructor sampling), so experiment scripts
+    keep their recorded pool protocol."""
     ds_name, ds_kw, _ = DATASETS[dataset]
     from experiments.datasets import load as load_dataset
-    return load_dataset(ds_name, root=REPO_ROOT / "data", transform=transform,
-                        **{**ds_kw, **(extra_kwargs or {})})
+    merged = {**ds_kw, **(extra_kwargs or {})}
+    pool = classes = None
+    if ds_name == "imagenet_val_hf":
+        pool = merged.pop("n_per_class", None)
+        classes = merged.pop("classes", None)
+    ds = load_dataset(ds_name, root=REPO_ROOT / "data", transform=transform, **merged)
+    if classes is not None:
+        ds.items = ds.filter_classes(ds.items, classes)
+    if pool is not None:
+        ds.subsample(pool)
+    return ds
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,38 +192,9 @@ def load_eval_dataset(dataset: str, transform, extra_kwargs: Optional[dict] = No
 def make_concept(kind: str, num_heads: int):
     if kind == "head":
         return HeadConcept(num_heads=num_heads)
-    if kind in ("embed_dim", "sae"):
-        # 'sae' is per-latent over the spliced SAE feature space, same machinery
-        # as embed_dim but applied to the SAESplice '.features' sublayer.
+    if kind == "embed_dim":
         return EmbeddingDimConcept(num_heads=num_heads)
     raise typer.BadParameter(f"--concept must be one of {CONCEPTS}, got {kind!r}")
-
-
-def splice_sae(model, site: str, dataset: str, blocks: List[int], m: int,
-               device: str) -> Dict[int, str]:
-    """Splice the trained SAE (dictionary size ``m``) in as a reconstruction
-    pass-through at ``site`` for each requested block, exactly like
-    ``concept_flipping.setup_sites``. Returns ``{block: features_layer_name}`` —
-    the recordable ``.features`` sublayer whose output is the (B, N, m) SAE codes
-    that CRP decomposes the logit relevance onto. Mutates ``model`` in place."""
-    from experiments.sae import load_sae, sae_path
-    bl = model.backbone.blocks
-    names: Dict[int, str] = {}
-    for b in blocks:
-        if not sae_path(site, dataset, b, m=m).is_file():
-            raise typer.BadParameter(
-                f"no SAE checkpoint {sae_path(site, dataset, b, m=m)} — train it first (experiments.sae)")
-        sp = load_sae(site, dataset, b, device, m=m)   # reuse: ckpt-load + SAESplice build
-        if site == "proj_drop":
-            bl[b].attn.proj_drop = sp
-            names[b] = f"backbone.blocks.{b}.attn.proj_drop.features"
-        elif site == "residual":
-            sp.inner = bl[b]                            # rewire for the residual site
-            bl[b] = sp
-            names[b] = f"backbone.blocks.{b}.features"
-        else:
-            raise typer.BadParameter(f"--site must be one of {SITES} for --concept sae, got {site!r}")
-    return names
 
 
 def resolve_layers(model, site: str, blocks: List[int]) -> List[Tuple[int, str]]:
@@ -277,15 +268,8 @@ def _now() -> str:
 
 def concept_kind_desc(concept_kind: str, site: str) -> str:
     """One-line description of the concept *basis* for the web (the composite
-    panel is config-level and shared, so the SAE vs axis-aligned distinction must
-    live per layer)."""
-    if concept_kind.startswith("sae"):
-        m = concept_kind.split("_m")[-1] if "_m" in concept_kind else "?"
-        return (f"SAE-basis CRP — the logit relevance is decomposed onto a trained "
-                f"sparse-autoencoder dictionary ({m} latents) spliced in as a reconstruction "
-                f"pass-through at the {site} site. Concepts = SAE latents (learned, ~monosemantic), "
-                f"not raw embedding axes. Same recipe/composite as the axis-aligned case — only the "
-                f"concept basis differs.")
+    panel is config-level and shared, so the basis distinction must live per
+    layer)."""
     if concept_kind == "embed_dim":
         return ("Axis-aligned basis — one concept per embedding dimension (the standard CRP basis). "
                 f"Relevance read directly at the {site} site.")
@@ -367,16 +351,20 @@ def local_relevances(attribution, x, target: int, layer: str, *, concept, compos
 
 def render_local_entry(fv, attribution, ds, x, target: int, layer: str, cid: int, *,
                        mode: str, n_ref: int, composite, concept, normalize, device: str,
-                       crop: bool, plot: str, out_dir: Path, meta_extra: dict) -> float:
+                       crop: bool, plot: str, out_dir: Path, meta_extra: dict,
+                       fv_class: str = "original") -> float:
     """Local analysis of one detector for one input image: the leftmost column is
     the query image + its *conditional* CRP heatmap; the remaining columns are the
     detector's dataset **representatives** so the reader can tell what the locally-
     relevant concept actually is. Both are class-conditional (see
-    :func:`class_conditional_references`). png+pdf + meta.json.
+    :func:`class_conditional_references`); under the aligned index the
+    representatives come from the bucket of the query's own conditioning class,
+    so index conditioning matches the explanation. png+pdf + meta.json.
     Returns the query image's relevance on the concept."""
     ref_s, ref_h = class_conditional_references(
         attribution, fv, ds, layer, cid, n_ref=n_ref, mode=mode, composite=composite,
-        concept=concept, normalize=normalize, device=device)
+        concept=concept, normalize=normalize, device=device, fv_class=fv_class,
+        query_target=(int(target) if fv_class == "aligned" else None))
     xin = normalize(x[None].to(device)).requires_grad_(True)
     res = attribution(xin, [{layer: [int(cid)], "y": [int(target)]}], composite,
                       record_layer=[layer], mask_map=concept.mask)
@@ -564,7 +552,7 @@ def save_sample_ood(model, x, *, normalize, device: str, out_path: Path,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Instance = (config, concept basis). SAE vs axis-aligned is an *instance*, not a
+# Instance = (config, concept basis) — one instance per basis, so the layer
 # layer — so the layer dropdown lists each block exactly once per instance.
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -573,8 +561,6 @@ def instance_key(config: str, concept_kind: str) -> str:
 
 
 def instance_label(config: str, concept_kind: str) -> str:
-    if concept_kind.startswith("sae_m"):
-        return f"{config} · SAE (m={concept_kind.split('_m')[-1]})"
     if concept_kind == "embed_dim":
         return f"{config} · axis-aligned"
     if concept_kind == "head":
@@ -599,7 +585,9 @@ def _row_labels(fig, ncols: int, labels: Tuple[str, ...]) -> None:
 
 
 def class_conditional_references(attribution, fv, ds, layer: str, cid: int, *, n_ref: int,
-                                 mode: str, composite, concept, normalize, device: str):
+                                 mode: str, composite, concept, normalize, device: str,
+                                 fv_class: str = "original",
+                                 query_target: Optional[int] = None):
     """Top-``n_ref`` reference samples for a concept **with class-conditional CRP
     heatmaps**, as defined in the CRP paper.
 
@@ -624,16 +612,29 @@ def class_conditional_references(attribution, fv, ds, layer: str, cid: int, *, n
     the paper's way: initialise at the output on that sample's true class, mask at
     the concept, propagate to the input. Conditions are per batch element
     (``CondAttribution.broadcast`` maps ``conditions[i]`` to sample ``i``), so all
-    ``n_ref`` references are done in one batched pass."""
-    path = fv.RelMax.PATH if mode == "relevance" else fv.ActMax.PATH
-    d_sorted, _, _ = load_maximization(path, layer)
-    idxs = [int(i) for i in np.asarray(d_sorted)[:n_ref, int(cid)]]
-    xs, ys = [], []
-    for di in idxs:
-        x, y = ds[di]
-        xs.append(x)
-        ys.append(int(y))
-    batch = torch.stack(xs)
+    ``n_ref`` references are done in one batched pass.
+
+    ``fv_class`` selects the index flavour. ``"original"`` (stock): indices from
+    the target-agnostic RelMax store, heatmaps conditioned on each reference's
+    ground-truth label. ``"aligned"``: indices from the per-conditioning-class
+    RelStats store (see :mod:`experiments.fv_aligned`) and each heatmap is
+    conditioned on the class the reference was INDEXED under — with
+    ``query_target`` set (local view) only the bucket of that class is served,
+    so the conditioning matches the explanation's class exactly."""
+    if fv_class == "aligned":
+        if mode != "relevance":
+            raise ValueError("the aligned index serves relevance references only")
+        if query_target is None:
+            idxs, ys = fv_aligned.aligned_references_merged(fv, layer, cid, n_ref)
+        else:
+            idxs, ys = fv_aligned.aligned_references_for_class(
+                fv, layer, cid, int(query_target), n_ref)
+    else:
+        path = fv.RelMax.PATH if mode == "relevance" else fv.ActMax.PATH
+        d_sorted, _, _ = load_maximization(path, layer)
+        idxs = [int(i) for i in np.asarray(d_sorted)[:n_ref, int(cid)]]
+        ys = [int(ds[di][1]) for di in idxs]
+    batch = torch.stack([ds[di][0] for di in idxs])
     xin = normalize(batch.to(device)).requires_grad_(True)
     conds = [{layer: [int(cid)], "y": [y]} for y in ys]
     res = attribution(xin, conds, composite, mask_map=concept.mask)
@@ -642,30 +643,34 @@ def class_conditional_references(attribution, fv, ds, layer: str, cid: int, *, n
 
 def rf_crop_row(samples, heatmaps, *, vis_th: float = 0.2, crop_th: float = 0.1,
                 kernel_size: int = 19, alpha: float = 0.3):
-    """Receptive-field crop row, sign-safe.
+    """Receptive-field crop row, sign-safe and magnitude-based.
 
     Same recipe as :func:`crp.image.vis_opaque_img` with ``rf=True`` — blur the
     conditional heatmap, keep the box where it exceeds ``crop_th``, fade pixels
-    below ``vis_th`` — with ONE change: normalise by ``max(|R|)`` instead of
-    ``crp.helper.max_norm``'s ``R / R.max()``.
+    below ``vis_th`` — with TWO changes:
 
-    ``max_norm`` is unsafe for signed bases. A ViT embedding dimension can produce
-    a conditional heatmap that is negative almost everywhere (its input-space
-    attribution is net inhibitory); the blurred map's max is then itself negative,
-    so dividing by it FLIPS every pixel positive. The mask becomes all-True and the
-    crop box the full frame — the panel then reads as "this concept covers the whole
-    image" when the truth is "there is no positive evidence here". Normalising by
-    the absolute max keeps the sign, so such a panel correctly fades out instead.
-
-    For positive-dominant maps (the normal case) ``max(|R|) == R.max()``, so this is
-    identical to the published behaviour."""
+    1. Normalise by ``max(|R|)`` instead of ``crp.helper.max_norm``'s
+       ``R / R.max()``. ``max_norm`` is unsafe for signed bases: a ViT embedding
+       dimension can produce a conditional heatmap that is negative almost
+       everywhere (its input-space attribution is net inhibitory); the blurred
+       map's max is then itself negative, so dividing by it FLIPS every pixel
+       positive. The mask becomes all-True and the crop box the full frame —
+       the panel then reads as "this concept covers the whole image" when the
+       truth is "there is no positive evidence here".
+    2. Crop and fade on ``|fh|``. High-**negative** relevance is evidence too —
+       the CRP paper displays strong inhibitory regions alongside excitatory
+       ones — so the crop box and the unfaded region localise the strongest
+       conditional evidence of EITHER sign. The sign itself remains readable in
+       the bwr relevance row above the crop. A zero/structureless map still
+       fades dark (no evidence at all)."""
     out = []
     for i in range(len(samples)):
         img, heat = samples[i], heatmaps[i]
         blurred = gaussian_blur(heat.unsqueeze(0), kernel_size=kernel_size)[0]
         fh = blurred / (blurred.abs().max() + 1e-10)      # sign-safe normalisation
-        vis_mask = fh > vis_th
-        r1, r2, c1, c2 = get_crop_range(fh, crop_th)
+        fa = fh.abs()                                     # |R| decides crop + fade
+        vis_mask = fa > vis_th
+        r1, r2, c1, c2 = get_crop_range(fa, crop_th)
         img_t, mask_t = img[..., r1:r2, c1:c2], vis_mask[r1:r2, c1:c2]
         if img_t.sum() != 0 and mask_t.sum() != 0:
             img, vis_mask = img_t, mask_t
@@ -703,7 +708,7 @@ def build_rows(samples, heatmaps, *, plot: str, crop: bool):
 
 def render_entry(fv, attribution, ds, layer: str, cid: int, *, mode: str, n_ref: int,
                  composite, concept, normalize, device: str, crop: bool, plot: str,
-                 out_dir: Path, meta_extra: dict) -> None:
+                 out_dir: Path, meta_extra: dict, fv_class: str = "original") -> None:
     """Render + write one detector's figure (png+pdf) and meta.json (merge-not-wipe).
 
     Retrieve the reference images + their **class-conditional** CRP heatmaps (see
@@ -714,7 +719,7 @@ def render_entry(fv, attribution, ds, layer: str, cid: int, *, mode: str, n_ref:
     """
     samples, heatmaps = class_conditional_references(
         attribution, fv, ds, layer, cid, n_ref=n_ref, mode=mode, composite=composite,
-        concept=concept, normalize=normalize, device=device)
+        concept=concept, normalize=normalize, device=device, fv_class=fv_class)
     rows, nsub, row_lbl = build_rows(samples, heatmaps, plot=plot, crop=crop)
     ref = {cid: rows}
     ncols = len(rows[0]) if nsub > 1 else len(rows)
@@ -731,9 +736,10 @@ def render_entry(fv, attribution, ds, layer: str, cid: int, *, mode: str, n_ref:
 
 
 def record_job(spec: dict) -> None:
-    """Append/merge a job line in jobs.jsonl (dedup by base,dataset,config,site,concept)."""
+    """Append/merge a job line in jobs.jsonl (dedup by
+    base,dataset,config,site,concept,fv_class)."""
     key = (spec["base"], spec["dataset"], spec["config"], spec["site"],
-           spec["concept"], spec.get("sae_m", 0))
+           spec["concept"], spec.get("fv_class", "original"))
     jobs = []
     if JOBS_PATH.exists():
         for line in JOBS_PATH.read_text().splitlines():
@@ -742,7 +748,7 @@ def record_job(spec: dict) -> None:
                 continue
             j = json.loads(line)
             jk = (j["base"], j["dataset"], j["config"], j["site"],
-                  j["concept"], j.get("sae_m", 0))
+                  j["concept"], j.get("fv_class", "original"))
             if jk != key:
                 jobs.append(j)
     jobs.append(spec)
@@ -755,7 +761,7 @@ def rebuild_manifest() -> dict:
     tree is the single source of truth, so the web lists exactly what exists.
 
     Schema: ``models → instances → samples → layers → entries``. An *instance* is
-    (config, concept basis) — so SAE and axis-aligned are separate instances and
+    (config, concept basis) — separate instances per basis, and
     the layer list under each holds every block exactly once. A *sample* is either
     ``"aggregate"`` (dataset reference images) or one fixed input image."""
     models: Dict[str, dict] = {}
@@ -802,13 +808,16 @@ def rebuild_manifest() -> dict:
                 meta = json.loads(meta_path.read_text())
                 ck, layer = meta["concept_kind"], meta["layer"]
                 sample = meta.get("sample", "aggregate")
+                fvc = meta.get("fv_class", "original")
                 rel = meta_path.parent.relative_to(GALLERY_DIR)
                 inst = m["instances"].setdefault(instance_key(config, ck), {
                     "config": config, "basis": ck, "label": instance_label(config, ck),
                     "composite": composite,
                     "concept_desc": concept_kind_desc(ck, meta["site"]),
-                    "samples": {}})
-                srec = inst["samples"].setdefault(sample, {
+                    "fv": {}})
+                fvrec = inst["fv"].setdefault(fvc, {
+                    "label": FV_CLASS_LABELS[fvc], "samples": {}})
+                srec = fvrec["samples"].setdefault(sample, {
                     "label": meta.get("sample_label") or ("Aggregate" if sample == "aggregate" else sample),
                     "image": sample_imgs.get(sample),
                     "heat": sample_heats.get(ck, {}).get(sample),
@@ -824,9 +833,10 @@ def rebuild_manifest() -> dict:
                     "relevance": meta.get("relevance"),
                     "png": str(rel / "entry.png"), "pdf": str(rel / "entry.pdf")})
             for inst in m["instances"].values():
-                for srec in inst["samples"].values():
-                    for lrec in srec["layers"].values():
-                        lrec["entries"].sort(key=lambda e: (e["rank"] is None, e["rank"]))
+                for fvrec in inst["fv"].values():
+                    for srec in fvrec["samples"].values():
+                        for lrec in srec["layers"].values():
+                            lrec["entries"].sort(key=lambda e: (e["rank"] is None, e["rank"]))
     from experiments.xai_methods import METHODS, METHOD_CAPTIONS
     manifest = {"generated": _now(), "models": models,
                 "xai_order": list(METHODS), "xai_captions": METHOD_CAPTIONS}
@@ -903,6 +913,9 @@ def run_spec(spec: dict, device: str) -> None:
     classes = [int(c) for c in spec.get("classes", [])]
     n_rank = int(spec["n_rank"])
     fv_end = int(spec.get("fv_end", 0))
+    fv_class = spec.get("fv_class", "original")
+    if fv_class not in FV_CLASS_LABELS:
+        raise typer.BadParameter(f"--fv-class must be one of {FV_CLASS_LABELS}, got {fv_class!r}")
 
     model, num_classes, head_name, label = load_model(
         base, dataset, model_source=spec["model_source"], checkpoint=spec.get("checkpoint"),
@@ -911,32 +924,15 @@ def run_spec(spec: dict, device: str) -> None:
 
     num_heads = model.backbone.blocks[0].attn.num_heads
     transform, normalize = backbone_transforms(model.backbone)
-    # ImageNet (50k val): load a moderate, class-diverse subset (n per class over
-    # ALL classes). Full-50k indexing of a vit_base m=1536 SAE wedges NFS; too few
-    # images (single-class) starves get_max_reference (latents lack n_ref samples).
-    # Ranking still uses the spec's --classes; references come from the whole subset.
-    ds_extra = {"n_per_class": 10} if dataset == "imagenet" else None
-    ds = load_eval_dataset(dataset, transform, ds_extra)
+    # ImageNet: the gallery indexes and serves the FULL 50k val split (FV builds
+    # on local scratch, so the old NFS small-file wedge no longer forces a subset).
+    ds = load_eval_dataset(dataset, transform, None)
     concept = make_concept(concept_kind, num_heads)
     comp_cls = COMPOSITES[config]
 
     md = f"{base}_{dataset}"
-    # 'sae': splice the trained dictionary at each block and record its .features
-    # sublayer; label/cache are dict-size-specific so the SAE case coexists with
-    # the axis-aligned (embed_dim) case under the same model+config.
-    if concept_kind == "sae":
-        sae_m = int(spec.get("sae_m") or 0)
-        if sae_m <= 0:
-            raise typer.BadParameter("--sae-m (dictionary size) is required for --concept sae")
-        if site not in SITES:
-            raise typer.BadParameter(f"--site must be one of {SITES}, got {site!r}")
-        feat_names = splice_sae(model, site, dataset, blocks, sae_m, device)
-        layers = [(b, feat_names[b]) for b in blocks]
-        concept_kind = f"sae_m{sae_m}"          # display + output-dir + manifest label
-        model_tag = f"{md}_sae_m{sae_m}_{site}"  # SAE-specific FV index cache
-    else:
-        layers = resolve_layers(model, site, blocks)
-        model_tag = md
+    layers = resolve_layers(model, site, blocks)
+    model_tag = md
     attribution = CondAttribution(model)
     layer_names = [ln for _, ln in layers]
     # The FV index feeds the AGGREGATE view (reference sample indices), fv_index ranking,
@@ -952,17 +948,42 @@ def run_spec(spec: dict, device: str) -> None:
     if need_fv:
         # Build on scratch, mirror to the persistent root. Refill scratch from the
         # mirror first so an index built before a bounce is reused, not recomputed.
-        fv_dir = Path(CACHE_ROOT) / "fv" / model_tag / config
-        rel = fv_dir.relative_to(CACHE_ROOT)                 # fv/<model_tag>/<config>
+        # The aligned index lives in a sibling directory (suffix --aligned) so the
+        # two flavours never mix on disk.
+        fv_dirname = config if fv_class == "original" else f"{config}--aligned"
+        fv_dir = Path(CACHE_ROOT) / "fv" / model_tag / fv_dirname
+        rel = fv_dir.relative_to(CACHE_ROOT)                 # fv/<model_tag>/<dirname>
         storage.sync(CACHE_MIRROR / rel, fv_dir)             # hydrate (no-op if scratch already has it)
-        fv = FeatureVisualization(attribution, ds, {ln: concept for ln in layer_names},
-                                  preprocess_fn=normalize, path=str(fv_dir), device=device)
+        if fv_class == "aligned":
+            if fv_aligned.targets_path(fv_dir).exists():
+                pred_targets = fv_aligned.load_predicted_targets(fv_dir)
+            else:
+                print(f"[{md}/{config}] predicting conditioning targets over {len(ds)} samples…")
+                pred_targets = fv_aligned.predict_targets(model, ds, normalize, device)
+                fv_aligned.save_predicted_targets(
+                    fv_dir, pred_targets,
+                    provenance={"model_tag": model_tag, "config": config})
+            fv_ds = fv_aligned.PredTargetsDataset(ds, pred_targets)
+            fv = fv_aligned.AlignedFeatureVisualization(
+                attribution, fv_ds, {ln: concept for ln in layer_names},
+                preprocess_fn=normalize, path=str(fv_dir), device=device)
+            # per-class broadcast triples the effective batch — keep it bounded
+            fv_batch = 12
+        else:
+            fv = FeatureVisualization(attribution, ds, {ln: concept for ln in layer_names},
+                                      preprocess_fn=normalize, path=str(fv_dir), device=device)
+            fv_batch = 32
         fv_path = Path(fv.RelMax.PATH)
         have = fv_path.exists() and all(any(fv_path.glob(f"{ln}_data.npy")) for ln in layer_names)
+        if fv_class == "aligned":
+            stats_path = Path(fv.RelStats.PATH)
+            have = have and (stats_path / "targets.npy").exists() \
+                and all((stats_path / ln).is_dir() for ln in layer_names)
         if not have:
             end = fv_end if fv_end > 0 else len(ds)
-            print(f"[{md}/{config}] building FV index over {end} samples for {len(layer_names)} layer(s)…")
-            fv.run(comp_cls(), 0, end, batch_size=32)
+            print(f"[{md}/{config}] building {fv_class} FV index over {end} samples "
+                  f"for {len(layer_names)} layer(s)…")
+            fv.run(comp_cls(), 0, end, batch_size=fv_batch)
             storage.sync(fv_dir, CACHE_MIRROR / rel)         # persist the fresh build
 
     # Correctly-classified sample for class-conditional ranking.
@@ -1012,20 +1033,24 @@ def run_spec(spec: dict, device: str) -> None:
         ids = list(dict.fromkeys([int(c) for c in order[:n]] + detectors))
         print(f"[{md}/{config}] block {b} ({layer}): {len(ids)} detector(s) → {ids}")
         base_meta = {"layer": layer, "site": site, "block": b,
-                     "concept_kind": concept_kind, "config": config}
+                     "concept_kind": concept_kind, "config": config, "fv_class": fv_class}
+        # Entries of the two FV flavours live in disjoint subtrees so recomputes
+        # of one never touch the other; the manifest keys them by meta fv_class.
+        entries_root = config_dir if fv_class == "original" else config_dir / "fv_aligned"
         # Aggregate view: top reference images across the dataset (needs FV).
         if not only_samples:
             for cid in ids:
-                out_dir = config_dir / site / f"block{b}" / concept_kind / str(cid)
+                out_dir = entries_root / site / f"block{b}" / concept_kind / str(cid)
                 render_entry(fv, attribution, ds, layer, cid, mode=mode, n_ref=n_ref,
                              composite=comp_cls(), concept=concept, normalize=normalize,
-                             device=device, crop=crop, plot=plot, out_dir=out_dir, meta_extra={
+                             device=device, crop=crop, plot=plot, out_dir=out_dir,
+                             fv_class=fv_class, meta_extra={
                                  **base_meta, "sample": "aggregate", "sample_label": "Aggregate",
                                  "rank": rank_of.get(int(cid)), "relevance": float(scores[int(cid)]),
                              })
         # Local analysis per fixed input image: rank detectors on THAT image, then
         # show each with the query heatmap + its dataset representatives (needs FV).
-        img_root = config_dir / site / f"block{b}" / concept_kind / "_img"
+        img_root = entries_root / site / f"block{b}" / concept_kind / "_img"
         for s in samples:
             shutil.rmtree(img_root / s["key"], ignore_errors=True)   # drop stale detectors
             x = ds[s["ds_index"]][0]
@@ -1037,7 +1062,8 @@ def run_spec(spec: dict, device: str) -> None:
                 render_local_entry(fv, attribution, ds, x, s["target"], layer, cid, mode=mode,
                                    n_ref=n_ref, composite=comp_cls(), concept=concept,
                                    normalize=normalize, device=device, crop=crop, plot=plot,
-                                   out_dir=img_root / s["key"] / str(cid), meta_extra={
+                                   out_dir=img_root / s["key"] / str(cid), fv_class=fv_class,
+                                   meta_extra={
                                        **base_meta, "sample": s["key"],
                                        "sample_label": s["label"], "rank": r_local})
 
@@ -1054,7 +1080,6 @@ def compute(
     site: str = typer.Option("proj_drop", "--site", help=f"probe site: {SITES}"),
     blocks: List[int] = typer.Option(..., "--blocks", help="block indices (repeat the flag)"),
     concept: str = typer.Option("embed_dim", "--concept", help=f"concept kind: {CONCEPTS}"),
-    sae_m: int = typer.Option(0, "--sae-m", help="(concept=sae) SAE dictionary size to splice"),
     n: int = typer.Option(5, "--n", help="auto top-n most-relevant detectors per layer"),
     detectors: List[int] = typer.Option([], "--detectors", help="extra explicit detector ids (additive)"),
     n_ref: int = typer.Option(6, "--n-ref", help="number of representative images per detector"),
@@ -1064,6 +1089,7 @@ def compute(
     samples: bool = typer.Option(True, "--samples/--no-samples", help="also render the fixed single-image comparison views (lizard, cheeseburger, …)"),
     only_samples: bool = typer.Option(False, "--only-samples", help="render ONLY the single-image views (skip FV index + aggregate; reuse existing aggregate entries)"),
     rank: str = typer.Option("class_conditional", "--rank", help="class_conditional | fv_index"),
+    fv_class: str = typer.Option("original", "--fv-class", help=f"FV index flavour: {', '.join(FV_CLASS_LABELS.keys())}"),
     classes: List[int] = typer.Option([], "--classes", help="restrict ranking to these classes"),
     n_rank: int = typer.Option(8, "--n-rank", help="correct images per class for ranking"),
     fv_end: int = typer.Option(0, "--fv-end", help="cap FV-index samples (0 = full dataset)"),
@@ -1081,9 +1107,9 @@ def compute(
         raise typer.BadParameter(f"--dataset must be one of {sorted(DATASETS)}")
     spec = {
         "base": base, "dataset": dataset, "config": config, "site": site,
-        "blocks": list(blocks), "concept": concept, "sae_m": sae_m, "n": n, "detectors": list(detectors),
+        "blocks": list(blocks), "concept": concept, "n": n, "detectors": list(detectors),
         "n_ref": n_ref, "mode": mode, "plot": plot, "crop": crop, "samples": samples,
-        "only_samples": only_samples, "rank": rank,
+        "only_samples": only_samples, "rank": rank, "fv_class": fv_class,
         "classes": list(classes), "n_rank": n_rank, "fv_end": fv_end,
         "model_source": model_source, "checkpoint": checkpoint, "head": head,
         "num_classes": num_classes, "head_kwargs": json.loads(head_kwargs_json),
@@ -1197,8 +1223,8 @@ def sample_xai(
             seen.add(key)
             uniq.append(j)
     print(f"sample-xai backfill for {len(uniq)} model(s) (from {len(sel)}/{len(jobs)} job(s))")
-    for j in uniq:                                   # embed_dim/proj_drop: no SAE splice, no FV
-        run_spec({**j, "concept": "embed_dim", "sae_m": 0, "site": "proj_drop",
+    for j in uniq:                                   # embed_dim/proj_drop: extras only, no FV
+        run_spec({**j, "concept": "embed_dim", "site": "proj_drop",
                   "only_extras": True, "samples": True}, device)
     rebuild_manifest()
     print(f"done · manifest → {MANIFEST_PATH}")
