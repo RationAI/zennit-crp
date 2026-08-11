@@ -15,7 +15,7 @@ Phased CLI so each GPU chunk runs under the shared GPU lock separately:
 
 Protocol
 --------
-* Model: timm ViT-B/16 ImageNet-1k (via crp_gallery.load_model, tag "imagenet").
+* Model: timm ViT-B/16 ImageNet-1k (experiments.models.ImagenetViTBase).
 * Data: imagenet_val_hf, n_per_class=10 (10k pool), shuffled with a fixed seed.
 * Outlier tokens: per-block L2 norms of the block-output patch tokens (CLS
   excluded), threshold = mean + 4*sd over the scan pool per block; per-image
@@ -70,12 +70,10 @@ SIGMA_K = 4.0          # mean + 4*sd criterion
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_everything(device: str):
-    from experiments.crp_gallery import load_model, load_eval_dataset
-    from experiments.model_io import backbone_transforms
-    model, num_classes, _, label = load_model(
-        base="vit_base", dataset="imagenet", model_source="checkpoint",
-        checkpoint=None, head="timm_builtin", num_classes=None, head_kwargs={},
-        device=device)
+    from experiments.models import ImagenetViTBase, backbone_transforms
+    from experiments.datasets import load_eval_dataset
+    model = ImagenetViTBase(device=device)
+    label = f"vit_base · {model.head_name} · imagenet"
     transform, normalize = backbone_transforms(model.backbone)
     ds = load_eval_dataset("imagenet", transform, {"n_per_class": 10})
     print(f"model: {label}  dataset: {len(ds)} images")

@@ -3,7 +3,7 @@
 Single source of truth for the *un-normalized dataset + normalize-at-forward*
 convention used across the experiments and by :class:`models.bases.base.Base`
 (`get_transform`/`get_normalize` delegate here). Keeping it in one leaf module
-(no intra-package imports) lets every consumer — the Base, ``model_io``, the
+(no intra-package imports) lets every consumer — the Base, the zoo, the
 CRP gallery — reach the same implementation without duplicating it or risking
 an import cycle.
 """

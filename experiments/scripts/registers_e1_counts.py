@@ -212,7 +212,7 @@ def _verify_sites(blocks, x_in, forward_fn) -> float:
 
 def cmd_collect(args):
     import torch
-    from experiments.crp_gallery import load_eval_dataset
+    from experiments.datasets import load_eval_dataset
     from experiments.models import backbone_transforms
 
     spec = MODELS[args.model]
@@ -221,17 +221,15 @@ def cmd_collect(args):
         # v2: --checkpoint overrides the spec default; the loaded path is
         # asserted so a stale spec default can never silently win.
         ckpt = getattr(args, "checkpoint", None) or spec["checkpoint"]
-        from experiments.crp_gallery import DATASETS
-        from experiments.model_io import load_probe
-        tag = DATASETS[spec["dataset"]][2]
-        model, ck, loaded_path = load_probe(tag, device, base=spec["base"],
-                                            path=Path(ckpt) if ckpt else None)
+        from experiments.models import MODELS as MODEL_ZOO
+        zoo_cls = MODEL_ZOO[f"{spec['base']}_{spec['dataset']}"]
+        model = zoo_cls(**({"checkpoint": ckpt} if ckpt else {}), device=device)
         if ckpt:
-            assert Path(loaded_path).resolve() == Path(ckpt).resolve(), (
-                f"loaded {loaded_path} != requested {ckpt}")
-            print(f"loaded probe checkpoint {loaded_path} "
-                  f"(val_acc={ck.get('val_acc', float('nan')):.4f})")
-        label = f"{ck['base']} · {ck['head']} · {spec['dataset']}"
+            assert Path(model.source).resolve() == Path(ckpt).resolve(), (
+                f"loaded {model.source} != requested {ckpt}")
+            print(f"loaded probe checkpoint {model.source} "
+                  f"(val_acc={model.meta.get('val_acc', float('nan')):.4f})")
+        label = f"{spec['base']} · {model.head_name} · {spec['dataset']}"
         backbone = model.backbone
         forward_fn = lambda x: model(x)                        # noqa: E731
         n_prefix, n_reg = 1, 0

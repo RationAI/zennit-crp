@@ -57,7 +57,7 @@ from zennit_extensions.attention_unfolded import (
     BilinearMatmul, ScaleByConstant, SoftmaxAlongLastDim,
 )
 from zennit_extensions.canonisation.canonizers import (
-    EvaAttentionSubstitutionCanonizer, TimmAttentionSubstitutionCanonizer,
+    EvaAttentionSubstitutionCanonizer, VanillaViTAttentionSubstitutionCanonizer,
 )
 from zennit_extensions.rules.bajger_contrib import AlphaBetaMatmul
 from crp.attribution import CondAttribution
@@ -229,7 +229,7 @@ def main(
         canonizers=[
             CapturingBlockCanonizer(),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
-            TimmAttentionSubstitutionCanonizer(block_indices=None),
+            VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
         ],
     )
     attribution = CondAttribution(model)

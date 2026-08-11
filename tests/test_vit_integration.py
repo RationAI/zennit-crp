@@ -33,7 +33,7 @@ from crp.concepts import (
 )
 from zennit_extensions.canonisation.canonizers import (
     EvaAttentionSubstitutionCanonizer,
-    TimmViTCanonizer,
+    TimmViTBlockCanonizer,
 )
 from crp.attribution import CondAttribution
 from zennit_extensions import (
@@ -110,7 +110,7 @@ class TestTimmViTCanonizer:
         blk = vit_tiny.blocks[0]
         original_class_forward = type(blk).forward
         assert "forward" not in blk.__dict__, "test pre-condition: clean state"
-        canonizer = TimmViTCanonizer(residual=True)
+        canonizer = TimmViTBlockCanonizer(residual=True)
         instances = canonizer.apply(vit_tiny)
         try:
             assert "forward" in blk.__dict__, "canonizer did not swap Block forward"

@@ -88,20 +88,18 @@ def collect(dataset: str, device: str):
     """Forward the 6 gallery samples once, norms at both sites.
     Returns ``(samples, {site: (12, 6, 197)})``."""
     import torch
-    from experiments.model_io import load_probe
-    from experiments.models import backbone_transforms
+    from experiments.models import FunnyBirdsViTSmall, ImagenetViTBase, backbone_transforms
     from experiments.datasets import load as load_dataset
     from experiments.crp_gallery import pick_samples
     from experiments.scripts.registers_position_freq import CKPT_FUNNY
 
     if dataset == "funny_birds":
-        model, _, _ = load_probe("funny-birds-train-clean", device,
-                                 base="vit_small", path=CKPT_FUNNY)
+        model = FunnyBirdsViTSmall(checkpoint=CKPT_FUNNY, device=device)
         transform, normalize = backbone_transforms(model.backbone)
         ds = load_dataset("funny_birds", root=REPO_ROOT / "data",
                           transform=transform, split="train", clean_only=True)
     elif dataset == "imagenet":
-        model, _, _ = load_probe("imagenet", device, base="vit_base")
+        model = ImagenetViTBase(device=device)
         transform, normalize = backbone_transforms(model.backbone)
         ds = load_dataset("imagenet_val_hf", root=REPO_ROOT / "data",
                           transform=transform).subsample(10)

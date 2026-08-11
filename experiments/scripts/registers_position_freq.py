@@ -154,13 +154,11 @@ def flags_from_norms(norms: np.ndarray):
 def cmd_collect(args):
     import torch
     device = args.device
-    from experiments.model_io import load_probe
-    from experiments.models import backbone_transforms
+    from experiments.models import FunnyBirdsViTSmall, ImagenetViTBase, backbone_transforms
     from experiments.datasets import load as load_dataset
 
     if args.dataset == "funny_birds":
-        model, ck, ck_path = load_probe("funny-birds-train-clean", device,
-                                        base="vit_small", path=CKPT_FUNNY)
+        model = FunnyBirdsViTSmall(checkpoint=CKPT_FUNNY, device=device)
         transform, normalize = backbone_transforms(model.backbone)
         kw = {"split": "test"} if args.split == "test" else \
              {"split": "train", "clean_only": True}
@@ -168,7 +166,7 @@ def cmd_collect(args):
                           transform=transform, **kw)
         label = f"vit_small · funny_birds {args.split.upper()}"
     elif args.dataset == "imagenet":
-        model, ck, ck_path = load_probe("imagenet", device, base="vit_base")
+        model = ImagenetViTBase(device=device)
         transform, normalize = backbone_transforms(model.backbone)
         ds = load_dataset("imagenet_val_hf", root=REPO_ROOT / "data",
                           transform=transform).subsample(10)
@@ -195,7 +193,7 @@ def cmd_collect(args):
         thresholds_mean4sd=tau.astype(np.float32),
         masks=masks, image_level_mask=image_level,
         meta=np.array([
-            f"model={label}", f"checkpoint={ck_path}",
+            f"model={label}", f"checkpoint={model.source}",
             "norm=L2 over embed_dim of blocks[i] output, i=0..11",
             "token0=CLS (excluded), tokens1..196=patches row-major 14x14",
             f"criterion=norm > mean_b + {SD_K}*sd_b over all patch tokens of the sample; "

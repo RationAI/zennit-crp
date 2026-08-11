@@ -3,7 +3,7 @@ from typing import Callable, List, Optional, Sequence
 import torch.nn as nn
 from timm.models.eva import EvaAttention, EvaBlock
 from timm.models.vision_transformer import Attention as TimmAttention, Block as TimmBlock
-from zennit.canonizers import AttributeCanonizer, Canonizer, CompositeCanonizer
+from zennit.canonizers import AttributeCanonizer, Canonizer
 
 from zennit_extensions.attention_unfolded import EvaAttentionUnfolded, TimmAttentionUnfolded
 
@@ -99,7 +99,7 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
         )
 
 
-class TimmAttentionSubstitutionCanonizer(Canonizer):
+class VanillaViTAttentionSubstitutionCanonizer(Canonizer):
     """Replace standard timm ``Attention`` instances with :class:`TimmAttentionUnfolded`.
     Mirror of :class:`EvaAttentionSubstitutionCanonizer`; each canonizer's
     ``isinstance`` filter skips the other's target, so both can be bundled.
@@ -125,13 +125,13 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
         self.original_module: Optional[nn.Module] = None
         self.unfolded_module: Optional[TimmAttentionUnfolded] = None
 
-    def apply(self, root_module: nn.Module) -> List["TimmAttentionSubstitutionCanonizer"]:
+    def apply(self, root_module: nn.Module) -> List["VanillaViTAttentionSubstitutionCanonizer"]:
         # Stock timm ``Attention`` does not carry ``num_prefix_tokens``; it
         # lives on the top-level VisionTransformer, read once here and passed
         # down. Fallback 1 covers bare attentions in tests.
         num_prefix_tokens = int(getattr(root_module, "num_prefix_tokens", 1))
 
-        instances: List[TimmAttentionSubstitutionCanonizer] = []
+        instances: List[VanillaViTAttentionSubstitutionCanonizer] = []
         for parent_name, parent in root_module.named_modules():
             for attr_name, child in parent.named_children():
                 if not isinstance(child, TimmAttention):
@@ -167,7 +167,7 @@ class TimmAttentionSubstitutionCanonizer(Canonizer):
         setattr(self.parent, self.attr_name, self.original_module)
         self.unfolded_module = None
 
-    def copy(self) -> "TimmAttentionSubstitutionCanonizer":
+    def copy(self) -> "VanillaViTAttentionSubstitutionCanonizer":
         return type(self)(block_indices=self.block_indices)
 
 
@@ -271,7 +271,7 @@ def _timm_block_forward(self, x, attn_mask=None, is_causal=False):
     return x
 
 
-class TimmBlockResidualCanonizer(AttributeCanonizer):
+class VanillaViTBlockResidualCanonizer(AttributeCanonizer):
     """Swap ``forward`` on timm ``vision_transformer.Block`` so each residual
     add routes through a :class:`~zennit_extensions.attention_unfolded.ResidualAdd`
     module — making the add hookable. The residual *rule* is a ``layer_map``
@@ -303,45 +303,3 @@ class TimmBlockResidualCanonizer(AttributeCanonizer):
     def copy(self):
         return type(self)()
 
-
-class TimmViTCanonizer(CompositeCanonizer):
-    """Bundles the block-level canonizers for AttnLRP on a timm ViT
-    (standard or Eva stack): with ``residual=True``, the
-    Timm/Eva ``BlockResidualCanonizer`` pair. LayerNorm / Dropout need no
-    canonizer (mapped to ``Pass`` in the layer_map), and attention substitution
-    is handled separately by the ``*AttentionSubstitutionCanonizer``. All
-    mutations are instance-level and revert on ``composite.context()`` exit.
-
-    Parameters
-    ----------
-    palrp : bool
-        Deprecated no-op, accepted for back-compat (PA-LRP removed).
-    residual : bool
-        Route the block residual adds through ``ResidualAdd`` modules so the
-        composite ``layer_map`` can apply a residual rule.
-    layerscale_uniform : bool
-        Also route Eva LayerScale γ multiplications through ``LayerScaleMul``.
-    epsilon : float
-        Unused (rules are configured by the composite); accepted for
-        back-compat.
-    """
-
-    def __init__(
-        self,
-        *,
-        palrp: bool = False,
-        residual: bool = False,
-        layerscale_uniform: bool = False,
-        epsilon: float = 1e-6,
-    ):
-        canonizers: List[Canonizer] = []
-        if residual:
-            canonizers.append(TimmBlockResidualCanonizer())
-            canonizers.append(EvaBlockResidualCanonizer(
-                layerscale_uniform=layerscale_uniform,
-            ))
-        elif layerscale_uniform:
-            # LayerScale-uniform wants the EvaBlock forward installed (the
-            # wrapper lives inside that forward) even without a residual rule.
-            canonizers.append(EvaBlockResidualCanonizer(layerscale_uniform=True))
-        super().__init__(canonizers)

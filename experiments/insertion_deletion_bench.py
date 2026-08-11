@@ -80,21 +80,20 @@ CKPT_M3 = REPO_ROOT / "data/runs/finetune_vit_dinov3_small_funny-birds-train-cle
 @dataclass(frozen=True)
 class ModelSpec:
     tag: str                      # M1..M4
-    base: str
+    model_key: str                # experiments.models.MODELS key
     dataset: str
-    model_source: str             # checkpoint | dinov3_in1k
     checkpoint: Optional[str]
     label: str
     ds_extra: dict = field(default_factory=dict)
 
 MODELS: Dict[str, ModelSpec] = {
-    "M1": ModelSpec("M1", "vit_small", "funny_birds", "checkpoint", str(CKPT_M1),
+    "M1": ModelSpec("M1", "vit_small_funny_birds", "funny_birds", str(CKPT_M1),
                     "ViT-S/16 · FunnyBirds (test)", {"split": "test"}),
-    "M2": ModelSpec("M2", "vit_base", "imagenet", "checkpoint", None,
+    "M2": ModelSpec("M2", "vit_base_imagenet", "imagenet", None,
                     "ViT-B/16 · ImageNet (val)", {"n_per_class": 10}),
-    "M3": ModelSpec("M3", "vit_dinov3_small", "funny_birds", "checkpoint", str(CKPT_M3),
+    "M3": ModelSpec("M3", "vit_dinov3_small_funny_birds", "funny_birds", str(CKPT_M3),
                     "DINOv3-S/16 (+reg, finetuned) · FunnyBirds (test)", {"split": "test"}),
-    "M4": ModelSpec("M4", "vit_base_patch16_dinov3", "imagenet", "dinov3_in1k", None,
+    "M4": ModelSpec("M4", "vit_dinov3_base_imagenet", "imagenet", None,
                     "DINOv3-B/16 (+reg, canvit head) · ImageNet (val)", {"n_per_class": 10}),
 }
 
@@ -127,18 +126,16 @@ def npz_path(model: str) -> Path:
     return RES_DIR / f"iddapc_{model}.npz"
 
 
-# ── model + data loading (reuses crp_gallery.load_model) ───────────────────────
+# ── model + data loading (zoo classes) ─────────────────────────────────────────
 def load(model_id: str, device: str):
-    from experiments.crp_gallery import load_model, load_eval_dataset
-    from experiments.model_io import backbone_transforms
+    from experiments.models import MODELS as MODEL_ZOO, backbone_transforms
+    from experiments.datasets import load_eval_dataset
     spec = MODELS[model_id]
-    model, ncls, head, label = load_model(
-        spec.base, spec.dataset, model_source=spec.model_source,
-        checkpoint=spec.checkpoint, head="linear", num_classes=None,
-        head_kwargs={}, device=device)
+    ckpt = {"checkpoint": spec.checkpoint} if spec.checkpoint else {}
+    model = MODEL_ZOO[spec.model_key](**ckpt, device=device)
     transform, normalize = backbone_transforms(model.backbone)
     ds = load_eval_dataset(spec.dataset, transform, spec.ds_extra)
-    return model, normalize, ds, ncls, label
+    return model, normalize, ds, model.num_classes, spec.label
 
 
 def select_indices(model, normalize, ds, device, *, n: int = N_IMAGES,
@@ -268,8 +265,8 @@ def select(model: str = typer.Option(..., help="M1|M2|M3|M4"),
         "clean_prob": np.array(probs, dtype=np.float64),
     })
     store["provenance"] = json.dumps({
-        "model": model, "label": label, "base": spec.base, "dataset": spec.dataset,
-        "model_source": spec.model_source, "checkpoint": spec.checkpoint,
+        "model": model, "label": label, "model_key": spec.model_key, "dataset": spec.dataset,
+        "checkpoint": spec.checkpoint,
         "ds_extra": spec.ds_extra, "num_classes": int(ncls), "n_images": len(idxs),
         "seed": SEED, "occlusion": "image-mean fill", "patch_agg": "max",
         "metric": "DAPC = trapz(LeRF)-trapz(MoRF) over occlusion-fraction; curves length N+1 (index0=clean=1.0)",

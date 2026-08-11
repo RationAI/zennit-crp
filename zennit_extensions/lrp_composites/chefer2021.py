@@ -18,8 +18,9 @@ from zennit_extensions.attention_unfolded import (
 )
 from zennit_extensions.canonisation.canonizers import (
     EvaAttentionSubstitutionCanonizer,
-    TimmAttentionSubstitutionCanonizer,
-    TimmViTCanonizer,
+    EvaBlockResidualCanonizer,
+    VanillaViTAttentionSubstitutionCanonizer,
+    VanillaViTBlockResidualCanonizer,
 )
 from zennit_extensions.rules.attnlrp import Uniform
 from zennit_extensions.rules.chefer2021 import CheferAdd, CheferMatmul
@@ -56,10 +57,10 @@ class CheferLRPComposite(LayerMapComposite):
                  high: float = 3.0, canonizers=None):
         self._zbox = ZBox(low=low, high=high)   # first (pixel-space) conv
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
-                palrp=False, residual=True, layerscale_uniform=True, epsilon=epsilon),
+            VanillaViTBlockResidualCanonizer(),
+            EvaBlockResidualCanonizer(layerscale_uniform=True),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
-            TimmAttentionSubstitutionCanonizer(block_indices=None),
+            VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
         ]
         layer_map = [
             (BilinearMatmul, CheferMatmul(epsilon=epsilon)),

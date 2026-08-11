@@ -106,13 +106,13 @@ def overlap_path(m): return RES_DIR / f"e2_overlap_{m}.npz"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_model_ds(model_key: str, device: str):
-    from experiments.crp_gallery import load_model, load_eval_dataset
-    from experiments.model_io import backbone_transforms
+    from experiments.models import MODELS as MODEL_ZOO, backbone_transforms
+    from experiments.datasets import load_eval_dataset
     spec = MODELS[model_key]
-    model, _, _, label = load_model(
-        spec["base"], spec["dataset"], model_source="checkpoint",
-        checkpoint=spec["checkpoint"], head="linear", num_classes=None,
-        head_kwargs={}, device=device)
+    ckpt = spec["checkpoint"]
+    model = MODEL_ZOO[f"{spec['base']}_{spec['dataset']}"](
+        **({"checkpoint": ckpt} if ckpt else {}), device=device)
+    label = f"{spec['base']} · {model.head_name} · {spec['dataset']}"
     transform, normalize = backbone_transforms(model.backbone)
     ds = load_eval_dataset(spec["dataset"], transform, extra_kwargs=spec["extra"])
     assert int(model.backbone.num_prefix_tokens) == 1, "expected exactly one CLS token"
@@ -122,8 +122,8 @@ def _load_model_ds(model_key: str, device: str):
 def _load_ds_only(model_key: str):
     """Dataset + transform without putting the model on GPU (figure stages)."""
     import timm
-    from experiments.crp_gallery import load_eval_dataset
-    from experiments.model_io import backbone_transforms
+    from experiments.datasets import load_eval_dataset
+    from experiments.models import backbone_transforms
     spec = MODELS[model_key]
     arch = {"vit_base": "vit_base_patch16_224", "vit_small": "vit_small_patch16_224"}
     tm = timm.create_model(arch[spec["base"]], pretrained=False)

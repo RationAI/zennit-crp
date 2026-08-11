@@ -64,9 +64,44 @@ def load(name: str, *, root: _Optional[_Path] = None, **kwargs):
     return DATASETS[name](root=root, **kwargs)
 
 
+# Experiment eval-dataset keys → (loader name, loader kwargs). These keys name
+# datasets in job specs, result parquets and figure trees — do not rename.
+EVAL_DATASETS = {
+    "funny_birds":   ("funny_birds",   {"split": "train", "clean_only": True}),
+    "dsprites":      ("dsprites",      {"target": "shape"}),
+    "colored_mnist": ("colored_mnist", {"split": "train"}),
+    "imagenet":      ("imagenet_val_hf", {}),
+}
+
+
+def load_eval_dataset(key: str, transform, extra_kwargs: _Optional[dict] = None):
+    """Un-normalized eval dataset for an :data:`EVAL_DATASETS` key.
+
+    ``extra_kwargs`` is merged into the loader kwargs. ``ImagenetValHFDataset``
+    always loads the FULL 50k val — an ``n_per_class`` / ``classes`` entry for
+    imagenet is applied AFTER construction (``ds.subsample`` /
+    ``filter_classes``, identical pools to the old in-constructor sampling),
+    so experiment scripts keep their recorded pool protocol.
+    """
+    ds_name, ds_kw = EVAL_DATASETS[key]
+    merged = {**ds_kw, **(extra_kwargs or {})}
+    pool = classes = None
+    if ds_name == "imagenet_val_hf":
+        pool = merged.pop("n_per_class", None)
+        classes = merged.pop("classes", None)
+    ds = load(ds_name, transform=transform, **merged)
+    if classes is not None:
+        ds.items = ds.filter_classes(ds.items, classes)
+    if pool is not None:
+        ds.subsample(pool)
+    return ds
+
+
 __all__ = [
     "ImageClassDataset",
     "DATASETS",
+    "EVAL_DATASETS",
+    "load_eval_dataset",
     "IMAGENETTE_TO_IMAGENET",
     "IMAGENETTE_CLASS_NAMES",
     "load",

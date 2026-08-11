@@ -6,8 +6,6 @@ Composable building blocks for explainability work:
   composed via :func:`~experiments.models.build_probe`.
 * :mod:`experiments.datasets` — auto-downloading dataset loaders.
 * :mod:`experiments.train_probe` — typer CLI (``cache`` + ``train``).
-* :mod:`experiments.viz_unfolded` — plotting helpers for the
-  walkthrough notebook.
 
 Importable as ``from experiments.<sub> import ...`` once the project is
 installed (``uv sync``). No ``sys.path`` manipulation required at

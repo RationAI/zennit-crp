@@ -129,58 +129,31 @@ def endpoint_check_pairs(model) -> List[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 def load_model_for_args(args, device):
-    """Resolve the eval model for (base, dataset, checkpoint).
-
-    ``vit_dinov3_base_in1k`` is a special assembly: timm DINOv3-B/16 backbone
-    + the public canvit IN1k linear head on the final-norm CLS token, wrapped
-    in one module so ``CondAttribution`` sees a single classifier. Otherwise
-    loads a finetuned probe via ``experiments.model_io.load_probe``
-    (``--checkpoint`` pins the exact run instead of the newest-glob default).
-    """
-    import torch.nn as nn
-    from experiments.model_io import DATASETS, load_probe
+    """Resolve the eval model for (base, dataset, checkpoint) via the zoo
+    (``experiments.models.MODELS``). ``vit_dinov3_base_in1k`` is the CLI alias
+    for :class:`experiments.models.ImagenetDinoV3Base`; otherwise the zoo class
+    for ``<base>_<dataset>`` (``--checkpoint`` pins the exact probe run instead
+    of the newest-glob default)."""
+    from experiments.models import MODELS, ImagenetDinoV3Base
 
     if args.base == "vit_dinov3_base_in1k":
-        import timm
-        from experiments.scripts.eval_dinov3_in1k_probe import (
-            HEAD_REPOS, load_in1k_linear_head)
-        timm_name = "vit_base_patch16_dinov3.lvd1689m"
+        return ImagenetDinoV3Base(device=device)
 
-        class _DinoV3CLSFullProbe(nn.Module):
-            """DINOv3 backbone features → final-norm CLS token → linear head."""
-
-            def __init__(self, backbone: nn.Module, head: nn.Module):
-                super().__init__()
-                self.backbone = backbone
-                self.head = head
-
-            def forward(self, x):
-                return self.head(self.backbone.forward_features(x)[:, 0])
-
-        backbone = timm.create_model(timm_name, pretrained=True,
-                                     num_classes=0, img_size=256)
-        head = load_in1k_linear_head(timm_name, device)
-        model = _DinoV3CLSFullProbe(backbone, head).eval().to(device)
-        model.requires_grad_(False)
-        ck = {"base": args.base, "head": "canvit_in1k_linear_cls",
-              "num_classes": 1000, "dataset": "imagenet_val_hf"}
-        return model, ck, Path(f"timm:{timm_name} + hf:{HEAD_REPOS[timm_name]}")
-
-    tag = DATASETS[args.dataset][2]
     ckpt = Path(args.checkpoint) if getattr(args, "checkpoint", None) else None
-    model, ck, ck_path = load_probe(tag, device, base=args.base, path=ckpt)
+    model = MODELS[f"{args.base}_{args.dataset}"](
+        **({"checkpoint": ckpt} if ckpt else {}), device=device)
     if ckpt is not None:
-        assert Path(ck_path).resolve() == ckpt.resolve(), (ck_path, ckpt)
-    return model, ck, ck_path
+        assert Path(model.source).resolve() == ckpt.resolve(), (model.source, ckpt)
+    return model
 
 
 def dataset_eval_kwargs(dataset: str) -> dict:
-    """Eval-split loader kwargs for a ``DATASETS`` entry. FunnyBirds evaluates
-    on the *test* split (it contains zero part-ablated images)."""
-    from experiments.model_io import DATASETS
+    """Eval-split loader kwargs for an ``EVAL_DATASETS`` entry. FunnyBirds
+    evaluates on the *test* split (it contains zero part-ablated images)."""
+    from experiments.datasets import EVAL_DATASETS
     if dataset == "funny_birds":
         return {"split": "test"}
-    return dict(DATASETS[dataset][1])
+    return dict(EVAL_DATASETS[dataset][1])
 
 
 def pick_class_diverse(ds, n: int, seed: int = 0) -> List[int]:
@@ -403,26 +376,24 @@ def save_npz(args, sites, idxs, store: RecordedFlow, meta: dict) -> Path:
 
 
 def compute(args) -> Path:
-    from zennit_extensions.lrp_composites import AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite
-    composites = {"cp_lrp_baseline": CPLRPComposite, "attnlrp_baseline": AttnLRPBaselineComposite,
-                  "chefer_lrp": CheferLRPComposite}
+    from zennit_extensions.lrp_composites import COMPOSITES as composites
     from crp.attribution import CondAttribution
-    from experiments.datasets import load as load_dataset
-    from experiments.model_io import DATASETS, backbone_transforms
+    from experiments.datasets import EVAL_DATASETS, load as load_dataset
+    from experiments.models import backbone_transforms
 
     device = args.device
-    model, ck, ck_path = load_model_for_args(args, device)
-    print(f"checkpoint/model source: {ck_path}")
+    model = load_model_for_args(args, device)
+    print(f"checkpoint/model source: {model.source}")
 
     ds_kw = dataset_eval_kwargs(args.dataset)
     transform, normalize = backbone_transforms(model.backbone)
-    ds = load_dataset(DATASETS[args.dataset][0], root=REPO_ROOT / "data",
+    ds = load_dataset(EVAL_DATASETS[args.dataset][0], root=REPO_ROOT / "data",
                       transform=transform, **ds_kw)
     candidates = pick_class_diverse(ds, len(ds), seed=args.seed)
     idxs = pick_correct_class_diverse(model, ds, candidates, args.n_samples,
                                       normalize, device)
     print(f"{len(idxs)} class-diverse correctly-classified samples, "
-          f"model={ck['base']}·{ck['head']}, D={int(model.backbone.embed_dim)}")
+          f"model={args.base}·{model.head_name}, D={int(model.backbone.embed_dim)}")
 
     sites = list_residual_sites(model)
     composite_cls = composites[args.config]
@@ -430,7 +401,7 @@ def compute(args) -> Path:
     store = record_residual_flow(attribution, cfg, ds, idxs, normalize, sites,
                                  model, device, args.batch_size)
     drift = propagation_drift(store.tot_add, sites)
-    meta = build_metadata(args, ck_path, model, cfg, ds_kw, idxs,
+    meta = build_metadata(args, model.source, model, cfg, ds_kw, idxs,
                           store, drift)
     return save_npz(args, sites, idxs, store, meta)
 

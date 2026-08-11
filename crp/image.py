@@ -99,7 +99,7 @@ def vis_opaque_img(data_batch, heatmaps, rf=False, alpha=0.3, vis_th=0.2, crop_t
 
         inv_mask = ~vis_mask
         img = img * vis_mask + img * inv_mask * alpha
-        img = zimage.imgify(img.detach().cpu())
+        img = imgify(img)
 
         imgs.append(img)
 
@@ -191,8 +191,23 @@ def imgify(image: Union[Image.Image, torch.Tensor, np.ndarray], cmap: str = "bwr
     """
 
     if isinstance(image, torch.Tensor):
-        img = zimage.imgify(image.detach().cpu(), cmap=cmap, vmin=vmin, vmax=vmax, symmetric=symmetric, level=level, grid=grid, gridfill=gridfill)
-    elif isinstance(image, np.ndarray):
+        image = image.detach().cpu().numpy()
+
+    if isinstance(image, np.ndarray):
+        # zennit 1.0.0's imgify crashes whenever it auto-computes the norm
+        # bounds for float input (keepdims bounds + boolean indexing raise an
+        # IndexError). Explicit *scalar* bounds take its working code path, so
+        # compute the whole-array bounds here with the same norm semantics.
+        # Only the non-grid case is handled — grid mode normalizes per sample,
+        # which scalar bounds cannot express (no caller uses grid with floats).
+        if image.dtype != np.uint8 and not grid and None in (vmin, vmax):
+            if symmetric:
+                vmax_ = float(np.abs(image).max())
+                vmin_ = -vmax_
+            else:
+                vmin_, vmax_ = float(image.min()), float(image.max())
+            vmin = vmin_ if vmin is None else vmin
+            vmax = vmax_ if vmax is None else vmax
         img = zimage.imgify(image, cmap=cmap, vmin=vmin, vmax=vmax, symmetric=symmetric, level=level, grid=grid, gridfill=gridfill)
     elif isinstance(image, Image.Image):
         img = image

@@ -46,7 +46,6 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import matplotlib
-matplotlib.use("Agg")  # headless render
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -54,18 +53,7 @@ import typer
 
 from torchvision.transforms.functional import gaussian_blur
 
-from zennit_extensions.lrp_composites import (
-    AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite,
-)
-
-# The composites this experiment uses, tracked explicitly by name. Gathered
-# data + web manifests reference these name strings only; definitions live in
-# zennit_extensions.lrp_composites, provenance in the experiment journal.
-COMPOSITES = {
-    "cp_lrp_baseline": CPLRPComposite,
-    "attnlrp_baseline": AttnLRPBaselineComposite,
-    "chefer_lrp": CheferLRPComposite,
-}
+from zennit_extensions.lrp_composites import COMPOSITES
 from experiments import storage
 from experiments import fv_aligned
 from crp.attribution import CondAttribution
@@ -73,10 +61,10 @@ from crp.concepts import HeadConcept, EmbeddingDimConcept
 from crp.helper import load_maximization
 from crp.image import get_crop_range, imgify, plot_grid, vis_img_heatmap, vis_opaque_img
 from crp.visualization import FeatureVisualization
-from experiments.models import build_probe, BASES, HEADS
-from experiments.model_io import (
-    DATASETS, SITES, load_probe, select_correct, site_layer_names, backbone_transforms,
+from experiments.models import (
+    MODELS, backbone_transforms, select_correct,
 )
+from experiments.datasets import EVAL_DATASETS, load_eval_dataset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GALLERY_DIR = REPO_ROOT / "webapp" / "crp_gallery"
@@ -107,85 +95,6 @@ app = typer.Typer(add_completion=False, help=__doc__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model + data (reuse experiments.models boilerplate; un-normalized + normalize)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_model(base: str, dataset: str, *, model_source: str, checkpoint: Optional[str],
-               head: str, num_classes: Optional[int], head_kwargs: dict, device: str,
-               ) -> Tuple[torch.nn.Module, int, str, str]:
-    """Build the probe the systematic way (reuses ``experiments.model_io``).
-    Returns ``(model, num_classes, head_name, label)``.
-
-    * ``checkpoint`` source — load a finetuned probe via
-      :func:`model_io.load_probe` (``finetune_<base>_<tag>/<ts>/best.pt`` or an
-      explicit ``--checkpoint`` path); reconstruction uses the saved spec.
-    * ``fresh`` source — ImageNet-pretrained backbone + (untrained) head from the
-      registries, for inspecting raw pretrained features.
-    """
-    if model_source == "dinov3_in1k":
-        # M4: DINOv3-B/16 backbone (img 256, num_classes=0) + the public canvit
-        # ImageNet-1k linear head on the final-norm CLS token, wrapped as ONE
-        # classifier module so CondAttribution / the gallery see a single model
-        # (mirrors experiments/scripts/residual_flow_diag.load_model_for_args).
-        import timm
-        import torch.nn as nn
-        from experiments.scripts.eval_dinov3_in1k_probe import HEAD_REPOS, load_in1k_linear_head
-        timm_name = "vit_base_patch16_dinov3.lvd1689m"
-
-        class _DinoV3CLSFullProbe(nn.Module):
-            """DINOv3 backbone features → final-norm CLS token → linear head."""
-            def __init__(self, backbone: nn.Module, head: nn.Module):
-                super().__init__()
-                self.backbone = backbone
-                self.head = head
-            def forward(self, x):
-                return self.head(self.backbone.forward_features(x)[:, 0])
-
-        backbone = timm.create_model(timm_name, pretrained=True, num_classes=0, img_size=256)
-        head = load_in1k_linear_head(timm_name, device)
-        model = _DinoV3CLSFullProbe(backbone, head).eval().to(device)
-        model.requires_grad_(False)
-        label = f"{base} · canvit_in1k_linear_cls · {dataset}"
-        return model, 1000, "canvit_in1k_linear_cls", label
-    if model_source == "checkpoint":
-        tag = DATASETS[dataset][2]
-        model, ck, _ = load_probe(tag, device, base=base,
-                                  path=Path(checkpoint) if checkpoint else None)
-        label = f"{ck['base']} · {ck['head']} · {dataset}"
-        return model, int(ck["num_classes"]), ck["head"], label
-    if model_source == "fresh":
-        if num_classes is None:
-            raise typer.BadParameter("--num-classes is required for --model-source fresh")
-        model = build_probe(base=base, head=head, num_classes=num_classes,
-                            head_kwargs=head_kwargs).eval().to(device)
-        model.requires_grad_(False)
-        return model, int(num_classes), head, f"{base} · {head} · {dataset} (fresh)"
-    raise typer.BadParameter(f"--model-source must be checkpoint|fresh, got {model_source!r}")
-
-
-def load_eval_dataset(dataset: str, transform, extra_kwargs: Optional[dict] = None):
-    """Un-normalized eval dataset for the given key (reuses the dataset registry).
-    ``extra_kwargs`` is merged into the loader kwargs. ``ImagenetValHFDataset``
-    always loads the FULL 50k val — an ``n_per_class`` / ``classes`` entry for
-    imagenet is applied AFTER construction (``ds.subsample`` / ``filter_classes``,
-    identical pools to the old in-constructor sampling), so experiment scripts
-    keep their recorded pool protocol."""
-    ds_name, ds_kw, _ = DATASETS[dataset]
-    from experiments.datasets import load as load_dataset
-    merged = {**ds_kw, **(extra_kwargs or {})}
-    pool = classes = None
-    if ds_name == "imagenet_val_hf":
-        pool = merged.pop("n_per_class", None)
-        classes = merged.pop("classes", None)
-    ds = load_dataset(ds_name, root=REPO_ROOT / "data", transform=transform, **merged)
-    if classes is not None:
-        ds.items = ds.filter_classes(ds.items, classes)
-    if pool is not None:
-        ds.subsample(pool)
-    return ds
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Concepts / layers / ranking
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -197,12 +106,59 @@ def make_concept(kind: str, num_heads: int):
     raise typer.BadParameter(f"--concept must be one of {CONCEPTS}, got {kind!r}")
 
 
+# Probe-site layer names, written out in full. Every zoo backbone is a 12-block
+# ViT, so these ARE the probed layers — stated explicitly, never derived from
+# the model at runtime (the derivation repeatedly probed layers that did not
+# match the actual architecture). resolve_layers validates every name against
+# the model, so a backbone these don't fit fails at startup, not mid-run.
+# Mirrored in experiments/concept_flipping.py — keep the two copies in sync.
+SITE_LAYERS = {
+    "proj_drop": [
+        "backbone.blocks.0.attn.proj_drop",
+        "backbone.blocks.1.attn.proj_drop",
+        "backbone.blocks.2.attn.proj_drop",
+        "backbone.blocks.3.attn.proj_drop",
+        "backbone.blocks.4.attn.proj_drop",
+        "backbone.blocks.5.attn.proj_drop",
+        "backbone.blocks.6.attn.proj_drop",
+        "backbone.blocks.7.attn.proj_drop",
+        "backbone.blocks.8.attn.proj_drop",
+        "backbone.blocks.9.attn.proj_drop",
+        "backbone.blocks.10.attn.proj_drop",
+        "backbone.blocks.11.attn.proj_drop",
+    ],
+    "residual": [
+        "backbone.blocks.0",
+        "backbone.blocks.1",
+        "backbone.blocks.2",
+        "backbone.blocks.3",
+        "backbone.blocks.4",
+        "backbone.blocks.5",
+        "backbone.blocks.6",
+        "backbone.blocks.7",
+        "backbone.blocks.8",
+        "backbone.blocks.9",
+        "backbone.blocks.10",
+        "backbone.blocks.11",
+    ],
+}
+
+
 def resolve_layers(model, site: str, blocks: List[int]) -> List[Tuple[int, str]]:
-    """``(block, layer_name)`` per requested block at the probe site (canonical
-    site → layer mapping from :func:`model_io.site_layer_names`)."""
-    if site not in SITES:
-        raise typer.BadParameter(f"--site must be one of {SITES}, got {site!r}")
-    names = site_layer_names(model, site)
+    """``(block, layer_name)`` per requested block at the probe site. The names
+    are the explicit :data:`SITE_LAYERS` strings, validated against the model —
+    a name that does not resolve is a hard error (see SITE_LAYERS)."""
+    if site not in SITE_LAYERS:
+        raise typer.BadParameter(
+            f"--site must be one of {tuple(SITE_LAYERS)}, got {site!r}")
+    names = SITE_LAYERS[site]
+    known = set(dict(model.named_modules()))
+    missing = [n for n in names if n not in known]
+    if missing:
+        raise typer.BadParameter(
+            f"site {site!r} names layers this model does not have: {missing}. "
+            f"SITE_LAYERS is written for the 12-block zoo ViTs — extend the "
+            f"list for other architectures.")
     out = []
     for b in blocks:
         if not 0 <= b < len(names):
@@ -917,10 +873,14 @@ def run_spec(spec: dict, device: str) -> None:
     if fv_class not in FV_CLASS_LABELS:
         raise typer.BadParameter(f"--fv-class must be one of {FV_CLASS_LABELS}, got {fv_class!r}")
 
-    model, num_classes, head_name, label = load_model(
-        base, dataset, model_source=spec["model_source"], checkpoint=spec.get("checkpoint"),
-        head=spec.get("head", "linear"), num_classes=spec.get("num_classes"),
-        head_kwargs=spec.get("head_kwargs", {}), device=device)
+    # Model = zoo class keyed by the canonical model tag (experiments/models/zoo.py).
+    model_key = f"{base}_{dataset}"
+    if model_key not in MODELS:
+        raise typer.BadParameter(f"no zoo model {model_key!r}; known: {sorted(MODELS)}")
+    ckpt = spec.get("checkpoint")
+    model = MODELS[model_key](**({"checkpoint": ckpt} if ckpt else {}), device=device)
+    num_classes, head_name = model.num_classes, model.head_name
+    label = f"{base} · {head_name} · {dataset}"
 
     num_heads = model.backbone.blocks[0].attn.num_heads
     transform, normalize = backbone_transforms(model.backbone)
@@ -1074,10 +1034,10 @@ def run_spec(spec: dict, device: str) -> None:
 
 @app.command()
 def compute(
-    base: str = typer.Option("vit_small", "--base", help=f"backbone: {sorted(BASES)}"),
-    dataset: str = typer.Option(..., "--dataset", help=f"dataset key: {sorted(DATASETS)}"),
+    base: str = typer.Option("vit_small", "--base", help="backbone; <base>_<dataset> must be a models.MODELS key"),
+    dataset: str = typer.Option(..., "--dataset", help=f"dataset key: {sorted(EVAL_DATASETS)}"),
     config: str = typer.Option("cp_lrp_baseline", "--config", help=f"composite name: {sorted(COMPOSITES)}"),
-    site: str = typer.Option("proj_drop", "--site", help=f"probe site: {SITES}"),
+    site: str = typer.Option("proj_drop", "--site", help=f"probe site: {tuple(SITE_LAYERS)}"),
     blocks: List[int] = typer.Option(..., "--blocks", help="block indices (repeat the flag)"),
     concept: str = typer.Option("embed_dim", "--concept", help=f"concept kind: {CONCEPTS}"),
     n: int = typer.Option(5, "--n", help="auto top-n most-relevant detectors per layer"),
@@ -1093,26 +1053,20 @@ def compute(
     classes: List[int] = typer.Option([], "--classes", help="restrict ranking to these classes"),
     n_rank: int = typer.Option(8, "--n-rank", help="correct images per class for ranking"),
     fv_end: int = typer.Option(0, "--fv-end", help="cap FV-index samples (0 = full dataset)"),
-    # fresh-model only:
-    model_source: str = typer.Option("checkpoint", "--model-source", help="checkpoint | fresh"),
-    checkpoint: Optional[str] = typer.Option(None, "--checkpoint", help="explicit best.pt path"),
-    head: str = typer.Option("linear", "--head", help=f"(fresh) head: {sorted(HEADS)}"),
-    num_classes: Optional[int] = typer.Option(None, "--num-classes", help="(fresh) classes"),
-    head_kwargs_json: str = typer.Option("{}", "--head-kwargs", help="(fresh) JSON head kwargs"),
+    checkpoint: Optional[str] = typer.Option(None, "--checkpoint", help="explicit best.pt path (finetuned-probe models only)"),
     device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", "--device"),
 ):
     """Compute one (model, dataset, composite, site, blocks, concept) spec, record
     the job, render entries, and rebuild the manifest."""
-    if dataset not in DATASETS:
-        raise typer.BadParameter(f"--dataset must be one of {sorted(DATASETS)}")
+    if dataset not in EVAL_DATASETS:
+        raise typer.BadParameter(f"--dataset must be one of {sorted(EVAL_DATASETS)}")
     spec = {
         "base": base, "dataset": dataset, "config": config, "site": site,
         "blocks": list(blocks), "concept": concept, "n": n, "detectors": list(detectors),
         "n_ref": n_ref, "mode": mode, "plot": plot, "crop": crop, "samples": samples,
         "only_samples": only_samples, "rank": rank, "fv_class": fv_class,
         "classes": list(classes), "n_rank": n_rank, "fv_end": fv_end,
-        "model_source": model_source, "checkpoint": checkpoint, "head": head,
-        "num_classes": num_classes, "head_kwargs": json.loads(head_kwargs_json),
+        "checkpoint": checkpoint,
         "created": _now(),
     }
     run_spec(spec, device)
@@ -1218,7 +1172,7 @@ def sample_xai(
     seen = set()
     uniq = []
     for j in sel:                                    # one job per model (extras are md-level)
-        key = (j["base"], j["dataset"], j.get("model_source"), j.get("checkpoint"))
+        key = (j["base"], j["dataset"], j.get("checkpoint"))
         if key not in seen:
             seen.add(key)
             uniq.append(j)
@@ -1238,4 +1192,5 @@ def manifest():
 
 
 if __name__ == "__main__":
+    matplotlib.use("Agg")  # headless render; importers (notebooks) keep their backend
     app()

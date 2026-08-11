@@ -706,9 +706,9 @@ class TestTimmAttentionSubstitutionCanonizer:
         m = self._make_model()
         from timm.models.vision_transformer import Attention as TimmAttention
         from zennit_extensions.canonisation.canonizers import (
-            TimmAttentionSubstitutionCanonizer,
+            VanillaViTAttentionSubstitutionCanonizer,
         )
-        can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
+        can = VanillaViTAttentionSubstitutionCanonizer(block_indices=(0,))
         instances = can.apply(m)
         try:
             assert len(instances) == 1
@@ -721,9 +721,9 @@ class TestTimmAttentionSubstitutionCanonizer:
     def test_remove_restores_original(self):
         m = self._make_model()
         from timm.models.vision_transformer import Attention as TimmAttention
-        from zennit_extensions.canonisation.canonizers import TimmAttentionSubstitutionCanonizer
+        from zennit_extensions.canonisation.canonizers import VanillaViTAttentionSubstitutionCanonizer
         original = m.blocks[0].attn
-        can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
+        can = VanillaViTAttentionSubstitutionCanonizer(block_indices=(0,))
         instances = can.apply(m)
         for inst in instances:
             inst.remove()
@@ -732,14 +732,14 @@ class TestTimmAttentionSubstitutionCanonizer:
 
     def test_round_trip_forward_parity(self):
         """apply → forward → remove → re-apply → forward: outputs match."""
-        from zennit_extensions.canonisation.canonizers import TimmAttentionSubstitutionCanonizer
+        from zennit_extensions.canonisation.canonizers import VanillaViTAttentionSubstitutionCanonizer
         m = self._make_model()
         torch.manual_seed(0)
         img = torch.randn(1, 3, 224, 224)
         with torch.no_grad():
             y0 = m(img)
 
-        can = TimmAttentionSubstitutionCanonizer(block_indices=(0,))
+        can = VanillaViTAttentionSubstitutionCanonizer(block_indices=(0,))
         instances = can.apply(m)
         with torch.no_grad():
             y1 = m(img)
@@ -761,12 +761,12 @@ class TestTimmAttentionSubstitutionCanonizer:
         """Each substitution canonizer's isinstance filter must skip the
         other backbone's attention class — so both can be bundled into
         one composite without coupling."""
-        from zennit_extensions.canonisation.canonizers import TimmAttentionSubstitutionCanonizer
+        from zennit_extensions.canonisation.canonizers import VanillaViTAttentionSubstitutionCanonizer
         m_eva = timm.create_model(
             "vit_large_patch16_dinov3", pretrained=False, num_classes=10,
         )
         m_eva.eval()
-        can = TimmAttentionSubstitutionCanonizer(block_indices=None)
+        can = VanillaViTAttentionSubstitutionCanonizer(block_indices=None)
         instances = can.apply(m_eva)
         # No standard timm Attention modules → no substitutions.
         assert len(instances) == 0

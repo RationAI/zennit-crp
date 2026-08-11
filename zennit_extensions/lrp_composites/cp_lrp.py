@@ -25,8 +25,8 @@ from zennit_extensions.attention_unfolded import (
 from zennit_extensions.canonisation.canonizers import (
     EvaAttentionSubstitutionCanonizer,
     EvaBlockResidualCanonizer,
-    TimmAttentionSubstitutionCanonizer,
-    TimmBlockResidualCanonizer,
+    VanillaViTAttentionSubstitutionCanonizer,
+    VanillaViTBlockResidualCanonizer,
 )
 from zennit_extensions.cp_lrp import StopGradient
 from zennit_extensions.rules.attnlrp import Uniform
@@ -43,10 +43,10 @@ class CPLRPComposite(LayerMapComposite):
     def __init__(self, *, linear_gamma: float = 0.10, conv_gamma: float = 0.25,
                  epsilon: float = 1e-6, canonizers=None):
         canonizers = list(canonizers or []) + [
-            TimmBlockResidualCanonizer(),
+            VanillaViTBlockResidualCanonizer(),
             EvaBlockResidualCanonizer(layerscale_uniform=True),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
-            TimmAttentionSubstitutionCanonizer(block_indices=None),
+            VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
         ]
         layer_map = [
             (nn.Linear, Gamma(gamma=linear_gamma)),

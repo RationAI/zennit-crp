@@ -151,8 +151,8 @@ def main():
     save(fig, "relocation")
 
     # ── figure 4: examples ───────────────────────────────────────────────────
-    from experiments.crp_gallery import load_eval_dataset, load_model  # noqa: F401
-    from experiments.model_io import backbone_transforms
+    from experiments.datasets import load_eval_dataset
+    from experiments.models import backbone_transforms
     import timm
     tm = timm.create_model("vit_base_patch16_224", pretrained=False)
     transform, _ = backbone_transforms(tm)

@@ -11,8 +11,6 @@ Composable building blocks for the explainability work in this repo:
 * [`train_probe.py`](train_probe.py) — typer CLI with two commands:
   `cache` (one-shot feature extraction) and `train` (head training on
   cached features).
-* [`viz_unfolded.py`](viz_unfolded.py) — plotting helpers used by the
-  walkthrough notebook (concept atlases, conditional cascade).
 * [`funnybirds_part_alignment.py`](funnybirds_part_alignment.py) —
   attribution-on-parts vs background metric, FunnyBirds-only.
 

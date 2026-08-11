@@ -18,8 +18,9 @@ from zennit_extensions.attention_unfolded import (
 )
 from zennit_extensions.canonisation.canonizers import (
     EvaAttentionSubstitutionCanonizer,
-    TimmAttentionSubstitutionCanonizer,
-    TimmViTCanonizer,
+    EvaBlockResidualCanonizer,
+    VanillaViTAttentionSubstitutionCanonizer,
+    VanillaViTBlockResidualCanonizer,
 )
 from zennit_extensions.rules.attnlrp import EpsilonAdd, MatmulAttnLRP, SoftmaxAttnLRP, Uniform
 
@@ -53,10 +54,10 @@ class AttnLRPBaselineComposite(LayerMapComposite):
         self._ffn_gamma = ffn_gamma
         self._epsilon = epsilon
         canonizers = list(canonizers or []) + [
-            TimmViTCanonizer(
-                palrp=False, residual=True, layerscale_uniform=True, epsilon=epsilon),
+            VanillaViTBlockResidualCanonizer(),
+            EvaBlockResidualCanonizer(layerscale_uniform=True),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
-            TimmAttentionSubstitutionCanonizer(block_indices=None),
+            VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
         ]
         layer_map = [
             (BilinearMatmul, MatmulAttnLRP(epsilon=epsilon)),

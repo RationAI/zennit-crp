@@ -26,7 +26,7 @@ Predictions tested (hypothesis H_A):
    ``cp_lrp_baseline`` (metric: concentration ratio = share of total |input R|
    inside outlier patches / their area share).
 
-Model: timm ViT-B/16 ImageNet-1k-pretrained (``model_io.load_probe`` tag
+Model: timm ViT-B/16 ImageNet-1k-pretrained (``experiments.models.ImagenetViTBase``
 ``imagenet``); data: ImageNet val (HF mirror), ``n_per_class=10``; N
 class-diverse correctly-classified images, true-class conditioning.
 
@@ -72,15 +72,14 @@ def _now() -> str:
 def load_model_and_data(device: str):
     """ViT-B/16 ImageNet-pretrained probe + un-normalized ImageNet val subset
     (10 per class), exactly the crp_gallery loading path."""
-    from experiments.model_io import DATASETS, load_probe, backbone_transforms
+    from experiments.models import ImagenetViTBase, backbone_transforms
     from experiments.datasets import load as load_dataset
 
-    model, ck, ck_path = load_probe("imagenet", device, base="vit_base")
+    model = ImagenetViTBase(device=device)
     transform, normalize = backbone_transforms(model.backbone)
-    ds_name, ds_kw, _ = DATASETS["imagenet"]
-    ds = load_dataset(ds_name, root=REPO_ROOT / "data", transform=transform,
-                      **ds_kw).subsample(10)
-    return model, ck, ck_path, ds, normalize
+    ds = load_dataset("imagenet_val_hf", root=REPO_ROOT / "data",
+                      transform=transform).subsample(10)
+    return model, ds, normalize
 
 
 def pick_class_diverse(ds, n: int, seed: int = 0) -> List[int]:
@@ -153,7 +152,7 @@ class StreamNormRecorder:
 def cmd_select(args):
     import torch
     device = args.device
-    model, ck, ck_path, ds, normalize = load_model_and_data(device)
+    model, ds, normalize = load_model_and_data(device)
     cand = pick_class_diverse(ds, args.n_candidates, seed=args.seed)
     keep_idx, keep_y = [], []
     bs = args.batch_size
@@ -172,7 +171,7 @@ def cmd_select(args):
     if len(keep_idx) < args.n_samples:
         raise RuntimeError(f"only {len(keep_idx)} correct of {len(cand)} candidates")
     sel = {"ds_indices": keep_idx, "targets": keep_y, "n_samples": len(keep_idx),
-           "seed": args.seed, "checkpoint": str(ck_path),
+           "seed": args.seed, "checkpoint": str(model.source),
            "note": "class-diverse round-robin candidates, first n correctly classified",
            "generated": _now()}
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -195,7 +194,7 @@ def cmd_flow(args):
     sel = json.loads((OUT_DIR / "selection.json").read_text())
     idxs = sel["ds_indices"][args.start:args.stop]
     ys_all = sel["targets"][args.start:args.stop]
-    model, ck, ck_path, ds, normalize = load_model_and_data(device)
+    model, ds, normalize = load_model_and_data(device)
     n_blocks = len(model.backbone.blocks)
     composite_cls = composites[args.config]
     attribution = CondAttribution(model)
@@ -251,7 +250,7 @@ def cmd_flow(args):
         print(f"  batch {i0 // bs + 1}/{(S + bs - 1) // bs} done", flush=True)
     rec_norm.remove()
 
-    meta = {"config": args.config, "checkpoint": str(ck_path),
+    meta = {"config": args.config, "checkpoint": str(model.source),
             "start": args.start, "stop": args.start + S,
             "n_blocks": n_blocks, "endpoint_identity_err": endpoint_err,
             "composite_desc": (composite_cls.__doc__ or "").strip().splitlines()[0], "generated": _now()}
@@ -401,7 +400,7 @@ def cmd_ablate(args):
     device = args.device
     ab = json.loads((OUT_DIR / "ablate_selection.json").read_text())
     idxs, ys_all = ab["ds_indices"], ab["targets"]
-    model, ck, ck_path, ds, normalize = load_model_and_data(device)
+    model, ds, normalize = load_model_and_data(device)
     composite_cls = composites[args.config]
     attribution = CondAttribution(model)
 

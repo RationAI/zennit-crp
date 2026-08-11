@@ -173,15 +173,15 @@ class TwoSiteNormRecorder:
 
 def cmd_collect(args):
     import torch
-    from experiments.crp_gallery import load_model, load_eval_dataset
-    from experiments.model_io import backbone_transforms
+    from experiments.models import MODELS as MODEL_ZOO, backbone_transforms
+    from experiments.datasets import load_eval_dataset
 
     spec = MODELS[args.model]
     device = args.device
-    model, num_classes, head, label = load_model(
-        spec["base"], spec["dataset"], model_source="checkpoint",
-        checkpoint=spec["checkpoint"], head="linear", num_classes=None,
-        head_kwargs={}, device=device)
+    ckpt = spec["checkpoint"]
+    model = MODEL_ZOO[f"{spec['base']}_{spec['dataset']}"](
+        **({"checkpoint": ckpt} if ckpt else {}), device=device)
+    label = f"{spec['base']} · {model.head_name} · {spec['dataset']}"
     transform, normalize = backbone_transforms(model.backbone)
     ds = load_eval_dataset(spec["dataset"], transform, extra_kwargs=spec["extra"])
 

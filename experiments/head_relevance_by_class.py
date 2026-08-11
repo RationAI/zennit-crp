@@ -43,7 +43,7 @@ from crp.attribution import CondAttribution
 from zennit_extensions import AttnLRPBaselineComposite
 from crp.concepts import HeadConcept
 from experiments.datasets import load as load_dataset
-from experiments.models import build_probe
+from experiments.models import FinetunedProbe
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,19 +57,8 @@ SPLITS = {
 # ── compute ────────────────────────────────────────────────────────────────
 
 def _load_probe(path: Path, device: str):
-    ck = torch.load(path, map_location=device, weights_only=False)
-    model = build_probe(
-        base=ck["base"], head=ck["head"], num_classes=ck["num_classes"],
-        head_kwargs=ck.get("head_kwargs", {}),
-    ).eval().to(device)
-    # full-finetune checkpoints carry the trained backbone too; a frozen
-    # probe checkpoint has only the head. Load whatever is present.
-    if "backbone_state_dict" in ck:
-        model.backbone.load_state_dict(ck["backbone_state_dict"])
-    model.head.load_state_dict(ck["head_state_dict"])
-    for p in model.parameters():
-        p.requires_grad_(False)
-    return model, ck
+    model = FinetunedProbe(checkpoint=path, device=device)
+    return model, model.meta
 
 
 def _select_correct(model, ds, num_classes, n_per_class, device, batch_size=64):

@@ -91,11 +91,9 @@ app = typer.Typer(add_completion=False, help=__doc__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_model_ds(device: str):
-    from experiments.crp_gallery import load_model, load_eval_dataset
-    from experiments.model_io import backbone_transforms
-    model, _, _, _ = load_model(
-        "vit_base", "imagenet", model_source="checkpoint", checkpoint=None,
-        head="linear", num_classes=None, head_kwargs={}, device=device)
+    from experiments.models import ImagenetViTBase, backbone_transforms
+    from experiments.datasets import load_eval_dataset
+    model = ImagenetViTBase(device=device)
     transform, normalize = backbone_transforms(model.backbone)
     ds = load_eval_dataset("imagenet", transform, {"n_per_class": 10})
     return model, normalize, ds
@@ -104,10 +102,9 @@ def _load_model_ds(device: str):
 def _load_ds_only():
     """Dataset without instantiating the model on GPU (analyze stage)."""
     import timm
-    from experiments.model_io import IMAGENET_TIMM
-    from experiments.models import backbone_transforms
-    from experiments.crp_gallery import load_eval_dataset
-    tm = timm.create_model(IMAGENET_TIMM, pretrained=True, num_classes=1000)
+    from experiments.models import ImagenetViTBase, backbone_transforms
+    from experiments.datasets import load_eval_dataset
+    tm = timm.create_model(ImagenetViTBase.TIMM_NAME, pretrained=True, num_classes=1000)
     transform, _ = backbone_transforms(tm)
     return load_eval_dataset("imagenet", transform, {"n_per_class": 10})
 

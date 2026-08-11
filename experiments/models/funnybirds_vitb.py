@@ -16,8 +16,7 @@ the Chefer ViT (``models/ViT/ViT_new.py``) whose ``state_dict`` layout is
 missing / extra keys against ``timm.create_model('vit_base_patch16_224',
 num_classes=50)``), so we load it straight into a stock timm ViT-B/16 — which also
 lets the AttnLRP composite (type-based, timm-module-path aware) operate on it
-unchanged, exactly like the ``imagenet`` full-timm model in
-:mod:`experiments.model_io`.
+unchanged, exactly like :class:`experiments.models.ImagenetViTBase`.
 
 Preprocessing (their pipeline, reproduced faithfully)
 -----------------------------------------------------
@@ -57,7 +56,7 @@ class FunnyBirdsViTB(nn.Module):
 
     Exposes the full timm classifier under ``self.backbone`` (so
     ``backbone.blocks.{i}`` attribution layer-names and site modules resolve,
-    identical to :class:`experiments.model_io._TimmFullProbe`), and a ``forward``
+    identical to :class:`experiments.models.ImagenetViTBase`), and a ``forward``
     that returns 50-way class logits directly after downscaling the input to
     224×224 — reproducing the authors' ``ViTModel`` wrapper.
     """

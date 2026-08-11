@@ -131,7 +131,7 @@ def cmd_collect(args):
 
 def cmd_diagnose(args):
     import torch
-    from experiments.crp_gallery import load_eval_dataset
+    from experiments.datasets import load_eval_dataset
     from experiments.models import backbone_transforms
 
     indices = [int(i) for i in

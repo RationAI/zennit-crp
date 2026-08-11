@@ -19,36 +19,14 @@ from pathlib import Path
 
 import timm
 import torch
-import torch.nn as nn
 import typer
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from experiments.datasets import ImagenetValHFDataset
+from experiments.models import DINOV3_IN1K_HEAD_REPOS, load_dinov3_in1k_head
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-
-HEAD_REPOS = {
-    "vit_base_patch16_dinov3.lvd1689m":
-        "canvit/dinov3-vitb16-lvd1689m-in1k-512x512-linear-clf-probe",
-    "vit_small_patch16_dinov3.lvd1689m":
-        "canvit/dinov3-vits16-lvd1689m-in1k-512x512-linear-clf-probe",
-    "vit_large_patch16_dinov3.lvd1689m":
-        "canvit/dinov3-vitl16-lvd1689m-in1k-512x512-linear-clf-probe",
-}
-
-
-def load_in1k_linear_head(timm_name: str, device: str = "cpu") -> nn.Linear:
-    """Download the matching canvit IN1k linear head (cls-token -> 1000
-    logits) and return it as a frozen ``nn.Linear``."""
-    repo = HEAD_REPOS[timm_name]
-    sd = load_file(hf_hub_download(repo, "model.safetensors"))
-    head = nn.Linear(sd["weight"].shape[1], sd["weight"].shape[0])
-    head.load_state_dict(sd)
-    head.requires_grad_(False)
-    return head.eval().to(device)
 
 
 def main(
@@ -63,7 +41,7 @@ def main(
                                  img_size=image_size)
     backbone.requires_grad_(False)
     backbone = backbone.eval().to(device)
-    head = load_in1k_linear_head(timm_name, device)
+    head = load_dinov3_in1k_head(timm_name, device)
 
     cfg = backbone.pretrained_cfg
     tf = transforms.Compose([
@@ -94,7 +72,7 @@ def main(
             n += len(y)
             if n % 1024 < batch_size:
                 print(f"  {n} imgs: top1 {top1/n:.4f} top5 {top5/n:.4f}", flush=True)
-    print(f"\n{timm_name} + {HEAD_REPOS[timm_name]}")
+    print(f"\n{timm_name} + {DINOV3_IN1K_HEAD_REPOS[timm_name]}")
     print(f"image_size={image_size} n={n}  top1={top1/n:.4f}  top5={top5/n:.4f}")
 
 

@@ -46,7 +46,7 @@ from experiments.datasets import FunnyBirdsDataset
 from experiments.datasets.funny_birds import (
     PART_COLORS_TO_NAME, BACKGROUND_COLOR,
 )
-from experiments.models import build_probe
+from experiments.models import FinetunedProbe
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,17 +83,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}")
-    ckpt = torch.load(args.probe, map_location=device, weights_only=False)
-    print(f"probe: {args.probe}  (val_acc={ckpt.get('val_acc', '?')})")
-
-    model = build_probe(
-        base=ckpt["base"], head=ckpt["head"],
-        num_classes=ckpt["num_classes"],
-        head_kwargs=ckpt.get("head_kwargs", {}),
-    ).eval().to(device)
-    model.head.load_state_dict(ckpt["head_state_dict"])
-    for p_ in model.parameters():
-        p_.requires_grad_(False)
+    model = FinetunedProbe(checkpoint=args.probe, device=device)
+    print(f"probe: {args.probe}  (val_acc={model.meta.get('val_acc', '?')})")
 
     cfg = resolve_data_config({}, model=model.backbone)
     transform = create_transform(**cfg, is_training=False)

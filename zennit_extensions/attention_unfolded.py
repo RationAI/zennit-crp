@@ -77,11 +77,11 @@ class ResidualAdd(nn.Module):
         return x + branch
 
 
-class PosEmbedAdd(ResidualAdd):
-    """Alias of :class:`ResidualAdd` kept as a distinct dispatch type only so
-    the ``x + pos_embed`` merge can take its own ``layer_map`` rule (the PA-LRP
-    uniform ½ split). Order it BEFORE ``ResidualAdd`` in a map (zennit matches
-    by ``isinstance``, first hit wins)."""
+class PosEmbedAdd(nn.Module):
+    """``y = x + pos_embed`` — positional-embedding merge"""
+
+    def forward(self, x: torch.Tensor, pos_embed: torch.Tensor) -> torch.Tensor:
+        return x + pos_embed
 
 
 class SoftmaxAlongLastDim(nn.Module):

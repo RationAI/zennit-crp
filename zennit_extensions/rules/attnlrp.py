@@ -3,8 +3,9 @@ from zennit.core import Hook, stabilize
 
 class Uniform(Hook):
     """Uniform allocation rule (Eq. 14): divide the incoming relevance equally,
-    ``grad_input / factor``. ``factor=2`` is the per-bilinear default (e.g. the
-    LayerScale γ multiply or the ``x + pos_embed`` add).
+    ``grad_input / factor``. ``factor=2`` is the per-bilinear default (the
+    LayerScale γ multiply; the RoPE rotation mixing, PA-LRP opt-in via
+    :class:`~zennit_extensions.rules.palrp.RotaryRopeSink`).
 
     Sourced from 'AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for
     Transformers', https://proceedings.mlr.press/v235/achtibat24a.html

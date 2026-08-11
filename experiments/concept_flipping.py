@@ -51,22 +51,13 @@ import torch.nn as nn
 import typer
 from timm.data import resolve_data_config, create_transform
 
-from zennit_extensions.lrp_composites import (
-    AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite,
-)
-
-# The composites this experiment uses, tracked explicitly by name. Gathered
-# data references these name strings only; the definitions live in
-# zennit_extensions.lrp_composites and their provenance in the experiment journal.
-COMPOSITES = {
-    "cp_lrp_baseline": CPLRPComposite,
-    "attnlrp_baseline": AttnLRPBaselineComposite,
-    "chefer_lrp": CheferLRPComposite,
-}
+from zennit_extensions.lrp_composites import COMPOSITES
 from crp.attribution import CondAttribution
 from crp.concepts import HeadConcept, EmbeddingDimConcept
-# Model + data loading is shared in experiments.model_io; re-exported here so
-from experiments.model_io import site_modules, DATASETS, load_probe, select_correct, site_layer_names
+from experiments.models import (
+    DEFAULT_MODELS, MODELS, select_correct,
+)
+from experiments.datasets import EVAL_DATASETS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = REPO_ROOT / "data" / "results" / "concept_flipping"
@@ -84,8 +75,7 @@ ORDERINGS = ("most", "least")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# General, reusable building blocks  (load_probe / select_correct / DATASETS are
-# imported from experiments.model_io and re-exported above.)
+# General, reusable building blocks
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _subsample_grid(n_det: int, max_steps: Optional[int]) -> List[int]:
@@ -182,14 +172,61 @@ def forward_prob(model, x, c: int, hooks, masks: torch.Tensor, method_t: torch.T
     return pp
 
 
+# Probe-site layer names, written out in full. Every zoo backbone is a 12-block
+# ViT, so these ARE the probed layers — stated explicitly, never derived from
+# the model at runtime (the derivation repeatedly probed layers that did not
+# match the actual architecture). setup_sites validates every name against the
+# model, so a backbone these don't fit fails at startup, not mid-run.
+# Mirrored in experiments/crp_gallery.py — keep the two copies in sync.
+SITE_LAYERS = {
+    "proj_drop": [
+        "backbone.blocks.0.attn.proj_drop",
+        "backbone.blocks.1.attn.proj_drop",
+        "backbone.blocks.2.attn.proj_drop",
+        "backbone.blocks.3.attn.proj_drop",
+        "backbone.blocks.4.attn.proj_drop",
+        "backbone.blocks.5.attn.proj_drop",
+        "backbone.blocks.6.attn.proj_drop",
+        "backbone.blocks.7.attn.proj_drop",
+        "backbone.blocks.8.attn.proj_drop",
+        "backbone.blocks.9.attn.proj_drop",
+        "backbone.blocks.10.attn.proj_drop",
+        "backbone.blocks.11.attn.proj_drop",
+    ],
+    "residual": [
+        "backbone.blocks.0",
+        "backbone.blocks.1",
+        "backbone.blocks.2",
+        "backbone.blocks.3",
+        "backbone.blocks.4",
+        "backbone.blocks.5",
+        "backbone.blocks.6",
+        "backbone.blocks.7",
+        "backbone.blocks.8",
+        "backbone.blocks.9",
+        "backbone.blocks.10",
+        "backbone.blocks.11",
+    ],
+}
+
+
 def setup_sites(model, site: str, concept_name: str, dataset_key: str, device,
                 ) -> Tuple[List[str], List[nn.Module], int, Optional[List[float]]]:
     """Resolve the probe site into the pieces ``run_dataset`` needs, per block:
-    record-layer names, hook modules, and the feature dimension (``embed_dim``).
-    The trailing ``None`` keeps the (record_layers, hook_mods, feat_dim, fvu)
-    return shape stable."""
-    return (site_layer_names(model, site), site_modules(model, site),
-            model.backbone.embed_dim, None)
+    record-layer names (the explicit :data:`SITE_LAYERS` strings), their hook
+    modules, and the feature dimension (``embed_dim``). The trailing ``None``
+    keeps the (record_layers, hook_mods, feat_dim, fvu) return shape stable."""
+    if site not in SITE_LAYERS:
+        raise ValueError(f"unknown site {site!r}; pick from {tuple(SITE_LAYERS)}")
+    names = list(SITE_LAYERS[site])
+    try:
+        mods = [model.get_submodule(n) for n in names]
+    except AttributeError as e:
+        raise ValueError(
+            f"site {site!r} names layers this model does not have: {e}. "
+            f"SITE_LAYERS is written for the 12-block zoo ViTs — extend the "
+            f"list for other architectures.") from e
+    return names, mods, model.backbone.embed_dim, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -210,7 +247,7 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
 
     # ── Stage 1 · model, dataset, relevance composite, concept detectors ──────
     # Read geometry before wiring the probe sites.
-    model, ck, probe_path = load_probe(DATASETS[key][2], device)
+    model = MODELS[DEFAULT_MODELS[key]](device=device)
     num_heads = model.backbone.blocks[0].attn.num_heads
     embed_dim = model.backbone.embed_dim
     n_blocks = len(model.backbone.blocks)
@@ -223,14 +260,14 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
     grid_rows = np.asarray(n_grid, dtype=np.int64) - 1            # rows into the
     grid_rows_t = torch.as_tensor(grid_rows, device=device)      # full cumulative arrays
 
-    ds_name, ds_kw, _ = DATASETS[key]
+    ds_name, ds_kw = EVAL_DATASETS[key]
     transform = create_transform(**resolve_data_config({}, model=model.backbone), is_training=False)
     from experiments.datasets import load as load_dataset
     ds = load_dataset(ds_name, root=REPO_ROOT / "data", transform=transform, **ds_kw)
 
     # ── Stage 2 · pick N correctly-classified images per (chosen) class ───────
-    target_classes = sorted(set(classes) & set(range(int(ck["num_classes"])))) if classes \
-        else list(range(int(ck["num_classes"])))
+    target_classes = sorted(set(classes) & set(range(model.num_classes))) if classes \
+        else list(range(model.num_classes))
     # Cap the scan: an unfillable class would otherwise crawl the whole dataset (esp. dSprites,
     # 737k imgs — ~20 min of decoding). 30k is
     # ample to fill healthy classes; unfillable ones return partial (handled below).
@@ -343,7 +380,7 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
     out_path = OUT_DIR / f"flipping_{config_name}_{concept_name}_{site}_{key}.parquet"
     df.write_parquet(out_path)
     print(f"[{config_name}/{key}/{concept_name}/{site}] wrote {len(df)} rows → {out_path}")
-    return out_path, dict(probe=str(probe_path), config=config_name, site=site,
+    return out_path, dict(probe=str(model.source), config=config_name, site=site,
                           concept=concept_name, feat_dim=int(feat_dim),
                           n_detectors=int(D.shape[0]), n_blocks=n_blocks, n_grid=n_grid,
                           counts=counts)
@@ -358,7 +395,7 @@ app = typer.Typer(add_completion=False, pretty_exceptions_show_locals=False)
 
 @app.command()
 def main(
-    datasets: List[str] = typer.Option(list(DATASETS), "--datasets", help="dataset keys"),
+    datasets: List[str] = typer.Option(list(EVAL_DATASETS), "--datasets", help="dataset keys"),
     config: List[str] = typer.Option(["cp_lrp_baseline"], "--config",
                                      help=f"LRP recipe(s): {sorted(COMPOSITES)}"),
     concept: List[str] = typer.Option(["head"], "--concept", help="head | embed_dim"),
