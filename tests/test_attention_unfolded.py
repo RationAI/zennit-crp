@@ -29,7 +29,6 @@ import torch.nn.functional as F
 
 from zennit_extensions.attention_unfolded import EvaAttentionUnfolded, TimmAttentionUnfolded
 from zennit_extensions.canonisation.canonizers import EvaAttentionSubstitutionCanonizer
-from zennit_extensions.rules.attnlrp import Uniform
 from zennit_extensions.rules.bajger_contrib import AlphaBetaMatmul
 from zennit_extensions.rules.residuals_otsuki2024 import ResidualRatio
 
@@ -42,6 +41,7 @@ from zennit_extensions import (
     BilinearMatmul,
     ChunkAlongLastDim,
     LayerScaleMul,
+    PosEmbedAdd,
     ReshapeMergeHeads,
     ResidualAdd,
     RotaryEmbedding,
@@ -381,18 +381,18 @@ class TestLayerScaleMul:
         y.backward(R_y)
         assert torch.allclose(x.grad, R_y * gamma)
 
-    def test_uniform_canonizer_halves_relevance(self):
+    def test_pass_rule_forwards_relevance_unchanged(self):
         gamma = nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
         x = torch.randn(2, 4, 3, requires_grad=True)
         m = LayerScaleMul(gamma)
-        instances = _apply_hook(Uniform(factor=2), m)
+        instances = _apply_hook(Pass(), m)
         try:
             y = m(x)
             R_y = torch.randn_like(y)
             y.backward(R_y)
-            # Uniform rule: divide upstream R by 2 BEFORE bare-grad
-            # propagation, so x.grad = (R_y / 2) * gamma.
-            assert torch.allclose(x.grad, (R_y / 2) * gamma)
+            # γ-multiply is a bias-free elementwise linear op: identity
+            # attribution, γ transparent.
+            assert torch.allclose(x.grad, R_y)
         finally:
             for inst in instances:
                 inst.remove()
@@ -770,3 +770,242 @@ class TestTimmAttentionSubstitutionCanonizer:
         instances = can.apply(m_eva)
         # No standard timm Attention modules → no substitutions.
         assert len(instances) == 0
+
+
+# ─── 12. PA-LRP positional-sink rules (Bakish et al., arXiv:2506.02138) ────
+
+
+class TestPALRPRules:
+    """Equation-named tests for the PA-LRP positional-sink rules
+    (:class:`PosEmbedSink` Eq. 5; :class:`RotaryRopeSink` Eq. 10) and the
+    structural canonizer that exposes the input-level PE merge."""
+
+    @pytest.fixture
+    def pe_add_batch(self):
+        """B=2 (embedded, positional, rel_z) tensors for Eq. 5 checks."""
+        torch.manual_seed(0)
+        embedded = torch.randn(2, 7, 16, requires_grad=False)
+        positional = torch.randn(1, 7, 16, requires_grad=False)   # broadcast
+        rel_z = torch.randn(2, 7, 16)
+        return embedded, positional, rel_z
+
+    def test_eq5_pos_embed_sink(self, pe_add_batch):
+        """Eq. 5: R(P) = P·R(z)/(z+ε), R(E) = E·R(z)/(z+ε); sink stashed
+        per-sample; returned pos-side grad batch-summed (broadcast contract);
+        per-sample conservation R(E)+R(P)=R(z)."""
+        from zennit_extensions.rules.palrp import PosEmbedSink
+
+        embedded, positional, rel_z = pe_add_batch
+        eps = 1e-6
+        m = PosEmbedAdd()
+        instances = _apply_hook(PosEmbedSink(epsilon=eps), m)
+        try:
+            e = embedded.detach().clone().requires_grad_(True)
+            p = positional.detach().clone().requires_grad_(True)
+            z = m(e, p)
+            z.backward(rel_z)
+            denom = (e.detach() + p.detach()) + eps
+            expected_rel_E = e.detach() * rel_z / denom
+            expected_rel_P = p.detach() * rel_z / denom   # broadcast -> (2,7,16)
+            # returned grads
+            assert torch.allclose(e.grad, expected_rel_E, atol=1e-5)
+            assert torch.allclose(p.grad, expected_rel_P.sum(0, keepdim=True), atol=1e-5)
+            # stash is per-sample, batch dim preserved (Eq. 4 input space)
+            assert m._palrp_sink.shape == (2, 7, 16)
+            assert torch.allclose(m._palrp_sink, expected_rel_P.detach(), atol=1e-5)
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_eq5_pos_embed_sink_batched(self):
+        """B=2 keeps the batch dim in the stash; returned pos-side grad is
+        the per-position batch sum (1, N, D)."""
+        from zennit_extensions.rules.palrp import PosEmbedSink
+
+        torch.manual_seed(1)
+        embedded = torch.randn(2, 5, 8)
+        positional = torch.randn(1, 5, 8)
+        rel_z = torch.randn(2, 5, 8)
+        m = PosEmbedAdd()
+        instances = _apply_hook(PosEmbedSink(), m)
+        try:
+            e = embedded.detach().clone().requires_grad_(True)
+            p = positional.detach().clone().requires_grad_(True)
+            m(e, p).backward(rel_z)
+            assert m._palrp_sink.shape == (2, 5, 8)               # per-sample
+            assert p.grad.shape == (1, 5, 8)                     # batch-summed
+            assert e.grad.shape == (2, 5, 8)                     # unchanged
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_eq10_rotary_rope_sink_halves(self):
+        """Eq. 10 / Lemma 3.2: sink = ½ of output-side per-sample relevance
+        on rotated rows; EXACT zeros on prefix rows; prefix rows' grad_q
+        unmodified; rotated rows carry the ε-contribution share
+        ``q ⊙ Jᵀ(R/(2·(q̃+ε)))`` (reference-implementation semantics);
+        batch dim preserved; rope=None ⇒ identity (unmodified grads, sink
+        None)."""
+        from timm.layers import apply_rot_embed_cat
+        from zennit.core import stabilize
+        from zennit_extensions.rules.palrp import RotaryRopeSink
+
+        B, H, N, Dh = 2, 1, 10, 8
+        npt = 3
+        eps = 1e-6
+        torch.manual_seed(2)
+        q = torch.randn(B, H, N, Dh, requires_grad=True)
+        rope = torch.randn(N - npt, 2 * Dh, requires_grad=True)   # rotated slice only
+        m = RotaryEmbedding(num_prefix_tokens=npt, detach_rope=False)
+        instances = _apply_hook(RotaryRopeSink(epsilon=eps), m)
+        try:
+            y = m(q, rope)
+            rel_out = torch.randn_like(y)
+            y.backward(rel_out)
+            # sink shape preserved, batched; prefix rows zero, rotated rows = ½ R(out)
+            assert m._palrp_sink.shape == (B, H, N, Dh)
+            assert torch.all(m._palrp_sink[..., :npt, :] == 0)
+            assert torch.allclose(m._palrp_sink[..., npt:, :], rel_out[..., npt:, :] / 2, atol=1e-6)
+            # grad_q: prefix rows pass through unchanged (identity via cat)
+            assert torch.allclose(q.grad[..., :npt, :], rel_out[..., :npt, :], atol=1e-6)
+            # rotated rows: ε-contribution rule q ⊙ Jᵀ(R/(2·(q̃+ε)))
+            q_rot = q.detach()[..., npt:, :].clone().requires_grad_(True)
+            y_rot = apply_rot_embed_cat(q_rot, rope.detach(), half=False)
+            s = rel_out[..., npt:, :] / stabilize(2.0 * y_rot.detach(), eps)
+            (vjp,) = torch.autograd.grad(y_rot, q_rot, grad_outputs=s)
+            expected = q_rot.detach() * vjp
+            assert torch.allclose(q.grad[..., npt:, :], expected, atol=1e-6)
+            # rope side: relevance-weighted share rope ⊙ Jᵀ_rope(s)
+            assert rope.grad is not None and rope.grad.shape == rope.shape
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_eq10_per_token_conservation(self):
+        """Lemma 3.2: per token, ``stash + R(q) = R(q̃)`` up to the ε
+        stabiliser — the sink absorbs exactly half and the ε-contribution
+        share returns the other half (a halved vanilla gradient would
+        backward-rotate the relevance and break this)."""
+        from zennit_extensions.rules.palrp import RotaryRopeSink
+
+        B, H, N, Dh = 1, 2, 6, 8
+        torch.manual_seed(5)
+        q = torch.randn(B, H, N, Dh, requires_grad=True)
+        rope = torch.randn(N, 2 * Dh)
+        m = RotaryEmbedding(num_prefix_tokens=0, detach_rope=False)
+        instances = _apply_hook(RotaryRopeSink(epsilon=1e-9), m)
+        try:
+            y = m(q, rope)
+            rel_out = torch.randn_like(y)
+            y.backward(rel_out)
+            per_token_in = (m._palrp_sink + q.grad).sum(dim=-1)
+            per_token_out = rel_out.sum(dim=-1)
+            assert torch.allclose(per_token_in, per_token_out, atol=1e-4)
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_rotary_rope_sink_identity_when_rope_none(self):
+        """rope=None ⇒ pass-through: grads unmodified, sink None."""
+        from zennit_extensions.rules.palrp import RotaryRopeSink
+
+        torch.manual_seed(3)
+        q = torch.randn(1, 2, 10, 8, requires_grad=True)
+        m = RotaryEmbedding(num_prefix_tokens=0, detach_rope=False)
+        instances = _apply_hook(RotaryRopeSink(), m)
+        try:
+            y = m(q, None)
+            assert torch.equal(y, q)                       # identity forward
+            rel_out = torch.randn_like(y)
+            y.backward(rel_out)
+            assert torch.allclose(q.grad, rel_out)        # unmodified
+            assert m._palrp_sink is None
+        finally:
+            for inst in instances:
+                inst.remove()
+
+    def test_pos_embed_canonizer_forward_parity(self):
+        """Canonized ``_pos_embed`` forward is bit-identical to stock timm
+        on a vanilla ViT; PosEmbedAdd submodule installed; remove() restores
+        the original method and deletes the attr."""
+        from zennit_extensions.canonisation.canonizers import VanillaViTPosEmbedCanonizer
+
+        m = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=10).eval()
+        torch.manual_seed(0)
+        x = torch.randn(1, 3, 224, 224)
+        with torch.no_grad():
+            y_stock = m._pos_embed(m.patch_embed(x))
+        original_method = type(m)._pos_embed
+        can = VanillaViTPosEmbedCanonizer()
+        instances = can.apply(m)
+        try:
+            assert hasattr(m, "pos_embed_add")
+            assert isinstance(m.pos_embed_add, PosEmbedAdd)
+            with torch.no_grad():
+                y_canon = m._pos_embed(m.patch_embed(x))
+            assert torch.equal(y_stock, y_canon)
+            # full-model forward parity too
+            m2 = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=10).eval()
+            m2.load_state_dict(m.state_dict())
+            with torch.no_grad():
+                assert torch.equal(m(x), m2(x))
+        finally:
+            for inst in instances:
+                inst.remove()
+        assert not hasattr(m, "pos_embed_add")
+        assert type(m)._pos_embed is original_method
+
+    def test_default_composite_identity_with_pos_embed_canonizer(self):
+        """Default recipe with the pos-embed canonizer (PosEmbedAdd installed
+        but UNmapped) is byte-identical to the same composite with the
+        canonizer removed — i.e. structure by default, rule by opt-in."""
+        from zennit_extensions.lrp_composites import COMPOSITES
+        from zennit_extensions.canonisation.canonizers import VanillaViTPosEmbedCanonizer
+        from crp.attribution import CondAttribution
+
+        m = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=10).eval()
+        attr = CondAttribution(m)
+        torch.manual_seed(0)
+        x = torch.randn(1, 3, 224, 224).requires_grad_(True)
+
+        comp_full = COMPOSITES["attnlrp_baseline"]()
+        with comp_full.context(m):
+            out_full = attr(x.detach().clone().requires_grad_(True), [{"y": [1]}], comp_full)
+            hm_full = out_full.heatmap.detach().clone()
+
+        comp_no = COMPOSITES["attnlrp_baseline"]()
+        comp_no.canonizers = [c for c in comp_no.canonizers
+                               if not isinstance(c, VanillaViTPosEmbedCanonizer)]
+        with comp_no.context(m):
+            out_no = attr(x.detach().clone().requires_grad_(True), [{"y": [1]}], comp_no)
+            hm_no = out_no.heatmap.detach().clone()
+
+        assert torch.equal(hm_full, hm_no)
+
+    def test_lemma31_conservation_restored_by_sink(self):
+        """Lemma 3.1: ignoring PE relevance violates conservation; with
+        :class:`PosEmbedSink` the stashed ``R(P)`` plus the token-stream
+        ``R(E)`` equals the relevance arriving at the add output (per
+        element, up to ε) — conservation is restored by the sink."""
+        from zennit_extensions.rules.palrp import PosEmbedSink
+
+        torch.manual_seed(4)
+        embedded = torch.randn(2, 7, 16)
+        positional = torch.randn(1, 7, 16)
+        rel_z = torch.randn(2, 7, 16)
+        m = PosEmbedAdd()
+        instances = _apply_hook(PosEmbedSink(epsilon=1e-9), m)
+        try:
+            e = embedded.detach().clone().requires_grad_(True)
+            p = positional.detach().clone().requires_grad_(True)
+            m(e, p).backward(rel_z)
+            # R(E) + R(P) (per-sample, full broadcast) == R(z)  (Eq. 5 conserves)
+            denom = (e.detach() + p.detach()) + 1e-9
+            rel_E = e.detach() * rel_z / denom
+            rel_P = p.detach() * rel_z / denom
+            assert torch.allclose(rel_E + rel_P, rel_z, atol=1e-4)
+            # the sink IS R(P) per sample — the previously-discarded share
+            assert torch.allclose(m._palrp_sink, rel_P.detach(), atol=1e-5)
+        finally:
+            for inst in instances:
+                inst.remove()

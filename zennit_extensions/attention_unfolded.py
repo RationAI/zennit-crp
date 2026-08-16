@@ -22,16 +22,19 @@ from __future__ import annotations
 
 from typing import Optional, Tuple
 
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from timm.layers import apply_rot_embed_cat
+from timm.layers.attention import resolve_self_attn_mask
 
 
 __all__ = [
     "AddBias", "BilinearMatmul", "ChunkAlongLastDim", "EvaAttentionUnfolded",
-    "KInspectionLayer", "LRPInspectionLayer", "LayerScaleMul", "PosEmbedAdd",
+    "FFNLinear", "KInspectionLayer", "LRPInspectionLayer", "LayerNormDetachedStd",
+    "LayerScaleMul", "PosEmbedAdd",
     "QInspectionLayer", "ReshapeMergeHeads", "ResidualAdd", "RotaryEmbedding",
     "ScaleByConstant", "SoftmaxAlongLastDim", "TimmAttentionUnfolded",
     "VInspectionLayer",
@@ -67,8 +70,8 @@ class ResidualAdd(nn.Module):
 
     The residual *rule* is a ``layer_map`` choice on this one type:
     :class:`~zennit_extensions.rules.residuals_otsuki2024.ResidualRatio`
-    (``|x|``/``|branch|`` split), :class:`~zennit_extensions.rules.attnlrp.Uniform`
-    (½ each), or :class:`~zennit_extensions.rules.bajger_contrib.ResidualL1`
+    (``|x|``/``|branch|`` split), :class:`~zennit_extensions.rules.attnlrp.EpsilonAdd`
+    (signed proportional split), or :class:`~zennit_extensions.rules.bajger_contrib.ResidualL1`
     (sign-preserving). Unmapped = plain (non-conservative) add. Do NOT create
     a module type per rule — one module, many selectable rules.
     """
@@ -187,10 +190,34 @@ class ReshapeMergeHeads(nn.Module):
         return f"out_dim={self.out_dim}"
 
 
+class FFNLinear(nn.Linear):
+    """Marker alias for ``nn.Linear`` layers inside an FFN/MLP block —
+    identical forward, distinct type, so a composite ``layer_map`` can give
+    FFN linears a different rule (paper Table B.5: FFN → γ-LRP) while every
+    other linear (qkv/proj/head) keeps the ε default. Installed by
+    :class:`~zennit_extensions.canonisation.canonizers.FFNLinearSubstitutionCanonizer`.
+
+    Since ``isinstance(FFNLinear(), nn.Linear)`` is True, list the
+    ``FFNLinear`` entry BEFORE the ``nn.Linear`` entry in a ``layer_map``.
+    """
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear) -> "FFNLinear":
+        # reference the original parameters without copying, so checkpoint
+        # loading through the original module still flows
+        alias = cls.__new__(cls)
+        nn.Module.__init__(alias)
+        alias.in_features = linear.in_features
+        alias.out_features = linear.out_features
+        alias.weight = linear.weight
+        alias.bias = linear.bias
+        return alias
+
+
 class LayerScaleMul(nn.Module):
-    """``y = γ * x`` (CaiT LayerScale). For the AttnLRP uniform rule on
-    backward (γ absorbs half the relevance), assign
-    :class:`~zennit_extensions.rules.attnlrp.Uniform` via the ``layer_map``.
+    """``y = γ * x`` (CaiT LayerScale). A bias-free elementwise linear op:
+    its ε-attribution ``R·|y|/(|y|+ε) ≈ R`` collapses to the identity, so
+    assign zennit's stock ``Pass`` rule via the ``layer_map``.
 
     Parameters
     ----------
@@ -207,12 +234,47 @@ class LayerScaleMul(nn.Module):
         return self.gamma * x
 
 
+class LayerNormDetachedStd(nn.Module):
+    """``nn.LayerNorm`` with the std factor detached from the autograd graph:
+    identity rule on ``x/σ`` (AttnLRP Prop. 3.4), while the remaining
+    ``(x − mean)·γ/σ + β`` is linear in x. 
+    The detached std factor does not affect the relevance flow.
+    Recommended to then be attributed by epsilon rule in AttnLRP.
+
+    Parameters
+    ----------
+    original : nn.LayerNorm
+        The stock layer whose ``weight``/``bias`` tensors are referenced
+        without copying, so checkpoint loading through the parent still flows.
+    """
+
+    def __init__(self, original: nn.LayerNorm):
+        super().__init__()
+        self.normalized_shape = tuple(original.normalized_shape)
+        self.eps = original.eps
+        self.weight = original.weight
+        self.bias = original.bias
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dims = tuple(range(-len(self.normalized_shape), 0))
+        mean = x.mean(dim=dims, keepdim=True)
+        var = ((x - mean) ** 2).mean(dim=dims, keepdim=True)
+        y = (x - mean) / (var + self.eps).sqrt().detach()
+        if self.weight is not None:
+            y = y * self.weight
+        if self.bias is not None:
+            y = y + self.bias
+        return y
+
+    def extra_repr(self) -> str:
+        return f"normalized_shape={self.normalized_shape}, eps={self.eps}"
+
+
 class LRPInspectionLayer(nn.Identity):
     """Named ``nn.Identity`` marking a hookable relevance-inspection site —
     named so graphviz renders it and ``get_layer_names(model,
-    [LRPInspectionLayer])`` can enumerate probe sites. The Q/K/V subclasses
-    let a ``layer_map`` target roles independently while
-    ``isinstance(m, LRPInspectionLayer)`` still enumerates all three."""
+    [LRPInspectionLayer])`` can enumerate probe sites.
+    """
     pass
 
 
@@ -374,7 +436,7 @@ class EvaAttentionUnfolded(nn.Module):
 
     def __init__(
         self,
-        orig,  # timm.models.eva.EvaAttention
+        orig: timm.models.eva.EvaAttention,
         *,
         rope_detach: bool = False,
     ):
@@ -396,23 +458,23 @@ class EvaAttentionUnfolded(nn.Module):
             )
 
         # Cache shape constants from the original module.
-        self.num_heads = int(orig.num_heads)
-        self.head_dim = int(orig.head_dim)
-        self.num_prefix_tokens = int(getattr(orig, "num_prefix_tokens", 0))
-        self.scale = float(orig.scale)
-        rotate_half = bool(getattr(orig, "rotate_half", False))
+        self.num_heads = orig.num_heads
+        self.head_dim = orig.head_dim
+        self.num_prefix_tokens = orig.num_prefix_tokens
+        self.scale = orig.scale
+        rotate_half = orig.rotate_half
 
         # Reference (do not copy) the parameter-bearing submodules.
         self.qkv = orig.qkv
         self.q_norm = orig.q_norm
         self.k_norm = orig.k_norm
         self.attn_drop = orig.attn_drop
-        # Some Eva variants have a post-attention norm; use Identity if not.
-        self.norm = getattr(orig, "norm", nn.Identity())
+        
+        self.norm = orig.norm
         self.proj = orig.proj
         self.proj_drop = orig.proj_drop
 
-        # Atomic vanilla submodules; a composite layer_map assigns LRP rules.
+        # Atomic vanilla submodules
         self.split = ChunkAlongLastDim(3)
         self.rope_q = RotaryEmbedding(
             self.num_prefix_tokens, rotate_half=rotate_half, detach_rope=rope_detach,
@@ -472,21 +534,10 @@ class EvaAttentionUnfolded(nn.Module):
         return out
 
     def _resolve_and_add_mask(self, scores, attn_mask, is_causal, N):
-        try:
-            from timm.models.eva import resolve_self_attn_mask
-            attn_bias = resolve_self_attn_mask(N, scores, attn_mask, is_causal)
-        except (ImportError, AttributeError):
-            attn_bias = None
-            if attn_mask is not None:
-                attn_bias = attn_mask
-            if is_causal:
-                causal = torch.triu(
-                    torch.full(
-                        (N, N), float("-inf"), device=scores.device, dtype=scores.dtype,
-                    ),
-                    diagonal=1,
-                )
-                attn_bias = causal if attn_bias is None else attn_bias + causal
+        # Same mask resolution as stock EvaAttention's explicit-math path:
+        # (attn_mask, is_causal) → one additive bias (bool masks become -inf
+        # floats). None bias ⇒ AddBias is identity.
+        attn_bias = resolve_self_attn_mask(N, scores, attn_mask, is_causal)
         return self.add_mask(scores, attn_bias)
 
     def extra_repr(self) -> str:

@@ -199,7 +199,7 @@ side-by-side comparison of the three granularities on a target image.
 Setup and the single-image CLI demo are documented in
 [`tutorials/vit_crp/README.md`](tutorials/vit_crp/README.md). Sweeps,
 audits, and milestone drivers (faithfulness AUC, conservation
-diagnostic, multi-model PA-LRP / residual-LRP comparisons) are separated
+diagnostic, multi-model residual-LRP comparisons) are separated
 into [`experiments/`](experiments/) — see
 [`experiments/README.md`](experiments/README.md). All generated artefacts
 live under [`data/`](data) (gitignored). For an agent-oriented map of the

@@ -85,7 +85,6 @@ Sweeps and audits that drove design decisions; **not** prerequisites for using t
 * `datasets.py` — uniform loader. ``load("imagenette", n_per_class=16, classes=[217,482,569,701])`` → 64-image dev/CI subset; ``load("imagenet_val", n_per_class=1)`` → 1000-image class-balanced benchmark sample. Imagenette auto-downloads; imagenet_val is gated and expects manual setup. Ships the canonical 1000-WordNet-ID list at `_data/imagenet_synsets.txt`.
 * `metrics.py` — Petsiuk deletion/insertion AUC machinery (per-granularity top-k, random-concept baseline, ε / γ composite factory). Imported by all milestone drivers; also runnable as a single-config CLI.
 * `run_milestone_a.py` — γ-LRP sweep on `vit_base_patch16_224` (Milestone A). `--dataset {imagenette|imagenet_val}` switch.
-* `run_milestone_d.py` — multi-model PA-LRP sweep on vit_small/base/large (Milestone D). Same dataset switch.
 * `run_milestone_g.py` — multi-model residual-LRP (symmetric / ratio) sweep (Milestone G). Same dataset switch.
 * `aggregate_milestone_a.py` — turn the milestone-A CSV into a markdown table for the PR description.
 * `conservation_check.py` — diagnostic CLI that complements `tests/test_vit_integration.py::TestConservation`.
@@ -127,8 +126,8 @@ Dependency management is `uv add` / `uv sync`. `timm` and `Pillow` are pinned in
 | 5  | `8019975` / `3c80950` | γ-LRP variant (`GTIGamma` / `AttnLRPGammaComposite`) + drop legacy classes + state docs refresh |
 | 6  | `526c77a` | Generalise `FeatureVisualization._attribution_on_reference` — pull `mask_map` from `self.layer_map[layer_name]` instead of hardcoded `ChannelConcept.{mask,mask_rf}`. Restores per-reference-sample conditional heatmaps for the four attention concepts. |
 | 7  | `c7cd0d7` | Milestone A faithfulness sweep on `vit_base_patch16_224` (64 imgs × 4 classes × {ε, γ ∈ 0.0/0.1/0.25/0.5} × 4 granularities × {true, random}, per-granularity top-k). Methodology fix (`resolve_top_k`), per-granularity top-k defaults, `run_milestone_a.py` driver, `aggregate_milestone_a.py` table emitter. Drop stale `IMPLEMENTATION_PLAN.md`. |
-| 8  | `4835c3c` | Milestone D — conservation test + PA-LRP. `PALRPCanonizer` (uniform rule at `x + pos_embed`, factor 2). `TimmViTCanonizer(palrp=…)`, both composites take `palrp` kwarg. Conservation diagnostic in `tests/test_vit_integration.py` and `tutorials/vit_crp/conservation_check.py`. Multi-model sweep `run_milestone_d.py` on `vit_small/base/large` × ± PA-LRP. Findings: PA-LRP halves heatmap uniformly → AUC unchanged (Pearson=1.0, argsort identical empirically). kqv_head failure persists at every model scale (vit_large worst, vit_small mildest — opposite of saturation hypothesis). |
-| 9  | `c38923e` | Milestone G — residual-LRP. `_ResidualRatioFn` (Otsuki ratio split, ∝ `|x|` vs `|branch|`) + `vit_block_forward_{symmetric,ratio}` swaps + `TimmViTCanonizer(residual_lrp=…)` toggle. `run_milestone_g.py` sweep. Symmetric is AUC-inert (Pearson=1.0, like PA-LRP). **Ratio fixes the kqv_head AUC anomaly at all three model sizes and gets vit_small to 4/4 OK** (was 2/4). Trade-off: breaks `head` on vit_base (del_gap −0.0075) and degrades vit_large further. Default kept off; opt-in via `residual_lrp='ratio'`. |
+| 8  | `4835c3c` | Milestone D — conservation diagnostic. `tests/test_vit_integration.py::TestConservation` + `tutorials/vit_crp/conservation_check.py` (both since removed). Found the pipeline far from conservative; dominant leak = un-hooked residual adds (~2×/block). *(An earlier uniform-½ "PA-LRP" sketch in this same commit was NOT the paper's method — it had no positional sink, so it only rescaled heatmaps by ½ and was AUC-inert by construction. Superseded by the paper-faithful PA-LRP in `zennit_extensions/rules/palrp.py` + `VanillaViTPosEmbedCanonizer`, opt-in via layer_map.)* |
+| 9  | `c38923e` | Milestone G — residual-LRP. `_ResidualRatioFn` (Otsuki ratio split, ∝ `|x|` vs `|branch|`) + `vit_block_forward_{symmetric,ratio}` swaps + `TimmViTCanonizer(residual_lrp=…)` toggle. `run_milestone_g.py` sweep. Symmetric is AUC-inert (Pearson=1.0 — uniform ½ rescale, rank-preserving). **Ratio fixes the kqv_head AUC anomaly at all three model sizes and gets vit_small to 4/4 OK** (was 2/4). Trade-off: breaks `head` on vit_base (del_gap −0.0075) and degrades vit_large further. Default kept off; opt-in via `residual_lrp='ratio'`. |
 | 10 | `c608a8e` | Concept refactor per design review. **Removed `KQVConcept`** (per-block coarse Q/K/V wasn't a meaningful concept detector). **Renamed old `HeadDimConcept` → `KQVHeadDimConcept`** and introduced **new `HeadConcept` and `HeadDimConcept` reading at the per-head output tokens**: a new `attn_out_tap` (`nn.Identity` between `attn @ v` and `self.proj`) is now the default tap for output-side concepts. Single `_AttentionConcept` base class with two boolean flags `KQV_SPLIT` and `DIM_SPLIT`; the four concrete classes are flag-only. `AttentionTapsCanonizer` (rename of `QKVTapCanonizer`) installs both taps; back-compat alias kept. Concepts auto-register attention dims when constructed with the model: `HeadConcept(model)`. Tests fully rewritten; tutorials, demo CLI, milestone drivers, walkthrough notebook, README updated. |
 | 11 | `66129e8` | Repo layout cleanup. **Top-level `data/`** (single `.gitignore` entry) replaces nested `tutorials/vit_crp/data/` + `tutorials/vit_crp/FeatureVisualization/`. **`experiments/`** dir holds milestone drivers + metrics + conservation_check + aggregator (moved from `tutorials/vit_crp/`); `tutorials/vit_crp/` keeps only `walkthrough.ipynb` + `demo.py`. `_build_notebook.py` deleted — the notebook is tracked directly going forward. New `experiments/README.md`; `tutorials/vit_crp/README.md` rewritten to focus on the notebook + demo. Path defaults in scripts derive `<repo>/data/` from `__file__`; the notebook walks up to `pyproject.toml` to find the repo root. |
 | 12 | (this commit) | Dataset abstraction (phase 1 of full-ImageNet support). New `experiments/datasets.py` exposes `load("imagenette", ...)` (auto-downloaded) and `load("imagenet_val", ...)` (gated; manual setup expected, code-ready, **not auto-downloaded**). Both yield a `CuratedDataset` (PIL image + ImageNet-1k class idx, also a `torch.utils.data.Dataset`). Canonical 1000-WordNet-ID list shipped at `experiments/_data/imagenet_synsets.txt`. All milestone drivers gain `--dataset {imagenette\|imagenet_val}` + `--n-per-class` + `--classes` flags; the old symlink-farm `build_curated_subset` is gone. `demo.py` deleted (single-image comparison folds into the walkthrough notebook in phase 2). |
@@ -206,8 +205,12 @@ Two plausible explanations, both deferred:
 
 1. **Positional-encoding leakage** — relevance flowing through `pos_embed`
    is treated as a constant by AttnLRP §3 and lost from the conservation
-   accounting. PA-LRP (Bakish et al., NeurIPS 2025; arXiv 2506.02138) adds a
-   uniform-rule canonizer for it. Triggers FUTURE_STATE.md Milestone D.
+   accounting. PA-LRP (Bakish et al., arXiv:2506.02138) addresses this with
+   per-layer positional sinks and paper-faithful ε/uniform rules; the
+   implementation lives in `zennit_extensions/rules/palrp.py`
+   (`PosEmbedSink` Eq. 5, `RotaryRopeSink` Eq. 10), opt-in via `layer_map`,
+   structure exposed by `VanillaViTPosEmbedCanonizer` (input-level PE) and
+   the existing `RotaryEmbedding` modules (RoPE).
 2. **Union-of-top-k saturation** — at 8/36 concepts, the 8 random concepts
    already cover most of the model's spatial attention; the discriminative
    ranking signal is washed out by the union. Smaller top-k (1, 2) or a
@@ -225,52 +228,48 @@ contributions in a way that flattens the per-concept ranking specificity.
 `AttnLRPGammaComposite(gamma=0.25)` available for users who want the
 paper-default rule but flag the AUC behaviour. Re-evaluate after Milestone D.
 
-## Milestone D — conservation + PA-LRP (iter 8)
+## Milestone D — conservation diagnostic (iter 8)
 
 ### What landed
 
 * **Conservation diagnostic** — `tests/test_vit_integration.py::TestConservation`
   (3 tests, gating off — current pipeline is far from conservative; loose
   assertions for regression detection only). Companion CLI:
-  `tutorials/vit_crp/conservation_check.py`.
-* **PA-LRP**: `vit_pos_embed_palrp` swap, `PALRPCanonizer` integrated
-  through a `palrp: bool` kwarg on `TimmViTCanonizer`,
-  `AttnLRPEpsilonComposite`, `AttnLRPGammaComposite`. Default off — PA-LRP
-  is opt-in until conservation justifies turning it on.
+  `tutorials/vit_crp/conservation_check.py` (both since removed).
+* **Paper-faithful PA-LRP** — `zennit_extensions/rules/palrp.py`
+  (`PosEmbedSink` Eq. 5, `RotaryRopeSink` Eq. 10) plus
+  `VanillaViTPosEmbedCanonizer` (input-level PE) and the existing
+  `RotaryEmbedding` modules (RoPE). Opt-in via `layer_map`; default recipes
+  unchanged (structure installed, no rule mapped).
 
 ### Conservation finding
 
 `R_input.sum() / target_logit` ratios on a real Imagenette image (target
-class 217), pretrained models:
+class 217), pretrained models, ε-LRP:
 
-| model | ε | ε+PA-LRP | γ=0.25 | γ=0.25+PA-LRP |
-|---|---|---|---|---|
-| vit_tiny | −14.6 | −7.3 | −1.7e31 | −8.8e30 |
-| vit_small | 3.0e8 | 1.5e8 | NaN | NaN |
-| vit_base | −223 | −112 | −1.6e35 | −7.8e34 |
+| model | ratio |
+|---|---|
+| vit_tiny | −14.6 |
+| vit_small | 3.0e8 |
+| vit_base | −223 |
 
-PA-LRP halves the ratio **exactly** (mathematical: it halves the gradient
-once at the additive `pos_embed` step). It does not approach 1.0 — the
-remaining ~100× drift is dominated by the unhooked residual additions
-inside each block (`x = x + attn(x)` and `x = x + mlp(x)` are plain
-tensor `+`, no LRP rule applied), which add ~2× per block. γ-LRP magnitudes
-are catastrophic and unfixable by PA-LRP. Documented in test docstrings.
+Far from 1.0 — the dominant leak is the unhooked residual additions inside
+each block (`x = x + attn(x)` and `x = x + mlp(x)` are plain tensor `+`, no
+LRP rule applied), which add ~2× per block. γ-LRP magnitudes are
+catastrophic. Documented in test docstrings.
 
-### PA-LRP × AUC finding
-
-Run `tutorials/vit_crp/run_milestone_d.py` (multi-model: vit_small / base /
-large × ε-LRP × {palrp off, on}, same 64-image curated subset and 14-step
-deletion/insertion as milestone A). 3072 rows in
-`data/milestone_d_results.csv`.
-
-**PA-LRP changes nothing about AUC** — every (model, granularity) row in
-the summary table reproduces bit-identically across `palrp=False` and
-`palrp=True` (del_AUC, ins_AUC at 4 dp). Independently verified on a
-single image: with PA-LRP the heatmap = baseline × 0.5 at every pixel
-(Pearson 1.0000, `argsort` identical). PA-LRP halves a constant factor;
-AUC is rank-based; rank is preserved. PA-LRP is a conservation-magnitude
-fix, not a faithfulness fix — for the milestone-A AUC anomaly it is
-mathematically inert.
+> **Note on an earlier, superseded sketch.** This commit originally shipped a
+> uniform-½ "PA-LRP" that wrapped `x + pos_embed` in `divide_gradient(_, 2)`
+> with **no positional sink**. That is *not* the paper's method (Bakish et al.,
+> arXiv:2506.02138, Eq. 5 is an ε-proportional split with a per-layer sink).
+> Without a sink the positional half was discarded, so the heatmap came out
+> as `baseline × 0.5` at every pixel — a uniform rescale that is AUC-inert
+> by construction (rank-based AUC is blind to a constant scale). The
+> "PA-LRP is AUC-inert / mathematically inert" conclusion recorded in
+> earlier drafts of this section was an artifact of that wrong
+> implementation, **not** a property of the paper's method. The
+> paper-faithful implementation now in `zennit_extensions/rules/palrp.py`
+> supersedes it.
 
 ### Multi-scale finding (`kqv_head` AUC anomaly)
 
@@ -294,17 +293,11 @@ enough rule error that the ranking on the 3072 head_dim concepts inverts.
 
 ### Decision
 
-* **Default kept as `AttnLRPEpsilonComposite(palrp=False)`**. PA-LRP has
-  no AUC effect; turning it on by default would be an opaque ½×
-  rescaling of every heatmap with no upside.
-* **Milestone D is closed**: PA-LRP is implemented, opt-in, tested. The
-  kqv_head failure mode it was hypothesised to fix is unrelated to
-  pos_embed.
 * **kqv_head and (vit_large) head_dim AUC remain open.** The probable
   cause — un-hooked residual additions accumulating ~2×/block — is a
-  separate fix (residual-LRP via a `BlockResidualCanonizer` that wraps the
-  `x = x + branch(x)` step in `divide_gradient(2)`). Tracked in
-  FUTURE_STATE.md as the next milestone.
+  separate fix (residual-LRP via the `ResidualAdd` module + a residual
+  rule in the `layer_map`, now shipped as `ResidualRatio` / `EpsilonAdd` /
+  `CheferAdd`). Tracked in FUTURE_STATE.md as the next milestone.
 
 ## Milestone G — residual-LRP (iter 9)
 
@@ -389,7 +382,9 @@ is `AttnLRPEpsilonComposite(residual_lrp='ratio')` — strict improvement.
 ## Outstanding work
 
 Roadmap moved to YouTrack **XAI-21** (paper plan; see `scout_novelty_crp_vit.md` for the novelty verdict). `FUTURE_STATE.md` is retired. Milestone A is **investigated, not closed**;
-Milestone D is **closed** (PA-LRP shipped, AUC-inert). Milestone G is
+Milestone D's conservation diagnostic landed; its earlier uniform-½ "PA-LRP"
+sketch was superseded by the paper-faithful implementation in
+`zennit_extensions/rules/palrp.py` (opt-in). Milestone G is
 **closed** (ratio rule shipped opt-in; partial AUC fix; open questions
 above). Next: methodology check (Milestone H — pixel-rank Petsiuk and
 signed-vs-abs ranking) and Milestone B (richer baselines).

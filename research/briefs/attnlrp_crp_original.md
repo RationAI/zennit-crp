@@ -14,7 +14,7 @@ Careful full-text read (ar5iv HTML, both papers incl. appendices/supplement). Fo
 - **Matrix multiplication A·V** (Props 3.2–3.3): decompose bilinear summands A_ji·V_ip; uniform rule R_{i←j} = R_j/N for N-ary multiplication (Eq 14; provably identical under Shapley with zero baseline); combined with ε-rule gives R_ji(A_ji) = Σ_p A_ji V_ip R_jp/(2·O_jp + ε) (Eq 15) — each operand (A and V) gets **half** the relevance; conservation strictly holds, no bias.
 - **LayerNorm/RMSNorm** (Prop 3.4, Eq 19): Taylor at reference point **0** ⇒ identity rule through the x_j/g(x) normalization; affine parts (γ, β, mean subtraction) handled by ε-rule; normalization removed from the backprop graph. This *derives* Ali et al. (2022)'s heuristic from DTD.
 - **γ-rule for ViTs** (Eq 24; z+ rule Eq 25 = γ→∞ case): applied *only in ViTs* (gradient shattering; LLMs are noise-free with ε everywhere), to conv + linear FFN layers *outside* the attention module; optionally z+ on softmax (App A.2.3, Fig 12 — propagating relevance through softmax with z+ beats blocking it).
-- **ViT composite** (App B.4, Table 4), found by per-layer-type perturbation sweep (Figs 12–16): Convolution γ=0.25; Linear γ=0.05; LinearInputProjection (W_q, W_k, W_v) ε; LinearOutputProjection (W_o) ε.
+- **ViT composite** (App B.5, Table B.5), found by per-layer-type perturbation sweep (Figs 12–16): Convolution γ=0.25; Linear γ=0.05; LinearInputProjection (W_q, W_k, W_v) ε; LinearOutputProjection (W_o) ε.
 - CP-LRP (Ali et al. 2022) contrast (App A.2.2, Table 3): treats softmax output as constant ⇒ attention becomes linear in V, relevance flows only through the value path; "the query and key matrices can no longer be attributed".
 
 ### 1.2 What they demonstrate, exactly

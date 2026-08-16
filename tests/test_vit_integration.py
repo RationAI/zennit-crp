@@ -33,7 +33,7 @@ from crp.concepts import (
 )
 from zennit_extensions.canonisation.canonizers import (
     EvaAttentionSubstitutionCanonizer,
-    TimmViTBlockCanonizer,
+    VanillaViTBlockResidualCanonizer,
 )
 from crp.attribution import CondAttribution
 from zennit_extensions import (
@@ -96,21 +96,22 @@ def img_batch():
     return torch.randn(1, 3, 224, 224, requires_grad=True)
 
 
-# ── TimmViTCanonizer round-trip (standard timm path) ────────────────────────
+# ── VanillaViTBlockResidualCanonizer round-trip (standard timm path) ────────
 
 
-class TestTimmViTCanonizer:
+class TestVanillaViTBlockResidualCanonizer:
     def test_forward_swap_is_reversible(self, vit_tiny):
-        """TimmViTCanonizer(residual=True) installs a forward closure on each
-        timm Block (routing the residual adds through ResidualAdd). After context
-        exit the original forwards must be restored. (LayerNorm / Dropout carry no
-        canonizer — they are handled by the ``Pass`` rule; attention is handled by
-        the separate substitution canonizer.)
+        """``VanillaViTBlockResidualCanonizer`` installs a forward closure on
+        each timm ``Block`` (routing the residual adds through ``ResidualAdd``).
+        After the canonizer is removed the original forwards must be restored.
+        (LayerNorm / Dropout carry no canonizer — they are handled by the
+        ``Pass`` rule; attention is handled by the separate substitution
+        canonizer.)
         """
         blk = vit_tiny.blocks[0]
         original_class_forward = type(blk).forward
         assert "forward" not in blk.__dict__, "test pre-condition: clean state"
-        canonizer = TimmViTBlockCanonizer(residual=True)
+        canonizer = VanillaViTBlockResidualCanonizer()
         instances = canonizer.apply(vit_tiny)
         try:
             assert "forward" in blk.__dict__, "canonizer did not swap Block forward"

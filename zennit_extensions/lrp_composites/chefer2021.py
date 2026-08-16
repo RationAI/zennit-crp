@@ -21,8 +21,8 @@ from zennit_extensions.canonisation.canonizers import (
     EvaBlockResidualCanonizer,
     VanillaViTAttentionSubstitutionCanonizer,
     VanillaViTBlockResidualCanonizer,
+    VanillaViTPosEmbedCanonizer,
 )
-from zennit_extensions.rules.attnlrp import Uniform
 from zennit_extensions.rules.chefer2021 import CheferAdd, CheferMatmul
 
 
@@ -39,7 +39,8 @@ class CheferLRPComposite(LayerMapComposite):
       which lives in the attribution method, not this composite;
     * residual adds → :class:`CheferAdd` (z-rule + Eq. 9 normalisation, their
       ``Add`` layer);
-    * GELU / LayerNorm / Dropout → ``Pass``; LayerScale → :class:`Uniform`.
+    * GELU / LayerNorm / Dropout / LayerScale → ``Pass`` (LayerScale is a
+      bias-free elementwise linear γ-multiply; its ε-attribution ≈ identity).
 
     Standalone input-pixel attribution: the patch-embed conv (the first,
     pixel-space layer) uses the z^B box rule (:class:`zennit.rules.ZBox`),
@@ -59,6 +60,7 @@ class CheferLRPComposite(LayerMapComposite):
         canonizers = list(canonizers or []) + [
             VanillaViTBlockResidualCanonizer(),
             EvaBlockResidualCanonizer(layerscale_uniform=True),
+            VanillaViTPosEmbedCanonizer(),
             EvaAttentionSubstitutionCanonizer(block_indices=None),
             VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
         ]
@@ -67,7 +69,7 @@ class CheferLRPComposite(LayerMapComposite):
             (SoftmaxAlongLastDim, Pass()),
             (ScaleByConstant, Pass()),
             (ResidualAdd, CheferAdd(epsilon=epsilon)),
-            (LayerScaleMul, Uniform(factor=2)),
+            (LayerScaleMul, Pass()),
             (nn.GELU, Pass()),
             (nn.LayerNorm, Pass()),
             (nn.Dropout, Pass()),

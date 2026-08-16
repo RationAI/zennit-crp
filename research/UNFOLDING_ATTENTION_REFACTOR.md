@@ -207,7 +207,11 @@ the next phase.
 
 ## Out of scope for this refactor
 
-* PA-LRP for absolute-pos-embed ViTs (DINOv3 uses RoPE; not needed).
+* PA-LRP positional sinks — added *after* this refactor in
+  `zennit_extensions/rules/palrp.py` (input-level PE via
+  `VanillaViTPosEmbedCanonizer`+`PosEmbedSink`, Eq. 5; attention-level RoPE
+  via the existing `RotaryEmbedding` modules + `RotaryRopeSink`, Eq. 10).
+  Opt-in via `layer_map`; default recipes unchanged.
 * Symmetric residual rule (project keeps ratio per design decision —
   `RESEARCH_NOTES.md`).
 * Investigating the matmul-rule magnitude inflation — separately

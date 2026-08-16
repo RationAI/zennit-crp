@@ -141,7 +141,7 @@ def test_attnlrp_baseline_attributes():
 
 
 def test_attnlrp_baseline_ffn_gamma_projection_epsilon():
-    """Table 4: FFN linears → γ-LRP, attention projections (qkv/proj) + head → ε."""
+    """Table B.5: FFN linears → γ-LRP, attention projections (qkv/proj) + head → ε."""
     model = timm.create_model("vit_tiny_patch16_224", pretrained=False).eval()
     comp = AttnLRPBaselineComposite()
     linears = {n: m for n, m in model.named_modules() if isinstance(m, nn.Linear)}
