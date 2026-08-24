@@ -299,6 +299,14 @@ enough rule error that the ranking on the 3072 head_dim concepts inverts.
   rule in the `layer_map`, now shipped as `ResidualRatio` / `EpsilonAdd` /
   `CheferAdd`). Tracked in FUTURE_STATE.md as the next milestone.
 
+  **Update (2026-08-24):** The Chefer rules (`zennit_extensions/rules/chefer2021.py`)
+  and composite (`zennit_extensions/lrp_composites/chefer2021.py`) were rewritten to
+  be **code-exact** (released implementation, not the paper): matmul z-rule + ÷2
+  (not Eq. 9 normalization), Add global-sum renorm, Linear = ZPlus(zero_params=['bias']).
+  Validated against the reference clone's own tensors via
+  `tutorials/vit_crp/chefer_reference.ipynb` — all 6 `example.ipynb` heatmaps
+  reconstructed to pearson r ≥ 0.999998.
+
 ## Milestone G — residual-LRP (iter 9)
 
 Adapted from a ResNet residual-LRP scheme used in our adjacent project:

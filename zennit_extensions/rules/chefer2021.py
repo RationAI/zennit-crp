@@ -1,86 +1,95 @@
-from zennit.core import Hook, stabilize
+"""Chefer et al. (CVPR 2021) LRP rules — code-exact (released implementation).
+
+Matches the authors' *released code* bit-for-bit, not the paper's Eq. 9:
+https://github.com/hila-chefer/Transformer-Explainability (commit c3e578f),
+``modules/layers_ours.py`` + ``baselines/ViT/ViT_LRP.py``.
+
+Only the two rules the reference's ``transformer_attribution`` path actually
+exercises live here; both are ``safe_divide`` variants of an existing z-rule, so
+they subclass the AttnLRP kernels and override **only** the backward:
+
+* :class:`CheferMatmul` — plain z-rule + ÷2 on both branches (their ``einsum``
+  ``RelPropSimple`` followed by ``cam /= 2``; ``ViT_LRP.py:160-173``). Same
+  bilinear backward as :class:`~zennit_extensions.rules.attnlrp.MatmulAttnLRP`,
+  but with Chefer's :func:`safe_divide` stabilizer instead of zennit's
+  ``stabilize`` (they diverge near-zero denominators, so the swap is not free).
+* :class:`CheferAdd` — z-rule split + absolute-mass renorm over **GLOBAL** sums
+  (incl. batch; ``layers_ours.py:97-120``). Extends
+  :class:`~zennit_extensions.rules.attnlrp.EpsilonAdd`'s split with the renorm.
+
+The first-conv z-box (``Conv2d.relprop`` ``X.shape[1]==3`` branch) is **not**
+reproduced: ``transformer_attribution`` reads the attention relevance ``R_A`` at
+each softmax (above every block) and never propagates below it, so no reference
+ground truth exercises the conv. Pixel-space Chefer (``method="full"``) is out of
+scope.
+
+Sourced from 'Transformer Interpretability Beyond Attention Visualization',
+https://doi.org/10.1109/CVPR46437.2021.00084
+"""
+from zennit_extensions.rules.attnlrp import EpsilonAdd, MatmulAttnLRP
 
 
-def _chefer_normalize(r_u, r_v, rel, epsilon):
-    """Chefer et al. (CVPR 2021) binary-op conservation normalisation (Eq. 9):
-    rescale the two operand relevances so they split the incoming relevance
-    ``rel`` by their absolute mass and conserve the signed sum. Literal paper
-    form ``R̄^u = R^u · |S_u|/(|S_u|+|S_v|) · (Σ rel)/S_u``; every division goes
-    through zennit's :func:`~zennit.core.stabilize`. Per-sample scalars (sum over
-    all but the batch dim).
+def safe_divide(a, b):
+    """Chefer's stabilizer, verbatim from ``layers_ours.py``.
+
+    ``den = clamp(b, min=1e-9) + clamp(b, max=1e-9)`` ≈ ``b + 1e-9`` for
+    ``|b| > 1e-9``; ``+1e-9`` where ``den == 0``; multiply by ``(b ≠ 0)``.
     """
-    dims = tuple(range(1, rel.dim()))
-    s_u = r_u.sum(dims, keepdim=True)
-    s_v = r_v.sum(dims, keepdim=True)
-    r_tot = rel.sum(dims, keepdim=True)
-    denom = stabilize(s_u.abs() + s_v.abs(), epsilon)
-    r_u = r_u * (s_u.abs() / denom) * (r_tot / stabilize(s_u, epsilon))
-    r_v = r_v * (s_v.abs() / denom) * (r_tot / stabilize(s_v, epsilon))
-    return (r_u, r_v)
+    den = b.clamp(min=1e-9) + b.clamp(max=1e-9)
+    den = den + den.eq(0).to(den.dtype) * 1e-9
+    return a / den * b.ne(0).to(b.dtype)
 
 
-class CheferMatmul(Hook):
-    """Chefer et al. (CVPR 2021) relevance rule for a 2-input matmul ``y = a @ b``:
-    the z-rule (gradient×input) decomposition onto each operand followed by the
-    Eq. 9 conservation normalisation. The paper applies this to BOTH attention
-    matmuls and skip-connection adds (matrix multiplication otherwise violates
-    conservation, Lemma 1). Attach to
-    :class:`~zennit_extensions.attention_unfolded.BilinearMatmul`.
+class CheferMatmul(MatmulAttnLRP):
+    """Chefer et al. (CVPR 2021) matmul rule — **code-exact**.
 
-    NB. The authors' released code normalises only the ``Add`` layer and leaves
-    ``einsum`` (the matmul) un-normalised — a paper/code mismatch; this follows
-    the paper.
+    Reuses :class:`~zennit_extensions.rules.attnlrp.MatmulAttnLRP`'s tensor
+    capture (identical ``forward``); overrides only the backward to use Chefer's
+    :func:`safe_divide` and their external ``cam /= 2`` (``ViT_LRP.py:160-173``).
+    ``r_a = ½·a·(s @ bᵀ)``, ``r_b = ½·b·(aᵀ @ s)`` with ``s = safe_divide(R, O)``.
 
-    Sourced from 'Transformer Interpretability Beyond Attention Visualization',
-    https://doi.org/10.1109/CVPR46437.2021.00084
+    Attach to :class:`~zennit_extensions.attention_unfolded.BilinearMatmul`.
     """
-
-    def __init__(self, epsilon: float = 1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-
-    def forward(self, module, args, kwargs, output):
-        self.stored_tensors["a"] = args[0]
-        self.stored_tensors["b"] = args[1]
-        self.stored_tensors["output"] = output
 
     def backward(self, module, grad_input, grad_output):
-        a, b = self.stored_tensors["a"], self.stored_tensors["b"]
-        rel = grad_output[0]
-        s = rel / stabilize(self.stored_tensors["output"], self.epsilon)
-        r_a = a * (s @ b.transpose(-1, -2))
-        r_b = b * (a.transpose(-1, -2) @ s)
-        return _chefer_normalize(r_a, r_b, rel, self.epsilon)
+        a = self.stored_tensors["a"]
+        b = self.stored_tensors["b"]
+        s = safe_divide(grad_output[0], self.stored_tensors["output"])
+        r_a = 0.5 * a * (s @ b.transpose(-1, -2))
+        r_b = 0.5 * b * (a.transpose(-1, -2) @ s)
+        return (r_a, r_b)
 
     def copy(self):
-        return CheferMatmul(self.epsilon)
+        return CheferMatmul()
 
 
-class CheferAdd(Hook):
-    """Chefer et al. (CVPR 2021) relevance rule for a 2-input add ``y = x + b``:
-    the z-rule split followed by the same Eq. 9 conservation normalisation as
-    :class:`CheferMatmul`. Mirrors their ``Add`` layer. Attach to
-    :class:`~zennit_extensions.attention_unfolded.ResidualAdd`.
+class CheferAdd(EpsilonAdd):
+    """Chefer et al. (CVPR 2021) residual-add rule — **code-exact**.
 
-    Sourced from 'Transformer Interpretability Beyond Attention Visualization',
-    https://doi.org/10.1109/CVPR46437.2021.00084
+    Reuses :class:`~zennit_extensions.rules.attnlrp.EpsilonAdd`'s tensor capture;
+    overrides the backward with Chefer's z-rule split (:func:`safe_divide`) plus
+    absolute-mass renormalization over **GLOBAL** sums (incl. the batch
+    dimension), matching their ``Add.relprop`` (``layers_ours.py:97-120``):
+    ``a_fact = safe_divide(|Σa|, |Σa|+|Σb|) · ΣR``. Equal to a per-sample
+    formulation at ``B=1``; conserves only the global sum for ``B>1``.
+
+    Attach to :class:`~zennit_extensions.attention_unfolded.ResidualAdd`
+    and :class:`~zennit_extensions.attention_unfolded.PosEmbedAdd`.
     """
 
-    def __init__(self, epsilon: float = 1e-6):
-        super().__init__()
-        self.epsilon = epsilon
-
-    def forward(self, module, args, kwargs, output):
-        self.stored_tensors["x"] = args[0]
-        self.stored_tensors["branch"] = args[1]
-        self.stored_tensors["output"] = output
-
     def backward(self, module, grad_input, grad_output):
+        x = self.stored_tensors["x"]
+        branch = self.stored_tensors["branch"]
         rel = grad_output[0]
-        s = rel / stabilize(self.stored_tensors["output"], self.epsilon)
-        r_x = self.stored_tensors["x"] * s
-        r_b = self.stored_tensors["branch"] * s
-        return _chefer_normalize(r_x, r_b, rel, self.epsilon)
+        s = safe_divide(rel, self.stored_tensors["output"])
+        a = x * s
+        b = branch * s
+        denom = a.sum().abs() + b.sum().abs()
+        a_fact = safe_divide(a.sum().abs(), denom) * rel.sum()
+        b_fact = safe_divide(b.sum().abs(), denom) * rel.sum()
+        a = a * safe_divide(a_fact, a.sum())
+        b = b * safe_divide(b_fact, b.sum())
+        return (a, b)
 
     def copy(self):
-        return CheferAdd(self.epsilon)
+        return CheferAdd()

@@ -197,6 +197,18 @@ Rules:
   kernelspec registration needed (or wanted).
 
 ## Pointers & gotchas
+- Reference impl of Chefer/Gur/Wolf ViT gradient×LRP rollout (the classic baseline)
+  lives **next to this repo** at `../chefer-transformer-interpretability` — separate git
+  clone, own uv `.venv` (py3.11, torch 2.13+cu130, `opencv-python-headless`; upstream's
+  pinned torch 1.7 cannot run on the A40 GPU). `example.ipynb` is pre-executed in place;
+  re-run with `cd ../chefer-transformer-interpretability && .venv/bin/python -m jupyter
+  nbconvert --to notebook --execute --inplace example.ipynb`.
+  The **code-exact reconstruction** with our zennit rules lives at
+  `tutorials/vit_crp/chefer_reference.ipynb` — reference NPZs under
+  `data/chefer_reference/` (extracted by `extract_reference_attributions.py` in the
+  chefer venv); rules in `zennit_extensions/rules/chefer2021.py`, composite in
+  `zennit_extensions/lrp_composites/chefer2021.py`. All 6 heatmaps reconstructed to
+  pearson r ≥ 0.999998 vs the reference implementation.
 - Start from `tutorials/attributions.ipynb` then `feature_visualization.ipynb` (CNN
   fundamentals); ViT entry point is `tutorials/vit_crp/walkthrough.ipynb`.
 - Notebooks are edited **directly** (no `_build_*.py` generators anymore) — keep outputs.

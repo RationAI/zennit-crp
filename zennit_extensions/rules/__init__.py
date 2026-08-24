@@ -1,23 +1,33 @@
 """AttnLRP rule hooks — one module per source paper."""
 from zennit_extensions.rules.attnlrp import (
     EpsilonAdd,
-    EpsilonAddBasicHook,
+    EpsilonAddGradTimesInput,
+    GammaGradInput,
+    GradTimesInputMultiInputBasicHook,
+    IdentityGradTimesInput,
     LayerNormEpsilon,
     MatmulAttnLRP,
-    MatmulAttnLRPBasicHook,
+    MatmulAttnLRPGradTimesInput,
     SoftmaxAttnLRP,
-    SoftmaxAttnLRPBasicHook,
+    TorchvisionEncoderBlockCanonizer,
 )
-from zennit_extensions.rules.bajger_contrib import AlphaBetaMatmul, MultiInputBasicHook, ResidualL1
-from zennit_extensions.rules.chefer2021 import CheferAdd, CheferMatmul
+from zennit_extensions.rules.bajger_contrib import AlphaBetaMatmul, ResidualL1
+from zennit_extensions.rules.chefer2021 import (
+    CheferAdd,
+    CheferMatmul,
+    safe_divide,
+)
 from zennit_extensions.rules.palrp import PosEmbedSink, RotaryRopeSink
 from zennit_extensions.rules.residuals_otsuki2024 import ResidualRatio
 
 __all__ = [
     "SoftmaxAttnLRP", "MatmulAttnLRP", "EpsilonAdd", "LayerNormEpsilon",
-    "SoftmaxAttnLRPBasicHook", "MatmulAttnLRPBasicHook", "EpsilonAddBasicHook",
-    "MultiInputBasicHook",
+    "GradTimesInputMultiInputBasicHook",
+    "GammaGradInput", "EpsilonAddGradTimesInput", "MatmulAttnLRPGradTimesInput",
+    "IdentityGradTimesInput",
+    "TorchvisionEncoderBlockCanonizer",
     "ResidualRatio", "CheferAdd", "CheferMatmul",
+    "safe_divide",
     "AlphaBetaMatmul", "ResidualL1",
     "PosEmbedSink", "RotaryRopeSink",
 ]
