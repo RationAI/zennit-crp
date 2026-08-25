@@ -6,10 +6,17 @@ import numpy as np
 from typing import List, Dict, Optional
 
 
+def _filter_positions(token_filter: slice, n_tokens: int, device) -> torch.Tensor:
+    """Absolute indices of the tokens selected by ``token_filter``.
+
+    Handles arbitrary steps and negative bounds, unlike ``start + offset``
+    arithmetic, which silently assumes contiguous step-1 slices.
+    """
+    return torch.arange(n_tokens, device=device)[token_filter]
+
+
 class Concept:
-    """
-    Abstract class that imlplements the core functionality for the attribution computation of concepts.
-    """
+    """Abstract base for concept attribution."""
 
     def mask(self, batch_id, concept_ids, layer_name):
 
@@ -33,25 +40,18 @@ class Concept:
 
 
 class ChannelConcept(Concept):
-    """
-    Concept Class for torch.nn.Conv2D and torch.nn.Linear layers
-    """
+    """Channel-wise concept for ``Conv2d`` / ``Linear`` layers."""
 
     @staticmethod
     def mask(batch_id: int, concept_ids: List, layer_name=None):
-        """
-        Wrapper that generates a function that modifies the gradient (replaced by zennit by attributions).
+        """Build a gradient hook that zeros every channel except ``concept_ids``.
 
-        Parameters:
+        Parameters
         ----------
-        batch_id: int
-            Specifies the batch dimension in the torch.Tensor.
-        concept_ids: list of integer values
-            integer lists corresponding to channel indices.
-
-        Returns:
-        --------
-        callable function that modifies the gradient
+        batch_id : int
+            Index of the sample in the batch to mask.
+        concept_ids : list of int
+            Channel indices to keep.
         """
 
         def mask_fct(grad):
@@ -66,21 +66,16 @@ class ChannelConcept(Concept):
 
     @staticmethod
     def mask_rf(batch_id: int, c_n_map: Dict[int, List], layer_name=None):
-        """
-        Wrapper that generates a function that modifies the gradient (replaced by zennit by attributions) for a single neuron.
+        """Build a gradient hook that keeps selected neurons within selected channels.
 
-        Parameters:
+        Parameters
         ----------
-        batch_id: int
-            Specifies the batch dimension in the torch.Tensor.
-        c_n_map: dist with int keys and list values
-            Keys correspond to channel indices and values correspond to neuron indices.
-            Neuron Indices are counted as if the 2D Channel has 1D dimension i.e. channel dimension [3, 20, 20] -> [3, 400],
-            so that neuron indices range between 0 and 399.
-
-        Returns:
-        --------
-        callable function that modifies the gradient
+        batch_id : int
+            Index of the sample in the batch to mask.
+        c_n_map : dict[int, list[int]]
+            ``{channel: [neuron_indices]}``. Neuron indices address a channel's
+            spatial grid flattened to 1D (e.g. a ``[3, 20, 20]`` channel becomes
+            ``[3, 400]`` with indices ``0..399``).
         """
 
         def mask_fct(grad):
@@ -149,54 +144,28 @@ class ChannelConcept(Concept):
         return d_ch_sorted, rel_ch_sorted, rf_ch_sorted
 
 
-# ---------------------------------------------------------------------------
-# Transformer attention concepts
-# ---------------------------------------------------------------------------
-# HeadConcept / EmbeddingDimConcept / TokenConcept operate on a 3D
-# ``(B, N, embed_dim)`` relevance tensor recorded at an unfolded-attention
-# probe site (``q_lrp_probe`` / ``k_lrp_probe`` / ``v_lrp_probe`` / ``proj_drop``
-# installed by the attention-substitution canonizers; see the LRP-primitive
-# package). They subclass :class:`Concept` exactly like :class:`ChannelConcept`,
-# so the FeatureVisualization / Maximization / CondAttribution machinery treats
-# them identically.
-
 class HeadConcept(Concept):
     """Per-head attribution on a 3D ``(B, N, embed_dim)`` relevance tensor.
 
     Slices ``embed_dim`` into ``num_heads`` contiguous segments of size
-    ``head_dim = embed_dim / num_heads``. One concept = one head; the
-    head's relevance is the sum over its embed_dim slice and over the
-    (filtered) token axis.
-
-    Hookable at any 3D site of the unfolded attention block:
-    ``q_lrp_probe``, ``k_lrp_probe``, ``v_lrp_probe``, ``proj_drop``.
+    ``head_dim = embed_dim / num_heads``. One concept = one head; its
+    relevance is the sum over the head's ``embed_dim`` slice and the
+    filtered token axis.
 
     Parameters
     ----------
     num_heads : int
-        Number of attention heads. The constructor argument is required
-        because ``embed_dim`` alone doesn't determine the per-head split.
-        The substitution canonizer reads this from the model when
-        building the unfolded attention; the user passes the same value
-        here. For DINOv3 ViT-L: 16. For ``vit_base_patch16_224``: 12.
+        Number of attention heads. Required because ``embed_dim`` alone does
+        not fix the per-head split.
     token_filter : slice, optional
-        Restrict the token axis to a subset before aggregating. Default:
-        ``slice(None)`` (= include all tokens: cls + register + spatial).
+        Restrict the token axis before aggregating. Default ``slice(None)``
+        (all tokens). Applied at both ``mask`` time (zeroes excluded
+        positions) and ``attribute`` time (excludes them from the per-head
+        sum). Callers must know the model's prefix layout to pick a
+        meaningful slice (e.g. ``slice(0, 1)`` for cls,
+        ``slice(num_prefix, None)`` for patches).
 
-        Examples for DINOv3 (``num_prefix_tokens = 5``: 1 cls + 4 reg):
-
-        * ``slice(None)`` — all 261 tokens (default)
-        * ``slice(5, None)`` — spatial patch tokens only (256)
-        * ``slice(0, 1)`` — cls only
-        * ``slice(1, 5)`` — register tokens only
-        * ``slice(0, 5)`` — all prefix tokens (cls + register)
-
-        The slice is applied to the ``N`` axis at both ``mask`` time
-        (zeroes excluded positions) and ``attribute`` time (excludes
-        them from the per-head sum). User must know the model's prefix
-        layout when picking a slice.
-
-    Concept ids : ``List[int]``. Each id is a head index in ``[0, num_heads)``.
+    Concept ids : ``List[int]``, each a head index in ``[0, num_heads)``.
     """
 
     def __init__(self, num_heads: int, token_filter: slice = slice(None)):
@@ -264,9 +233,9 @@ class HeadConcept(Concept):
         # Argmax over filtered tokens to get the receptive-field token id
         # per (batch, head). Shape (B, num_heads).
         rf_token_filtered = torch.argmax(rel_per_token, dim=1)
-        # Map back to absolute token id using the slice's start.
-        offset = self.token_filter.start or 0
-        rf_neuron = rf_token_filtered + offset
+        # Map back to absolute token ids via the slice's selected positions.
+        positions = _filter_positions(self.token_filter, relevance.shape[1], rel.device)
+        rf_neuron = positions[rf_token_filtered]
         if max_target == "sum":
             rel_c = rel_per_token.sum(dim=1)
         elif max_target == "max":
@@ -285,22 +254,19 @@ class EmbeddingDimConcept(Concept):
     """Per-embedding-dimension attribution on a 3D ``(B, N, embed_dim)``
     relevance tensor. Same hook sites as :class:`HeadConcept`.
 
-    One concept = one ``embed_dim`` index. The dim's relevance is the
-    sum over the (filtered) token axis at that dim. Finer granularity
-    than HeadConcept (which sums ``head_dim`` adjacent indices into one
-    head): ``num_heads * head_dim = embed_dim`` distinct concept ids.
+    One concept = one ``embed_dim`` index; its relevance is the sum over
+    the filtered token axis. Finer-grained than :class:`HeadConcept`, which
+    sums ``head_dim`` adjacent dims per head.
 
     Parameters
     ----------
     num_heads : int
-        Number of heads. Used only for the convenience decoder
-        ``head_id = dim // head_dim`` so callers can label which head a
-        dim belongs to. Not used for indexing.
+        Used only by :meth:`head_of` to label which head a dim belongs to;
+        not used for indexing.
     token_filter : slice, optional
         See :class:`HeadConcept`.
 
-    Concept ids : ``List[int]``. Each id is an absolute dim in
-    ``[0, embed_dim)``.
+    Concept ids : ``List[int]``, each an absolute dim in ``[0, embed_dim)``.
     """
 
     def __init__(self, num_heads: int, token_filter: slice = slice(None)):
@@ -308,9 +274,8 @@ class EmbeddingDimConcept(Concept):
         self.token_filter = token_filter
 
     def head_of(self, dim_id: int, embed_dim: int) -> int:
-        """Convenience: which head does this dim belong to?
-        ``head_id = dim_id // head_dim`` where ``head_dim = embed_dim / num_heads``.
-        """
+        """Which head owns ``dim_id``? Returns ``dim_id // head_dim``
+        (``head_dim = embed_dim / num_heads``)."""
         return int(dim_id) // (embed_dim // self.num_heads)
 
     def mask(self, batch_id: int, concept_ids: List, layer_name: Optional[str] = None):
@@ -357,8 +322,9 @@ class EmbeddingDimConcept(Concept):
         rel = relevance[:, self.token_filter, :]
         # Argmax over filtered tokens → (B, embed_dim).
         rf_token_filtered = torch.argmax(rel, dim=1)
-        offset = self.token_filter.start or 0
-        rf_neuron = rf_token_filtered + offset
+        # Map back to absolute token ids via the slice's selected positions.
+        positions = _filter_positions(self.token_filter, relevance.shape[1], rel.device)
+        rf_neuron = positions[rf_token_filtered]
         if max_target == "sum":
             rel_c = rel.sum(dim=1)
         elif max_target == "max":
@@ -377,24 +343,19 @@ class TokenConcept(Concept):
     """Per-token-position attribution on a 3D ``(B, N, embed_dim)``
     relevance tensor. Hooked at ``proj_drop`` (or any 3D site).
 
-    One concept = one token position. The position's relevance is the
-    sum over all ``embed_dim`` at that token. Different granularity from
-    :class:`HeadConcept` and :class:`EmbeddingDimConcept`: those select
-    on ``embed_dim`` (subspaces), this selects on ``N`` (positions).
-
-    Useful for attributing what each cls / register token contributed,
-    or what each spatial patch position contributed.
+    One concept = one token position; its relevance is the sum over
+    ``embed_dim`` at that token. Selects on ``N`` (positions), unlike
+    :class:`HeadConcept` / :class:`EmbeddingDimConcept` which select on
+    ``embed_dim``.
 
     Parameters
     ----------
     token_filter : slice, optional
         Universe of token positions to consider. Default ``slice(None)``
-        (all tokens). Concept ids index into the positions remaining
-        after this filter has been applied — i.e., concept id 0 maps to
-        the first position passing the filter.
+        (all tokens). Concept ids index the positions remaining after the
+        filter (id 0 = first surviving position).
 
-    Concept ids : ``List[int]``. Each id is a token position index in
-    the post-filter axis ``[0, N_filtered)``.
+    Concept ids : ``List[int]``, each a position in ``[0, N_filtered)``.
     """
 
     def __init__(self, token_filter: slice = slice(None)):
@@ -450,9 +411,8 @@ class TokenConcept(Concept):
         rel_per_pos = relevance[:, self.token_filter, :].sum(dim=-1)  # (B, N_f)
         # No "receptive-field" sub-axis — each concept IS one token id.
         # rf_neuron mirrors the absolute token id for the caller's bookkeeping.
-        offset = self.token_filter.start or 0
-        N_f = rel_per_pos.shape[1]
-        rf_neuron = (torch.arange(N_f, device=rel_per_pos.device) + offset).expand_as(rel_per_pos)
+        positions = _filter_positions(self.token_filter, relevance.shape[1], rel_per_pos.device)
+        rf_neuron = positions.expand_as(rel_per_pos)
         rel_c = rel_per_pos
         if abs_norm:
             rel_c = rel_c / (rel_c.abs().sum(-1, keepdim=True) + 1e-10)

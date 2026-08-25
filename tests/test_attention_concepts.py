@@ -94,6 +94,30 @@ class TestHeadConcept:
         per_batch = rel.abs().sum(dim=-1)
         assert torch.allclose(per_batch, torch.ones_like(per_batch), atol=1e-5)
 
+    def test_reference_sampling_rf_contiguous_filter(self):
+        # Contiguous filter: absolute id = filtered position + start.
+        c = HeadConcept(num_heads=NUM_HEADS, token_filter=slice(NUM_PREFIX, None))
+        rel = torch.zeros(B, N, EMBED_DIM)
+        rel[:, 5, :] = 1.0  # argmax lands on absolute token 5
+        _, _, rf_sorted = c.reference_sampling(rel, abs_norm=False)
+        assert torch.all(rf_sorted == 5)
+
+    def test_reference_sampling_rf_stepped_filter(self):
+        # Stepped slice: filtered position p is absolute token 2*p.
+        c = HeadConcept(num_heads=NUM_HEADS, token_filter=slice(0, None, 2))
+        rel = torch.zeros(B, N, EMBED_DIM)
+        rel[:, 6, :] = 1.0  # filtered position 3
+        _, _, rf_sorted = c.reference_sampling(rel, abs_norm=False)
+        assert torch.all(rf_sorted == 6)
+
+    def test_reference_sampling_rf_negative_start(self):
+        # slice(-3, None) keeps tokens 6..8; spike at 7 is filtered position 1.
+        c = HeadConcept(num_heads=NUM_HEADS, token_filter=slice(-3, None))
+        rel = torch.zeros(B, N, EMBED_DIM)
+        rel[:, 7, :] = 1.0
+        _, _, rf_sorted = c.reference_sampling(rel, abs_norm=False)
+        assert torch.all(rf_sorted == 7)
+
 
 # ── EmbeddingDimConcept ──────────────────────────────────────────────────────
 
@@ -130,6 +154,14 @@ class TestEmbeddingDimConcept:
         m = c.mask(batch_id=0, concept_ids=[EMBED_DIM])
         with pytest.raises(IndexError):
             m(relevance_3d.clone())
+
+    def test_reference_sampling_rf_stepped_filter(self):
+        # Stepped slice: filtered position p is absolute token 2*p.
+        c = EmbeddingDimConcept(num_heads=NUM_HEADS, token_filter=slice(0, None, 2))
+        rel = torch.zeros(B, N, EMBED_DIM)
+        rel[:, 6, 5] = 1.0  # dim 5 peaks at absolute token 6 (filtered position 3)
+        _, _, rf_sorted = c.reference_sampling(rel, abs_norm=False)
+        assert torch.all(rf_sorted[:, 5] == 6)
 
 
 # ── TokenConcept ─────────────────────────────────────────────────────────────
@@ -183,3 +215,19 @@ class TestTokenConcept:
         m = c.mask(batch_id=0, concept_ids=[N - NUM_PREFIX])
         with pytest.raises(IndexError):
             m(relevance_3d.clone())
+
+    def test_reference_sampling_rf_stepped_filter(self):
+        # rf entries mirror the absolute ids of the filtered universe (0,2,4,6,8).
+        c = TokenConcept(token_filter=slice(0, None, 2))
+        rel = torch.zeros(B, N, EMBED_DIM)
+        _, _, rf_sorted = c.reference_sampling(rel, abs_norm=False)
+        expected = torch.tensor([0, 2, 4, 6, 8]).expand(B, -1)
+        assert torch.equal(rf_sorted, expected)
+
+    def test_reference_sampling_rf_negative_start(self):
+        # slice(-3, None) keeps tokens 6..8.
+        c = TokenConcept(token_filter=slice(-3, None))
+        rel = torch.zeros(B, N, EMBED_DIM)
+        _, _, rf_sorted = c.reference_sampling(rel, abs_norm=False)
+        expected = torch.tensor([6, 7, 8]).expand(B, -1)
+        assert torch.equal(rf_sorted, expected)
