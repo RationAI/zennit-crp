@@ -221,9 +221,8 @@ def cmd_collect(args):
         # v2: --checkpoint overrides the spec default; the loaded path is
         # asserted so a stale spec default can never silently win.
         ckpt = getattr(args, "checkpoint", None) or spec["checkpoint"]
-        from experiments.models import MODELS as MODEL_ZOO
-        zoo_cls = MODEL_ZOO[f"{spec['base']}_{spec['dataset']}"]
-        model = zoo_cls(**({"checkpoint": ckpt} if ckpt else {}), device=device)
+        from experiments.model_datasets import find
+        model = find(spec["base"], spec["dataset"], device=device, checkpoint=ckpt).model
         if ckpt:
             assert Path(model.source).resolve() == Path(ckpt).resolve(), (
                 f"loaded {model.source} != requested {ckpt}")

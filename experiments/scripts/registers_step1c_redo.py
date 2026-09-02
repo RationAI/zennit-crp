@@ -173,17 +173,16 @@ class TwoSiteNormRecorder:
 
 def cmd_collect(args):
     import torch
-    from experiments.models import MODELS as MODEL_ZOO, backbone_transforms
-    from experiments.datasets import load_eval_dataset
+    from experiments.model_datasets import find
 
     spec = MODELS[args.model]
     device = args.device
-    ckpt = spec["checkpoint"]
-    model = MODEL_ZOO[f"{spec['base']}_{spec['dataset']}"](
-        **({"checkpoint": ckpt} if ckpt else {}), device=device)
+    md = find(spec["base"], spec["dataset"], device=device,
+              ds_extra=spec["extra"], checkpoint=spec["checkpoint"])
+    model = md.model
     label = f"{spec['base']} · {model.head_name} · {spec['dataset']}"
-    transform, normalize = backbone_transforms(model.backbone)
-    ds = load_eval_dataset(spec["dataset"], transform, extra_kwargs=spec["extra"])
+    normalize = md.normalize
+    ds = md.dataset
 
     indices = pick_class_diverse(ds, args.n, seed=args.seed)
     labels = np.array([_ds_labels(ds)[i] for i in indices])

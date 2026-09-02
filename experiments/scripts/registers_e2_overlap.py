@@ -106,17 +106,14 @@ def overlap_path(m): return RES_DIR / f"e2_overlap_{m}.npz"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_model_ds(model_key: str, device: str):
-    from experiments.models import MODELS as MODEL_ZOO, backbone_transforms
-    from experiments.datasets import load_eval_dataset
+    from experiments.model_datasets import find
     spec = MODELS[model_key]
-    ckpt = spec["checkpoint"]
-    model = MODEL_ZOO[f"{spec['base']}_{spec['dataset']}"](
-        **({"checkpoint": ckpt} if ckpt else {}), device=device)
+    md = find(spec["base"], spec["dataset"], device=device,
+              ds_extra=spec["extra"], checkpoint=spec["checkpoint"])
+    model = md.model
     label = f"{spec['base']} · {model.head_name} · {spec['dataset']}"
-    transform, normalize = backbone_transforms(model.backbone)
-    ds = load_eval_dataset(spec["dataset"], transform, extra_kwargs=spec["extra"])
     assert int(model.backbone.num_prefix_tokens) == 1, "expected exactly one CLS token"
-    return model, normalize, ds, label
+    return model, md.normalize, md.dataset, label
 
 
 def _load_ds_only(model_key: str):

@@ -129,19 +129,20 @@ def endpoint_check_pairs(model) -> List[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 def load_model_for_args(args, device):
-    """Resolve the eval model for (base, dataset, checkpoint) via the zoo
-    (``experiments.models.MODELS``). ``vit_dinov3_base_in1k`` is the CLI alias
-    for :class:`experiments.models.ImagenetDinoV3Base`; otherwise the zoo class
-    for ``<base>_<dataset>`` (``--checkpoint`` pins the exact probe run instead
-    of the newest-glob default)."""
-    from experiments.models import MODELS, ImagenetDinoV3Base
+    """Resolve the eval model for (base, dataset, checkpoint) via the
+    ModelDataset registry (``experiments.model_datasets.find``).
+    ``vit_dinov3_base_in1k`` is the CLI alias for the DINOv3-B/16 ImageNet pair;
+    otherwise the registered pair for ``(base, dataset)`` (``--checkpoint`` pins
+    the exact probe run instead of the newest-glob default)."""
+    from experiments.model_datasets import find
+    from experiments.model_datasets.names_paths import M_VIT_DINOV3_BASE, DS_IMAGENET
 
     if args.base == "vit_dinov3_base_in1k":
-        return ImagenetDinoV3Base(device=device)
+        return find(M_VIT_DINOV3_BASE, DS_IMAGENET, device=device).model
 
     ckpt = Path(args.checkpoint) if getattr(args, "checkpoint", None) else None
-    model = MODELS[f"{args.base}_{args.dataset}"](
-        **({"checkpoint": ckpt} if ckpt else {}), device=device)
+    model = find(args.base, args.dataset, device=device,
+                 checkpoint=str(ckpt) if ckpt else None).model
     if ckpt is not None:
         assert Path(model.source).resolve() == ckpt.resolve(), (model.source, ckpt)
     return model

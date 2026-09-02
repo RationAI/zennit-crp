@@ -54,9 +54,8 @@ from timm.data import resolve_data_config, create_transform
 from zennit_extensions.lrp_composites import COMPOSITES
 from crp.attribution import CondAttribution
 from crp.concepts import HeadConcept, EmbeddingDimConcept
-from experiments.models import (
-    DEFAULT_MODELS, MODELS, select_correct,
-)
+from experiments.models import select_correct
+from experiments.model_datasets import find, DEFAULT_MODEL_FOR_DATASET
 from experiments.datasets import EVAL_DATASETS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -247,7 +246,11 @@ def run_dataset(key: str, config_name: str, concept_name: str, methods: Sequence
 
     # ── Stage 1 · model, dataset, relevance composite, concept detectors ──────
     # Read geometry before wiring the probe sites.
-    model = MODELS[DEFAULT_MODELS[key]](device=device)
+    # Model-only use of the ModelDataset registry: this experiment keeps its own
+    # normalize-baked-in dataset transform (below), a different convention than
+    # ModelDataset's split transform/normalize — so we take just ``.model`` and
+    # leave the dataset pipeline untouched (``.dataset`` is lazy, never built).
+    model = find(DEFAULT_MODEL_FOR_DATASET[key], key, device=device).model
     num_heads = model.backbone.blocks[0].attn.num_heads
     embed_dim = model.backbone.embed_dim
     n_blocks = len(model.backbone.blocks)

@@ -68,6 +68,11 @@ import numpy as np
 import torch
 import typer
 
+from experiments.model_datasets.names_paths import (
+    M_VIT_SMALL, M_VIT_BASE, M_VIT_DINOV3_SMALL, M_VIT_DINOV3_BASE,
+    DS_FUNNY_BIRDS, DS_IMAGENET,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RES_DIR = REPO_ROOT / "data" / "results" / "benchmark"
 FIG_DIR = REPO_ROOT / "figures" / "benchmark"
@@ -77,23 +82,30 @@ CKPT_M1 = REPO_ROOT / "data/runs/finetune_vit_small_funny-birds-train-clean/2026
 CKPT_M3 = REPO_ROOT / "data/runs/finetune_vit_dinov3_small_funny-birds-train-clean/2026-07-25_200008/best.pt"
 
 # ── Model registry (design for extension: add a row, nothing else reruns) ──────
+# Each row names an M1..M4 run and its ``(model, dataset)`` axes for the
+# ModelDataset registry (experiments.model_datasets.find). ``model_key`` is the
+# historical flat ``<model>_<dataset>`` tag, kept for npz/provenance parity.
 @dataclass(frozen=True)
 class ModelSpec:
-    tag: str                      # M1..M4
-    model_key: str                # experiments.models.MODELS key
-    dataset: str
+    tag: str                      # M1..M4 run id
+    model: str                    # ModelDataset model axis (M_* constant)
+    dataset: str                  # ModelDataset dataset axis (DS_* constant)
     checkpoint: Optional[str]
     label: str
     ds_extra: dict = field(default_factory=dict)
 
+    @property
+    def model_key(self) -> str:
+        return f"{self.model}_{self.dataset}"
+
 MODELS: Dict[str, ModelSpec] = {
-    "M1": ModelSpec("M1", "vit_small_funny_birds", "funny_birds", str(CKPT_M1),
+    "M1": ModelSpec("M1", M_VIT_SMALL, DS_FUNNY_BIRDS, str(CKPT_M1),
                     "ViT-S/16 · FunnyBirds (test)", {"split": "test"}),
-    "M2": ModelSpec("M2", "vit_base_imagenet", "imagenet", None,
+    "M2": ModelSpec("M2", M_VIT_BASE, DS_IMAGENET, None,
                     "ViT-B/16 · ImageNet (val)", {"n_per_class": 10}),
-    "M3": ModelSpec("M3", "vit_dinov3_small_funny_birds", "funny_birds", str(CKPT_M3),
+    "M3": ModelSpec("M3", M_VIT_DINOV3_SMALL, DS_FUNNY_BIRDS, str(CKPT_M3),
                     "DINOv3-S/16 (+reg, finetuned) · FunnyBirds (test)", {"split": "test"}),
-    "M4": ModelSpec("M4", "vit_dinov3_base_imagenet", "imagenet", None,
+    "M4": ModelSpec("M4", M_VIT_DINOV3_BASE, DS_IMAGENET, None,
                     "DINOv3-B/16 (+reg, canvit head) · ImageNet (val)", {"n_per_class": 10}),
 }
 
@@ -126,16 +138,13 @@ def npz_path(model: str) -> Path:
     return RES_DIR / f"iddapc_{model}.npz"
 
 
-# ── model + data loading (zoo classes) ─────────────────────────────────────────
+# ── model + data loading (ModelDataset registry) ───────────────────────────────
 def load(model_id: str, device: str):
-    from experiments.models import MODELS as MODEL_ZOO, backbone_transforms
-    from experiments.datasets import load_eval_dataset
+    from experiments.model_datasets import find
     spec = MODELS[model_id]
-    ckpt = {"checkpoint": spec.checkpoint} if spec.checkpoint else {}
-    model = MODEL_ZOO[spec.model_key](**ckpt, device=device)
-    transform, normalize = backbone_transforms(model.backbone)
-    ds = load_eval_dataset(spec.dataset, transform, spec.ds_extra)
-    return model, normalize, ds, model.num_classes, spec.label
+    md = find(spec.model, spec.dataset, device=device,
+              ds_extra=spec.ds_extra, checkpoint=spec.checkpoint)
+    return md.model, md.normalize, md.dataset, md.num_classes, spec.label
 
 
 def select_indices(model, normalize, ds, device, *, n: int = N_IMAGES,
