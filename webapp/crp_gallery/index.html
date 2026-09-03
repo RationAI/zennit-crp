@@ -10,7 +10,7 @@
     body { max-width: 1100px; margin: 0 auto; padding: 1rem; }
     .selects { display: grid; gap: 0.75rem; grid-template-columns: 1fr; }
     @media (min-width: 640px) { .selects { grid-template-columns: 1fr 1fr; } }
-    @media (min-width: 900px) { .selects { grid-template-columns: 1fr 1fr 1fr 1fr 1fr; } }
+    @media (min-width: 900px) { .selects { grid-template-columns: repeat(6, 1fr); } }
     #sample-figs { display: flex; gap: 0.75rem; margin: 0 0 0.4rem; flex-wrap: wrap; }
     #sample-figs figure { margin: 0; }
     #sample-figs img { max-width: 160px; height: auto; border: 1px solid var(--pico-muted-border-color);
@@ -74,6 +74,9 @@
     </label>
     <label>Layer
       <select id="sel-layer"></select>
+    </label>
+    <label>Reference ranking
+      <select id="sel-ref"></select>
     </label>
   </div>
 

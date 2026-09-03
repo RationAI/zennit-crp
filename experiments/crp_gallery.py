@@ -22,6 +22,11 @@ Design (see the approved plan / AGENTS.md):
 * **Composites are taken AS-IS** from the python source; the web only displays
   their summary + hyperparameters (``composite.json``). Nothing here defines or
   mutates a composite.
+* **Relevance-sign flavours.** By default negative relevance is dropped from the
+  FV index, the rankings, the scores and the displayed maps (the "clamped"
+  flavour); ``--include-negative`` computes a parallel flavour that keeps it. The
+  two live in separate caches (``<config>--negincl``) and entry subtrees
+  (``<config>/negincl/``) and the web suffixes the instance labels accordingly.
 
 Compute nothing on your own — only the combinations explicitly requested.
 
@@ -56,15 +61,16 @@ from torchvision.transforms.functional import gaussian_blur
 from zennit_extensions.lrp_composites import COMPOSITES
 from experiments import storage
 from experiments import fv_aligned
-from crp.attribution import CondAttribution
+from experiments.gradinput import (
+    GradTimesInputAttribution, GradTimesInputFeatureVisualization)
 from crp.concepts import HeadConcept, EmbeddingDimConcept
 from crp.helper import load_maximization
 from crp.image import get_crop_range, imgify, plot_grid, vis_img_heatmap, vis_opaque_img
-from crp.visualization import FeatureVisualization
+from experiments.model_datasets import find
 from experiments.models import (
-    MODELS, backbone_transforms, select_correct,
+    select_correct,
 )
-from experiments.datasets import EVAL_DATASETS, load_eval_dataset
+from experiments.datasets import EVAL_DATASETS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 GALLERY_DIR = REPO_ROOT / "webapp" / "crp_gallery"
@@ -89,6 +95,17 @@ CONCEPTS = ("head", "embed_dim")
 FV_CLASS_LABELS = {
     "original": "original (ground-truth conditioning)",
     "aligned": "condition-class-aligned (top-3 predicted)",
+}
+
+# Reference-ranking modes: which per-concept score orders the representative
+# samples in the FV index. quantity ∈ {relevance, activation} × reduction over
+# the concept's neurons ∈ {sum, max} — served from the corresponding
+# ``{Rel|Act}Max_{sum|max}_normed`` store.
+REF_MODES = {
+    "relsum": ("relevance", "sum", "RelSum — relevance, token-sum"),
+    "relmax": ("relevance", "max", "RelMax — relevance, token-max"),
+    "actsum": ("activation", "sum", "ActSum — activation, token-sum"),
+    "actmax": ("activation", "max", "ActMax — activation, token-max"),
 }
 
 app = typer.Typer(add_completion=False, help=__doc__)
@@ -141,18 +158,29 @@ SITE_LAYERS = {
         "backbone.blocks.10",
         "backbone.blocks.11",
     ],
+    # Q/K probe sites — the QInspectionLayer/KInspectionLayer identities the
+    # attention-unfolding canonizer inserts on the (B, N, embed_dim) q/k tensors.
+    # These exist ONLY inside a canonized composite context, so resolve_layers
+    # validates them against the canonized model (see PROBE_SITES).
+    "query": [f"backbone.blocks.{b}.attn.q_lrp_probe" for b in range(12)],
+    "key": [f"backbone.blocks.{b}.attn.k_lrp_probe" for b in range(12)],
 }
 
+# Sites whose layer names materialize only after canonization (Q/K probes).
+PROBE_SITES = frozenset({"query", "key"})
 
-def resolve_layers(model, site: str, blocks: List[int]) -> List[Tuple[int, str]]:
+
+def resolve_layers(model, site: str, blocks: List[int], *,
+                   known: Optional[set] = None) -> List[Tuple[int, str]]:
     """``(block, layer_name)`` per requested block at the probe site. The names
-    are the explicit :data:`SITE_LAYERS` strings, validated against the model —
-    a name that does not resolve is a hard error (see SITE_LAYERS)."""
+    are the explicit :data:`SITE_LAYERS` strings, validated against ``known`` (the
+    bare model's module names by default; the caller passes the canonized set for
+    :data:`PROBE_SITES`) — a name that does not resolve is a hard error."""
     if site not in SITE_LAYERS:
         raise typer.BadParameter(
             f"--site must be one of {tuple(SITE_LAYERS)}, got {site!r}")
     names = SITE_LAYERS[site]
-    known = set(dict(model.named_modules()))
+    known = known if known is not None else set(dict(model.named_modules()))
     missing = [n for n in names if n not in known]
     if missing:
         raise typer.BadParameter(
@@ -168,13 +196,16 @@ def resolve_layers(model, site: str, blocks: List[int]) -> List[Tuple[int, str]]
 
 
 def rank_scores(rank_mode: str, *, attribution, ds, sel, layer, concept, composite,
-                normalize, device, fv, batch_size: int = 32) -> np.ndarray:
+                normalize, device, fv, batch_size: int = 32,
+                include_negative: bool = False) -> np.ndarray:
     """Per-detector relevance score vector for one layer (higher = more relevant).
 
     * ``class_conditional`` (default) — mean over a sample of correctly-classified
       images of ``concept.attribute(R[layer])`` with relevance initialised at the
       true target logit (``{"y":[c]}``). Idiom from ``head_relevance_by_class``.
     * ``fv_index`` — mean over the FV RelMax index (whole-dataset, target-agnostic).
+
+    ``include_negative=False`` (default) scores by positive relevance only.
     """
     if rank_mode == "fv_index":
         _, rel_c_sorted, _ = load_maximization(fv.RelMax.PATH, layer)
@@ -188,7 +219,9 @@ def rank_scores(rank_mode: str, *, attribution, ds, sel, layer, concept, composi
         x = torch.stack([ds[i][0] for i in idxs]).to(device)
         x = normalize(x).requires_grad_(True)
         res = attribution(x, [{"y": [int(c)]}], composite, record_layer=[layer])
-        det = concept.attribute(res.relevances[layer], abs_norm=False)  # (B, n_det)
+        rel = res.relevances[layer]
+        det = concept.attribute(rel if include_negative else rel.clamp(min=0),
+                                abs_norm=False)  # (B, n_det)
         s = det.sum(0).detach().cpu().numpy()
         total = s if total is None else total + s
         n_imgs += det.shape[0]
@@ -241,10 +274,16 @@ def concept_kind_desc(concept_kind: str, site: str) -> str:
 # the dataset-aggregate reference-image view.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ImageNet-1k class idx → display name. Six visually distinct classes.
-IMAGENET_SAMPLES: List[Tuple[int, str]] = [
+# ImageNet-1k class idx → display name. Six visually distinct classes; an
+# optional third element pins an explicit dataset index (else: first val image
+# of that class).
+IMAGENET_SAMPLES: List[Tuple] = [
     (39, "lizard"), (933, "cheeseburger"), (1, "goldfish"),
     (817, "sports_car"), (985, "daisy"), (207, "golden_retriever"),
+    # tutorials/images/lizard.jpg == val index 2339 (true label 46, models
+    # predict 40) — pinned for visual parity with the lxt_reference notebooks,
+    # conditioned on the predicted class like the notebooks.
+    (40, "lizard_nb", 2339),
 ]
 
 
@@ -271,8 +310,9 @@ def pick_samples(dataset: str, ds) -> List[dict]:
         return []
     if dataset == "imagenet":
         out = []
-        for cls, name in IMAGENET_SAMPLES:
-            idx = next((i for i, l in enumerate(labels) if l == cls), None)
+        for entry in IMAGENET_SAMPLES:
+            cls, name = entry[0], entry[1]
+            idx = entry[2] if len(entry) > 2 else                 next((i for i, l in enumerate(labels) if l == cls), None)
             if idx is not None:
                 out.append({"key": name, "label": f"{name} · class {cls}",
                             "ds_index": idx, "target": cls})
@@ -294,21 +334,24 @@ def pick_samples(dataset: str, ds) -> List[dict]:
 
 
 def local_relevances(attribution, x, target: int, layer: str, *, concept, composite,
-                     normalize, device: str) -> np.ndarray:
+                     normalize, device: str, include_negative: bool = False) -> np.ndarray:
     """Per-detector relevance of ONE input image at ``layer`` (local analysis):
     initialise relevance at the image's true class and read it on each concept.
     Returns a ``(n_det,)`` vector — argsort gives the detectors most relevant to
-    *this* image."""
+    *this* image. ``include_negative=False`` (default) scores positive relevance
+    only."""
     xin = normalize(x[None].to(device)).requires_grad_(True)
     res = attribution(xin, [{"y": [int(target)]}], composite, record_layer=[layer],
                       mask_map=concept.mask)
-    return concept.attribute(res.relevances[layer], abs_norm=False)[0].detach().cpu().numpy()
+    rel = res.relevances[layer]
+    rel = rel if include_negative else rel.clamp(min=0)
+    return concept.attribute(rel, abs_norm=False)[0].detach().cpu().numpy()
 
 
 def render_local_entry(fv, attribution, ds, x, target: int, layer: str, cid: int, *,
                        mode: str, n_ref: int, composite, concept, normalize, device: str,
                        crop: bool, plot: str, out_dir: Path, meta_extra: dict,
-                       fv_class: str = "original") -> float:
+                       fv_class: str = "original", include_negative: bool = False) -> float:
     """Local analysis of one detector for one input image: the leftmost column is
     the query image + its *conditional* CRP heatmap; the remaining columns are the
     detector's dataset **representatives** so the reader can tell what the locally-
@@ -320,16 +363,22 @@ def render_local_entry(fv, attribution, ds, x, target: int, layer: str, cid: int
     ref_s, ref_h = class_conditional_references(
         attribution, fv, ds, layer, cid, n_ref=n_ref, mode=mode, composite=composite,
         concept=concept, normalize=normalize, device=device, fv_class=fv_class,
-        query_target=(int(target) if fv_class == "aligned" else None))
+        query_target=(int(target) if fv_class == "aligned" else None),
+        include_negative=include_negative)
     xin = normalize(x[None].to(device)).requires_grad_(True)
     res = attribution(xin, [{layer: [int(cid)], "y": [int(target)]}], composite,
                       record_layer=[layer], mask_map=concept.mask)
     local_h = res.heatmap.detach().cpu()                     # (1, H, W)
-    rel = float(concept.attribute(res.relevances[layer], abs_norm=False)[0, int(cid)])
+    rel_vec = res.relevances[layer]
+    if not include_negative:
+        local_h = local_h.clamp(min=0)                       # clamped flavour: positive only
+        rel_vec = rel_vec.clamp(min=0)
+    rel = float(concept.attribute(rel_vec, abs_norm=False)[0, int(cid)])
     # Column 0 = query image + local heatmap; columns 1.. = global representatives.
     imgs = torch.cat([x[None].detach().cpu(), ref_s.detach().cpu()], dim=0)
     heats = torch.cat([local_h, ref_h.detach().cpu()], dim=0)
-    rows, nsub, row_lbl = build_rows(imgs, heats, plot=plot, crop=crop)
+    rows, nsub, row_lbl = build_rows(imgs, heats, plot=plot, crop=crop,
+                                     signed=include_negative)
     ref = {cid: rows}
     ncols = len(rows[0]) if nsub > 1 else len(rows)
     fig = plot_grid(ref, figsize=(1.9 * ncols, 2.1 * nsub + 0.5))
@@ -356,21 +405,27 @@ def save_sample_image(ds, sample: dict, out_path: Path) -> None:
 
 
 def save_sample_heat(attribution, x, target: int, *, composite, normalize, device: str,
-                     out_path: Path) -> None:
+                     out_path: Path, include_negative: bool = False) -> None:
     """Save the sample input's OWN overall relevance heatmap — the full-model LRP
     attribution to its true class (all concepts, input space), the standard CRP
     saliency for that image. Instance-specific (the composite/model differ per
-    basis), so stored per concept_kind. Always (re)written."""
+    basis and relevance-sign flavour), so stored per concept_kind and flavour.
+    Always (re)written."""
     xin = normalize(x[None].to(device)).requires_grad_(True)
     res = attribution(xin, [{"y": [int(target)]}], composite)   # no layer cond → total heatmap
-    heat = res.heatmap.detach().cpu()[0]                         # (H, W)
-    # ViT input relevance is sparse — a few extreme pixels wash out a plain
-    # symmetric norm. Clip to a high percentile of |R| so the structure is visible.
-    vmax = float(np.quantile(heat.abs().numpy(), 0.995))
-    if vmax <= 0:
-        vmax = float(heat.abs().max()) or 1.0
+    heat = res.heatmap.detach().cpu()[0]
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    imgify(heat, cmap="bwr", vmin=-vmax, vmax=vmax, symmetric=False).save(out_path)
+    # ViT input relevance is sparse — a few extreme pixels wash out a plain
+    # norm. Clip to a high percentile so the structure is visible.
+    if include_negative:
+        v = float(np.quantile(heat.abs().numpy(), 0.995)) or 1.0
+        imgify(heat, cmap="bwr", vmin=-v, vmax=v, symmetric=True).save(out_path)
+    else:
+        heat = heat.clamp(min=0)                                 # clamped flavour: positive only
+        vmax = float(np.quantile(heat.numpy(), 0.995))
+        if vmax <= 0:
+            vmax = float(heat.max()) or 1.0
+        imgify(heat, cmap="wred", vmin=0, vmax=vmax, symmetric=False).save(out_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,16 +567,18 @@ def save_sample_ood(model, x, *, normalize, device: str, out_path: Path,
 # layer — so the layer dropdown lists each block exactly once per instance.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def instance_key(config: str, concept_kind: str) -> str:
-    return f"{config}::{concept_kind}"
+def instance_key(config: str, concept_kind: str, include_negative: bool = False) -> str:
+    key = f"{config}::{concept_kind}"
+    return f"{key}::negincl" if include_negative else key
 
 
-def instance_label(config: str, concept_kind: str) -> str:
+def instance_label(config: str, concept_kind: str, include_negative: bool = False) -> str:
+    suffix = " (negative included)" if include_negative else " (neg. clamped away)"
     if concept_kind == "embed_dim":
-        return f"{config} · axis-aligned"
+        return f"{config} · axis-aligned{suffix}"
     if concept_kind == "head":
-        return f"{config} · heads"
-    return f"{config} · {concept_kind}"
+        return f"{config} · heads{suffix}"
+    return f"{config} · {concept_kind}{suffix}"
 
 
 def _entry_title(fig, text: str) -> None:
@@ -543,7 +600,8 @@ def _row_labels(fig, ncols: int, labels: Tuple[str, ...]) -> None:
 def class_conditional_references(attribution, fv, ds, layer: str, cid: int, *, n_ref: int,
                                  mode: str, composite, concept, normalize, device: str,
                                  fv_class: str = "original",
-                                 query_target: Optional[int] = None):
+                                 query_target: Optional[int] = None,
+                                 include_negative: bool = False):
     """Top-``n_ref`` reference samples for a concept **with class-conditional CRP
     heatmaps**, as defined in the CRP paper.
 
@@ -594,7 +652,9 @@ def class_conditional_references(attribution, fv, ds, layer: str, cid: int, *, n
     xin = normalize(batch.to(device)).requires_grad_(True)
     conds = [{layer: [int(cid)], "y": [y]} for y in ys]
     res = attribution(xin, conds, composite, mask_map=concept.mask)
-    return batch.detach().cpu(), res.heatmap.detach().cpu()
+    heat = res.heatmap.detach().cpu()
+    # clamped flavour (default): only the positive part of the map is shown
+    return batch.detach().cpu(), (heat if include_negative else heat.clamp(min=0))
 
 
 def rf_crop_row(samples, heatmaps, *, vis_th: float = 0.2, crop_th: float = 0.1,
@@ -643,7 +703,7 @@ def rf_crop_row(samples, heatmaps, *, vis_th: float = 0.2, crop_th: float = 0.1,
     return out
 
 
-def build_rows(samples, heatmaps, *, plot: str, crop: bool):
+def build_rows(samples, heatmaps, *, plot: str, crop: bool, signed: bool = False):
     """Sub-rows of one detector's figure. Returns ``(rows, nsub, row_labels)``.
 
     ``heat_rf`` (default) shows the three views together: the reference image, its
@@ -652,10 +712,15 @@ def build_rows(samples, heatmaps, *, plot: str, crop: bool):
     low-relevance pixels faded (``vis_opaque_img``). The crop answers "which part of
     the image does this concept latch onto?" without having to read heatmap colours.
     The RF row is always cropped (that is what the row *is*); ``crop`` still governs
-    whether the image/heatmap rows are clipped too."""
+    whether the image/heatmap rows are clipped too.
+
+    ``signed=False`` renders positive-only maps (red, the clamped flavour);
+    ``signed=True`` renders the signed map (bwr, the include-negative flavour)."""
     if plot == "opaque":
         return vis_opaque_img(samples, heatmaps, rf=crop), 1, ("concept",)
-    imgs, heats = vis_img_heatmap(samples, heatmaps, rf=crop)
+    vis_kw = {"cmap": "bwr", "symmetric": True} if signed else \
+             {"cmap": "wred", "vmin": 0, "symmetric": False}
+    imgs, heats = vis_img_heatmap(samples, heatmaps, rf=crop, **vis_kw)
     if plot != "heat_rf":
         return (imgs, heats), 2, ("image", "relevance")
     rf = rf_crop_row(samples, heatmaps)
@@ -664,7 +729,8 @@ def build_rows(samples, heatmaps, *, plot: str, crop: bool):
 
 def render_entry(fv, attribution, ds, layer: str, cid: int, *, mode: str, n_ref: int,
                  composite, concept, normalize, device: str, crop: bool, plot: str,
-                 out_dir: Path, meta_extra: dict, fv_class: str = "original") -> None:
+                 out_dir: Path, meta_extra: dict, fv_class: str = "original",
+                 include_negative: bool = False) -> None:
     """Render + write one detector's figure (png+pdf) and meta.json (merge-not-wipe).
 
     Retrieve the reference images + their **class-conditional** CRP heatmaps (see
@@ -675,8 +741,10 @@ def render_entry(fv, attribution, ds, layer: str, cid: int, *, mode: str, n_ref:
     """
     samples, heatmaps = class_conditional_references(
         attribution, fv, ds, layer, cid, n_ref=n_ref, mode=mode, composite=composite,
-        concept=concept, normalize=normalize, device=device, fv_class=fv_class)
-    rows, nsub, row_lbl = build_rows(samples, heatmaps, plot=plot, crop=crop)
+        concept=concept, normalize=normalize, device=device, fv_class=fv_class,
+        include_negative=include_negative)
+    rows, nsub, row_lbl = build_rows(samples, heatmaps, plot=plot, crop=crop,
+                                     signed=include_negative)
     ref = {cid: rows}
     ncols = len(rows[0]) if nsub > 1 else len(rows)
     fig = plot_grid(ref, figsize=(1.9 * ncols, 2.1 * nsub + 0.5))
@@ -693,9 +761,10 @@ def render_entry(fv, attribution, ds, layer: str, cid: int, *, mode: str, n_ref:
 
 def record_job(spec: dict) -> None:
     """Append/merge a job line in jobs.jsonl (dedup by
-    base,dataset,config,site,concept,fv_class)."""
+    base,dataset,config,site,concept,fv_class,include_negative)."""
     key = (spec["base"], spec["dataset"], spec["config"], spec["site"],
-           spec["concept"], spec.get("fv_class", "original"))
+           spec["concept"], spec.get("fv_class", "original"),
+           bool(spec.get("include_negative", False)))
     jobs = []
     if JOBS_PATH.exists():
         for line in JOBS_PATH.read_text().splitlines():
@@ -704,7 +773,8 @@ def record_job(spec: dict) -> None:
                 continue
             j = json.loads(line)
             jk = (j["base"], j["dataset"], j["config"], j["site"],
-                  j["concept"], j.get("fv_class", "original"))
+                  j["concept"], j.get("fv_class", "original"),
+                  bool(j.get("include_negative", False)))
             if jk != key:
                 jobs.append(j)
     jobs.append(spec)
@@ -765,9 +835,10 @@ def rebuild_manifest() -> dict:
                 ck, layer = meta["concept_kind"], meta["layer"]
                 sample = meta.get("sample", "aggregate")
                 fvc = meta.get("fv_class", "original")
+                neg = bool(meta.get("include_negative", False))
                 rel = meta_path.parent.relative_to(GALLERY_DIR)
-                inst = m["instances"].setdefault(instance_key(config, ck), {
-                    "config": config, "basis": ck, "label": instance_label(config, ck),
+                inst = m["instances"].setdefault(instance_key(config, ck, neg), {
+                    "config": config, "basis": ck, "label": instance_label(config, ck, neg),
                     "composite": composite,
                     "concept_desc": concept_kind_desc(ck, meta["site"]),
                     "fv": {}})
@@ -776,7 +847,7 @@ def rebuild_manifest() -> dict:
                 srec = fvrec["samples"].setdefault(sample, {
                     "label": meta.get("sample_label") or ("Aggregate" if sample == "aggregate" else sample),
                     "image": sample_imgs.get(sample),
-                    "heat": sample_heats.get(ck, {}).get(sample),
+                    "heat": sample_heats.get(ck + ("--negincl" if neg else ""), {}).get(sample),
                     "normmap": sample_norms.get(sample),
                     "xai": sample_xai.get(sample),
                     "ood_tokens": (ood_counts.get(sample) or {}).get("ood_tokens"),
@@ -786,6 +857,7 @@ def rebuild_manifest() -> dict:
                     "entries": []})
                 lrec["entries"].append({
                     "id": meta["concept_id"], "rank": meta.get("rank"),
+                    "ref": meta.get("ref", "relsum"),
                     "relevance": meta.get("relevance"),
                     "png": str(rel / "entry.png"), "pdf": str(rel / "entry.pdf")})
             for inst in m["instances"].values():
@@ -872,28 +944,47 @@ def run_spec(spec: dict, device: str) -> None:
     fv_class = spec.get("fv_class", "original")
     if fv_class not in FV_CLASS_LABELS:
         raise typer.BadParameter(f"--fv-class must be one of {FV_CLASS_LABELS}, got {fv_class!r}")
+    # Relevance-sign flavour: default drops negative relevance (index, rankings,
+    # scores, displayed maps); include_negative keeps the fully signed quantities.
+    include_negative = bool(spec.get("include_negative", False))
 
-    # Model = zoo class keyed by the canonical model tag (experiments/models/zoo.py).
-    model_key = f"{base}_{dataset}"
-    if model_key not in MODELS:
-        raise typer.BadParameter(f"no zoo model {model_key!r}; known: {sorted(MODELS)}")
+    # Model + dataset via the ModelDataset registry (experiments/model_datasets).
+    # The pair's flat tag (mdset.tag == f"{base}_{dataset}") names the FV cache /
+    # figure tree, unchanged from the old zoo tag.
     ckpt = spec.get("checkpoint")
-    model = MODELS[model_key](**({"checkpoint": ckpt} if ckpt else {}), device=device)
+    try:
+        mdset = find(base, dataset, device=device, checkpoint=ckpt)
+    except ValueError as e:
+        raise typer.BadParameter(str(e))
+    model = mdset.model
     num_classes, head_name = model.num_classes, model.head_name
     label = f"{base} · {head_name} · {dataset}"
 
     num_heads = model.backbone.blocks[0].attn.num_heads
-    transform, normalize = backbone_transforms(model.backbone)
+    transform, normalize = mdset.transform, mdset.normalize
     # ImageNet: the gallery indexes and serves the FULL 50k val split (FV builds
     # on local scratch, so the old NFS small-file wedge no longer forces a subset).
-    ds = load_eval_dataset(dataset, transform, None)
+    ds = mdset.dataset
     concept = make_concept(concept_kind, num_heads)
-    comp_cls = COMPOSITES[config]
 
     md = f"{base}_{dataset}"
-    layers = resolve_layers(model, site, blocks)
+    comp_cls = COMPOSITES[config]
+    if site in PROBE_SITES:
+        # Probe layers exist only after the composite canonizes the model — validate
+        # the names against the canonized module set, not the bare model.
+        with comp_cls().context(model.eval()) as canon:
+            known = set(dict(canon.named_modules()))
+        layers = resolve_layers(model, site, blocks, known=known)
+    else:
+        layers = resolve_layers(model, site, blocks)
     model_tag = md
-    attribution = CondAttribution(model)
+    # All composites are grad×input (g-convention): the read-out is uniformly
+    # heatmap = x.grad·x, per-layer relevance = g×activation.
+    if fv_class != "original":
+        raise typer.BadParameter(
+            "the aligned FV path has no g-convention adapter yet")
+    attribution = GradTimesInputAttribution(model)
+    fv_cls = GradTimesInputFeatureVisualization
     layer_names = [ln for _, ln in layers]
     # The FV index feeds the AGGREGATE view (reference sample indices), fv_index ranking,
     # AND the single-image local view (each locally-relevant detector is shown with
@@ -911,6 +1002,8 @@ def run_spec(spec: dict, device: str) -> None:
         # The aligned index lives in a sibling directory (suffix --aligned) so the
         # two flavours never mix on disk.
         fv_dirname = config if fv_class == "original" else f"{config}--aligned"
+        if include_negative:
+            fv_dirname += "--negincl"
         fv_dir = Path(CACHE_ROOT) / "fv" / model_tag / fv_dirname
         rel = fv_dir.relative_to(CACHE_ROOT)                 # fv/<model_tag>/<dirname>
         storage.sync(CACHE_MIRROR / rel, fv_dir)             # hydrate (no-op if scratch already has it)
@@ -930,8 +1023,9 @@ def run_spec(spec: dict, device: str) -> None:
             # per-class broadcast triples the effective batch — keep it bounded
             fv_batch = 12
         else:
-            fv = FeatureVisualization(attribution, ds, {ln: concept for ln in layer_names},
-                                      preprocess_fn=normalize, path=str(fv_dir), device=device)
+            fv = fv_cls(attribution, ds, {ln: concept for ln in layer_names},
+                        preprocess_fn=normalize, path=str(fv_dir), device=device,
+                        negative_clamp=not include_negative)
             fv_batch = 32
         fv_path = Path(fv.RelMax.PATH)
         have = fv_path.exists() and all(any(fv_path.glob(f"{ln}_data.npy")) for ln in layer_names)
@@ -945,6 +1039,22 @@ def run_spec(spec: dict, device: str) -> None:
                   f"for {len(layer_names)} layer(s)…")
             fv.run(comp_cls(), 0, end, batch_size=fv_batch)
             storage.sync(fv_dir, CACHE_MIRROR / rel)         # persist the fresh build
+        # Sibling index ranked by token-MAX (stores {Rel|Act}Max_max_normed) —
+        # the sum/max pair serves the four REF_MODES. Original fv_class only.
+        fv_max = None
+        if fv_class == "original":
+            fv_max = fv_cls(attribution, ds, {ln: concept for ln in layer_names},
+                            preprocess_fn=normalize, path=str(fv_dir),
+                            max_target="max", device=device,
+                            negative_clamp=not include_negative)
+            max_path = Path(fv_max.RelMax.PATH)
+            have_max = max_path.exists() and all(any(max_path.glob(f"{ln}_data.npy")) for ln in layer_names)
+            if not have_max:
+                end = fv_end if fv_end > 0 else len(ds)
+                print(f"[{md}/{config}] building max-ranked FV index over {end} samples "
+                      f"for {len(layer_names)} layer(s)…")
+                fv_max.run(comp_cls(), 0, end, batch_size=fv_batch)
+                storage.sync(fv_dir, CACHE_MIRROR / rel)
 
     # Correctly-classified sample for class-conditional ranking.
     target_classes = sorted(set(classes) & set(range(num_classes))) if classes else list(range(num_classes))
@@ -960,12 +1070,14 @@ def run_spec(spec: dict, device: str) -> None:
     # Fixed comparison images (shown across every layer of this instance). Saved
     # once at md level; their raw thumbnail goes to the web. Empty ⇒ aggregate-only.
     samples = pick_samples(dataset, ds) if spec.get("samples", True) else []
-    heat_dir = config_dir / "_sample_heat" / concept_kind
+    heat_key = concept_kind + ("--negincl" if include_negative else "")
+    heat_dir = config_dir / "_sample_heat" / heat_key
     for s in samples:
         save_sample_image(ds, s, config_dir.parent / "_samples" / f"{s['key']}.png")
         save_sample_heat(attribution, ds[s["ds_index"]][0], s["target"],
                          composite=comp_cls(), normalize=normalize, device=device,
-                         out_path=heat_dir / f"{s['key']}.png")
+                         out_path=heat_dir / f"{s['key']}.png",
+                         include_negative=include_negative)
     if samples:
         print(f"[{md}/{config}] {len(samples)} single-image sample(s): "
               f"{[s['key'] for s in samples]}")
@@ -987,16 +1099,20 @@ def run_spec(spec: dict, device: str) -> None:
     for b, layer in layers:
         scores = rank_scores(rank_mode, attribution=attribution, ds=ds, sel=sel, layer=layer,
                              concept=concept, composite=comp_cls(), normalize=normalize,
-                             device=device, fv=fv)
+                             device=device, fv=fv, include_negative=include_negative)
         order = list(np.argsort(scores)[::-1])               # descending
         rank_of = {int(cid): r for r, cid in enumerate(order)}
         ids = list(dict.fromkeys([int(c) for c in order[:n]] + detectors))
         print(f"[{md}/{config}] block {b} ({layer}): {len(ids)} detector(s) → {ids}")
         base_meta = {"layer": layer, "site": site, "block": b,
-                     "concept_kind": concept_kind, "config": config, "fv_class": fv_class}
+                     "concept_kind": concept_kind, "config": config, "fv_class": fv_class,
+                     "include_negative": include_negative}
         # Entries of the two FV flavours live in disjoint subtrees so recomputes
         # of one never touch the other; the manifest keys them by meta fv_class.
+        # The negincl sign flavour nests one level deeper inside that subtree.
         entries_root = config_dir if fv_class == "original" else config_dir / "fv_aligned"
+        if include_negative:
+            entries_root = entries_root / "negincl"
         # Aggregate view: top reference images across the dataset (needs FV).
         if not only_samples:
             for cid in ids:
@@ -1004,7 +1120,8 @@ def run_spec(spec: dict, device: str) -> None:
                 render_entry(fv, attribution, ds, layer, cid, mode=mode, n_ref=n_ref,
                              composite=comp_cls(), concept=concept, normalize=normalize,
                              device=device, crop=crop, plot=plot, out_dir=out_dir,
-                             fv_class=fv_class, meta_extra={
+                             fv_class=fv_class, include_negative=include_negative,
+                             meta_extra={
                                  **base_meta, "sample": "aggregate", "sample_label": "Aggregate",
                                  "rank": rank_of.get(int(cid)), "relevance": float(scores[int(cid)]),
                              })
@@ -1015,17 +1132,27 @@ def run_spec(spec: dict, device: str) -> None:
             shutil.rmtree(img_root / s["key"], ignore_errors=True)   # drop stale detectors
             x = ds[s["ds_index"]][0]
             det = local_relevances(attribution, x, s["target"], layer, concept=concept,
-                                   composite=comp_cls(), normalize=normalize, device=device)
+                                   composite=comp_cls(), normalize=normalize, device=device,
+                                   include_negative=include_negative)
             l_ids = list(dict.fromkeys([int(c) for c in np.argsort(det)[::-1][:n]] + detectors))
             print(f"[{md}/{config}] block {b} · {s['key']}: local detectors → {l_ids}")
+            ref_fvs = {"sum": fv, "max": fv_max}
             for r_local, cid in enumerate(l_ids):
-                render_local_entry(fv, attribution, ds, x, s["target"], layer, cid, mode=mode,
-                                   n_ref=n_ref, composite=comp_cls(), concept=concept,
-                                   normalize=normalize, device=device, crop=crop, plot=plot,
-                                   out_dir=img_root / s["key"] / str(cid), fv_class=fv_class,
-                                   meta_extra={
-                                       **base_meta, "sample": s["key"],
-                                       "sample_label": s["label"], "rank": r_local})
+                for ref_name, (ref_quantity, ref_reduction, _lbl) in REF_MODES.items():
+                    ref_fv = ref_fvs[ref_reduction]
+                    if ref_fv is None:
+                        continue                     # max stores absent (aligned fv_class)
+                    if fv_class == "aligned" and ref_quantity != "relevance":
+                        continue                     # aligned index is relevance-only
+                    render_local_entry(ref_fv, attribution, ds, x, s["target"], layer, cid,
+                                       mode=ref_quantity,
+                                       n_ref=n_ref, composite=comp_cls(), concept=concept,
+                                       normalize=normalize, device=device, crop=crop, plot=plot,
+                                       out_dir=img_root / s["key"] / ref_name / str(cid),
+                                       fv_class=fv_class, include_negative=include_negative,
+                                       meta_extra={
+                                           **base_meta, "sample": s["key"], "ref": ref_name,
+                                           "sample_label": s["label"], "rank": r_local})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1034,7 +1161,7 @@ def run_spec(spec: dict, device: str) -> None:
 
 @app.command()
 def compute(
-    base: str = typer.Option("vit_small", "--base", help="backbone; <base>_<dataset> must be a models.MODELS key"),
+    base: str = typer.Option("vit_small", "--base", help="model axis; (base, dataset) must be a registered model_datasets pair"),
     dataset: str = typer.Option(..., "--dataset", help=f"dataset key: {sorted(EVAL_DATASETS)}"),
     config: str = typer.Option("cp_lrp_baseline", "--config", help=f"composite name: {sorted(COMPOSITES)}"),
     site: str = typer.Option("proj_drop", "--site", help=f"probe site: {tuple(SITE_LAYERS)}"),
@@ -1042,7 +1169,7 @@ def compute(
     concept: str = typer.Option("embed_dim", "--concept", help=f"concept kind: {CONCEPTS}"),
     n: int = typer.Option(5, "--n", help="auto top-n most-relevant detectors per layer"),
     detectors: List[int] = typer.Option([], "--detectors", help="extra explicit detector ids (additive)"),
-    n_ref: int = typer.Option(6, "--n-ref", help="number of representative images per detector"),
+    n_ref: int = typer.Option(12, "--n-ref", help="number of representative images per detector"),
     mode: str = typer.Option("relevance", "--mode", help="relevance | activation"),
     plot: str = typer.Option("heat_rf", "--plot", help="heat_rf (img+saliency+receptive-field crop) | heatmap (img+saliency) | opaque (masked crop)"),
     crop: bool = typer.Option(False, "--crop", help="clip each reference to its saliency map's high-relevance region (CRP receptive-field crop)"),
@@ -1053,6 +1180,7 @@ def compute(
     classes: List[int] = typer.Option([], "--classes", help="restrict ranking to these classes"),
     n_rank: int = typer.Option(8, "--n-rank", help="correct images per class for ranking"),
     fv_end: int = typer.Option(0, "--fv-end", help="cap FV-index samples (0 = full dataset)"),
+    include_negative: bool = typer.Option(False, "--include-negative/--no-include-negative", help="keep negative relevance in the FV index, rankings, scores and displayed maps (default: dropped); renders a parallel '<config>/negincl' flavour"),
     checkpoint: Optional[str] = typer.Option(None, "--checkpoint", help="explicit best.pt path (finetuned-probe models only)"),
     device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", "--device"),
 ):
@@ -1066,6 +1194,7 @@ def compute(
         "n_ref": n_ref, "mode": mode, "plot": plot, "crop": crop, "samples": samples,
         "only_samples": only_samples, "rank": rank, "fv_class": fv_class,
         "classes": list(classes), "n_rank": n_rank, "fv_end": fv_end,
+        "include_negative": include_negative,
         "checkpoint": checkpoint,
         "created": _now(),
     }

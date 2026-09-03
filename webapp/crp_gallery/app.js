@@ -1,7 +1,7 @@
 // Static CRP gallery — reads manifest.json and drives cascading selects.
 // No build step, no framework. Empty manifest ⇒ empty selects.
 // Cascade: model+dataset → instance (composite × basis) → FV index class
-//          → image sample → layer.
+//          → image sample → layer → reference ranking (relsum/relmax/actsum/actmax).
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -155,13 +155,35 @@ function renderComposite(inst) {
   }
 }
 
+const REF_LABELS = {
+  relsum: "RelSum — relevance · token-sum",
+  relmax: "RelMax — relevance · token-max",
+  actsum: "ActSum — activation · token-sum",
+  actmax: "ActMax — activation · token-max",
+};
+const REF_ORDER = ["relsum", "relmax", "actsum", "actmax"];
+
 function onLayerChange() {
+  const s = curSample();
+  const ln = $("sel-layer").value;
+  const L = s && ln ? s.layers[ln] : null;
+  const all = (L && L.entries) || [];
+  // ref options present at this layer; keep the current choice if it exists
+  const present = REF_ORDER.filter((r) => all.some((e) => (e.ref || "relsum") === r));
+  const prev = $("sel-ref").value;
+  fillSelect($("sel-ref"), present, (r) => REF_LABELS[r] || r);
+  if (present.includes(prev)) $("sel-ref").value = prev;
+  onRefChange();
+}
+
+function onRefChange() {
   const s = curSample();
   const entries = $("entries");
   entries.innerHTML = "";
   const ln = $("sel-layer").value;
   const L = s && ln ? s.layers[ln] : null;
-  const list = (L && L.entries) || [];
+  const ref = $("sel-ref").value;
+  const list = ((L && L.entries) || []).filter((e) => (e.ref || "relsum") === ref);
   $("empty-msg").hidden = list.length > 0;
   for (const e of list) {
     const fig = document.createElement("figure");
@@ -195,6 +217,7 @@ async function main() {
   $("sel-fvclass").addEventListener("change", onFvClassChange);
   $("sel-sample").addEventListener("change", onSampleChange);
   $("sel-layer").addEventListener("change", onLayerChange);
+  $("sel-ref").addEventListener("change", onRefChange);
   onModelChange();
 }
 
