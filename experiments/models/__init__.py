@@ -82,10 +82,9 @@ def build_probe(
 
 # Imported last: zoo composes bases/heads via the registries defined above.
 from .zoo import (  # noqa: E402
-    MODELS, DEFAULT_MODELS,
     FinetunedProbe, FunnyBirdsViTSmall, FunnyBirdsDinoV3Small,
     DspritesViTSmall, ColoredMnistViTSmall,
-    ImagenetViTBase, ImagenetDinoV3Base,
+    ImagenetViTBase, ImagenetViTBaseTorchvision, ImagenetDinoV3Base,
     DINOV3_IN1K_HEAD_REPOS, load_dinov3_in1k_head,
 )
 from .eval import select_correct  # noqa: E402
@@ -97,10 +96,9 @@ __all__ = [
     "Probe",
     "build_base", "build_head", "build_probe",
     "backbone_transforms",
-    "MODELS", "DEFAULT_MODELS",
     "FinetunedProbe", "FunnyBirdsViTSmall", "FunnyBirdsDinoV3Small",
     "DspritesViTSmall", "ColoredMnistViTSmall",
-    "ImagenetViTBase", "ImagenetDinoV3Base",
+    "ImagenetViTBase", "ImagenetViTBaseTorchvision", "ImagenetDinoV3Base",
     "DINOV3_IN1K_HEAD_REPOS", "load_dinov3_in1k_head",
     "select_correct",
 ]

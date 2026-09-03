@@ -11,15 +11,15 @@ Every model exposes the same surface:
 * ``num_classes`` / ``head_name`` / ``source`` — metadata (``source`` is the
   provenance string: checkpoint path, ``timm:<name>``, or an HF repo id).
 
-:data:`MODELS` maps the canonical model tag (``<base>_<dataset>``, the string
-that keys FV caches and the gallery figure tree — keep stable) to its class.
-:data:`DEFAULT_MODELS` maps an eval-dataset key to the journal model used for
-it by default (concept flipping, gallery ``checkpoint`` source).
+Pairing a model with a dataset — and the flat ``<model>_<dataset>`` tag that
+keys FV caches and the gallery figure tree — lives in
+:mod:`experiments.model_datasets` (``find`` / ``find_by_tag``); this module is
+just the class definitions.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Type
+from typing import Optional
 
 import timm
 import torch
@@ -131,6 +131,51 @@ class ImagenetViTBase(nn.Module):
         return self.backbone(x)
 
 
+def _timm_key_from_torchvision(key: str) -> str:
+    """torchvision ViT state-dict key -> timm state-dict key (1:1 bijection,
+    verified logit-exact both directions on ViT-B/16)."""
+    import re
+    key = key.replace("class_token", "cls_token").replace("conv_proj", "patch_embed.proj")
+    key = key.replace("encoder.pos_embedding", "pos_embed")
+    m = re.match(r"encoder\.layers\.encoder_layer_(\d+)\.(.*)", key)
+    if m:
+        i, rest = m.groups()
+        rest = (rest.replace("ln_1", "norm1").replace("ln_2", "norm2")
+                    .replace("self_attention.in_proj_weight", "attn.qkv.weight")
+                    .replace("self_attention.in_proj_bias", "attn.qkv.bias")
+                    .replace("self_attention.out_proj", "attn.proj")
+                    .replace("mlp.linear_1", "mlp.fc1").replace("mlp.linear_2", "mlp.fc2")
+                    .replace("mlp.0", "mlp.fc1").replace("mlp.3", "mlp.fc2"))
+        return f"blocks.{i}.{rest}"
+    return key.replace("encoder.ln", "norm").replace("heads.head", "head")
+
+
+class ImagenetViTBaseTorchvision(ImagenetViTBase):
+    """timm ViT-B/16 skeleton carrying the torchvision ``ViT_B_16`` /
+    ``IMAGENET1K_V1`` checkpoint, transplanted via the key bijection
+    (weights only — architecture and all tooling stay the timm layout).
+    ``pretrained_cfg`` is overridden to the V1 preset's preprocessing (256
+    bilinear resize → 224 crop → ImageNet mean/std), so ``backbone_transforms``
+    yields the pipeline these weights were trained with, not the augreg2 one.
+    Journal model record M7."""
+
+    def __init__(self, *, device: str = "cpu"):
+        super().__init__(device=device)
+        from torchvision.models import ViT_B_16_Weights
+        tv_state = ViT_B_16_Weights.IMAGENET1K_V1.get_state_dict(progress=False)
+        self.backbone.load_state_dict(
+            {_timm_key_from_torchvision(k): v for k, v in tv_state.items()}, strict=True)
+        # preprocessing follows the weights: torchvision V1 preset
+        self.backbone.pretrained_cfg = dict(
+            self.backbone.pretrained_cfg,
+            mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),
+            interpolation="bilinear", crop_pct=224 / 256,
+            input_size=(3, 224, 224),
+        )
+        self.eval().to(device)
+        self.source = "torchvision:ViT_B_16/IMAGENET1K_V1 (timm-skeleton transplant)"
+
+
 # The canvit probes (https://github.com/m2b3/dinov3-in1k-probes) are linear
 # classifiers on the frozen DINOv3 cls token, trained on ImageNet-1k at
 # 512×512, published per backbone size:
@@ -181,32 +226,14 @@ class ImagenetDinoV3Base(nn.Module):
         return self.head(self.backbone.forward_features(x)[:, 0])
 
 
-# ── Registries ────────────────────────────────────────────────────────────────
-
-# Keyed by the canonical model tag ``<base>_<dataset>`` — the same string that
-# names FV cache dirs and the gallery figure tree. Keep keys stable.
-MODELS: Dict[str, Type[nn.Module]] = {
-    "vit_small_funny_birds":        FunnyBirdsViTSmall,
-    "vit_dinov3_small_funny_birds": FunnyBirdsDinoV3Small,
-    "vit_small_dsprites":           DspritesViTSmall,
-    "vit_small_colored_mnist":      ColoredMnistViTSmall,
-    "vit_base_imagenet":            ImagenetViTBase,
-    "vit_dinov3_base_imagenet":     ImagenetDinoV3Base,
-}
-
-# Journal-default model per eval-dataset key (concept flipping, gallery
-# ``checkpoint`` model source).
-DEFAULT_MODELS: Dict[str, str] = {
-    "funny_birds":   "vit_small_funny_birds",
-    "dsprites":      "vit_small_dsprites",
-    "colored_mnist": "vit_small_colored_mnist",
-    "imagenet":      "vit_base_imagenet",
-}
+# Model↔dataset selection now lives in :mod:`experiments.model_datasets`
+# (``find`` / ``find_by_tag`` over the ``(model, dataset)`` registry). The zoo
+# keeps only the model classes; the flat ``<model>_<dataset>`` tag — still the
+# name of the FV cache dirs and gallery figure tree — is ``ModelDataset.tag``.
 
 __all__ = [
-    "MODELS", "DEFAULT_MODELS",
     "FinetunedProbe", "FunnyBirdsViTSmall", "FunnyBirdsDinoV3Small",
     "DspritesViTSmall", "ColoredMnistViTSmall",
-    "ImagenetViTBase", "ImagenetDinoV3Base",
+    "ImagenetViTBase", "ImagenetViTBaseTorchvision", "ImagenetDinoV3Base",
     "DINOV3_IN1K_HEAD_REPOS", "load_dinov3_in1k_head",
 ]
