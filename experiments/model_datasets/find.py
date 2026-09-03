@@ -37,3 +37,26 @@ def find(model: str, dataset: str, *,
             f"choose from {sorted(MODEL_DATASET_REGISTRY)}")
     cls = MODEL_DATASET_REGISTRY[key]
     return cls(device=device, ds_extra=ds_extra, checkpoint=checkpoint)
+
+
+def find_by_tag(tag: str, *,
+                device: Optional[str] = None,
+                ds_extra: Optional[dict] = None,
+                checkpoint: Optional[str] = None) -> ModelDataset:
+    """Like :func:`find`, but selects by the flat ``<model>_<dataset>`` tag
+    (e.g. ``"vit_base_imagenet"``) rather than the two axes.
+
+    For call sites whose stable identifier / CLI is the historical single tag
+    (``--model-key vit_base_imagenet``): this maps that tag to the registry pair
+    without the caller having to split it (which is ambiguous — model names
+    themselves contain underscores). ``md.tag`` round-trips the input.
+    """
+    from . import MODEL_DATASET_REGISTRY
+
+    t = tag.lower()
+    for model, dataset in MODEL_DATASET_REGISTRY:
+        if f"{model}_{dataset}" == t:
+            return find(model, dataset, device=device,
+                        ds_extra=ds_extra, checkpoint=checkpoint)
+    known = sorted(f"{m}_{d}" for m, d in MODEL_DATASET_REGISTRY)
+    raise ValueError(f"no ModelDataset for tag {tag!r}; choose from {known}")

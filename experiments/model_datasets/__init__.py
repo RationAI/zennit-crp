@@ -13,7 +13,7 @@ The registry is keyed by the two independent identifier axes; the on-disk
 artefact tag (``md.tag``) is their flat join, preserving existing cache/figure
 directories.
 """
-from .find import find
+from .find import find, find_by_tag
 from .model_dataset import ModelDataset
 from .names_paths import (
     DEFAULT_MODEL_FOR_DATASET,
@@ -60,6 +60,7 @@ def get_available_combinations() -> list[tuple[str, str]]:
 
 __all__ = [
     "find",
+    "find_by_tag",
     "ModelDataset",
     "MODEL_DATASET_REGISTRY",
     "DEFAULT_MODEL_FOR_DATASET",

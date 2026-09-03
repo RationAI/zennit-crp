@@ -113,6 +113,22 @@ def test_find_unknown_pair_raises():
         find("vit_small", "imagenet")   # valid axes, unregistered combo
 
 
+def test_find_by_tag_maps_every_registered_tag():
+    """find_by_tag resolves each canonical flat tag to the same class as the
+    two-axis find (checked via the registry, no instantiation)."""
+    from experiments.model_datasets import MODEL_DATASET_REGISTRY
+    from experiments.model_datasets.find import find_by_tag  # noqa: F401
+    # the flat-tag → pair reverse map must cover exactly the registry.
+    tag_to_pair = {f"{m}_{d}": (m, d) for m, d in MODEL_DATASET_REGISTRY}
+    assert set(tag_to_pair) == EXPECTED_TAGS
+
+
+def test_find_by_tag_unknown_raises():
+    from experiments.model_datasets import find_by_tag
+    with pytest.raises(ValueError, match="no ModelDataset for tag"):
+        find_by_tag("vit_base_not_a_dataset")
+
+
 def test_imagenet_mixin_class_labels():
     """ImagenetMixin maps indices to the ImageNet-1k category names (metadata
     table only — no model instantiation)."""
