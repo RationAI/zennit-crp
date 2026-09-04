@@ -151,3 +151,6 @@ tmp/
 # covers the FV index cache under data/crp_gallery_cache/).
 webapp/crp_gallery/figures/
 webapp/crp_gallery/manifest.json
+# grid-rendered artifacts: regenerable from experiments/concept_detector_bench.py
+figures/concept_detector_bench/
+webapp/concept_detector_bench/
