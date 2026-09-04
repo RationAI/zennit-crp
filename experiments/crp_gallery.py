@@ -58,7 +58,13 @@ import typer
 
 from torchvision.transforms.functional import gaussian_blur
 
-from zennit_extensions.lrp_composites import COMPOSITES
+from zennit_extensions.lrp_composites import COMPOSITES as _BASE_COMPOSITES
+
+# Gallery config aliases: same composite math, distinct config name so a set of
+# entries lands in its own labeled gallery instance. ``cp_lrp_baseline_optimal_actmax``
+# is the heuristic-optimal activation-max view (experiments/scripts/gallery_optimal_actmax.py).
+COMPOSITES = {**_BASE_COMPOSITES,
+              "cp_lrp_baseline_optimal_actmax": _BASE_COMPOSITES["cp_lrp_baseline"]}
 from experiments import storage
 from experiments import fv_aligned
 from experiments.gradinput import (
@@ -576,13 +582,20 @@ def instance_key(config: str, concept_kind: str, include_negative: bool = False)
     return f"{key}::negincl" if include_negative else key
 
 
+# Human-readable instance names for configs whose raw string is opaque.
+_CONFIG_LABELS = {
+    "cp_lrp_baseline_optimal_actmax": "CP-LRP · heuristic-optimal detectors · activation-max",
+}
+
+
 def instance_label(config: str, concept_kind: str, include_negative: bool = False) -> str:
     suffix = " (negative included)" if include_negative else " (neg. clamped away)"
+    base = _CONFIG_LABELS.get(config, config)
     if concept_kind == "embed_dim":
-        return f"{config} · axis-aligned{suffix}"
+        return f"{base} · axis-aligned{suffix}"
     if concept_kind == "head":
-        return f"{config} · heads{suffix}"
-    return f"{config} · {concept_kind}{suffix}"
+        return f"{base} · heads{suffix}"
+    return f"{base} · {concept_kind}{suffix}"
 
 
 def _entry_title(fig, text: str) -> None:

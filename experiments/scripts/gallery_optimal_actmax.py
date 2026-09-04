@@ -33,7 +33,10 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NPZ = REPO_ROOT / "data/results/benchmark/cdet_dapc_vit_small_funny_birds__optimal.npz"
 METHOD = "optimal"                 # greedy (Variant A); the first, complete heuristic
-BASE, DATASET, CONFIG = "vit_small", "funny_birds", "cp_lrp_baseline"
+# Distinct gallery config → own labeled instance ("CP-LRP · heuristic-optimal
+# detectors · activation-max"). Same CP-LRP math as cp_lrp_baseline (aliased in
+# crp_gallery.COMPOSITES); the FV index is shared/copied so no rebuild.
+BASE, DATASET, CONFIG = "vit_small", "funny_birds", "cp_lrp_baseline_optimal_actmax"
 
 # heuristic npz site  ->  gallery --site
 SITE_MAP = {
