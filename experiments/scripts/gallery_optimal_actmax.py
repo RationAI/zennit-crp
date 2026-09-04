@@ -1,24 +1,25 @@
-"""Populate the CRP gallery with activation-maximization entries for the concept
-detectors the heuristic-optimal search flagged as most important, per layer.
+"""Aggregate (consensus) activation-max gallery entries for the concept detectors
+the heuristic-optimal search flagged as most important, per layer.
 
-Model M1 = vit_small_funny_birds. The heuristic (experiments.concept_detector_optimal,
-greedy "optimal") stores, per (site, block, image), a MoRF removal order over the
-384 embedding channels. We take the *consensus* top-k detectors per (site, block)
-(mean rank across the 16 test images) and render each as a gallery act-max entry
-(reference images ranked by ActMax), reusing one FV index.
+Model-agnostic: works for any (model, dataset) that has a heuristic npz
+``data/results/benchmark/cdet_dapc_<model>_<dataset>__optimal.npz`` produced by
+experiments.concept_detector_optimal (method "optimal", greedy). The consensus
+top-k detectors per (site, block) = mean-rank over the ranked images. Each is
+rendered as a gallery act-max entry under the labeled config
+``cp_lrp_baseline_optimal_actmax`` (see crp_gallery.COMPOSITES / _CONFIG_LABELS).
 
-Sites: the heuristic's 4 sites map to gallery --site as
-    residual -> residual, proj_drop -> proj_drop, qk -> query, value -> value.
+The heuristic's 4 sites map to gallery --site:
+    residual->residual, proj_drop->proj_drop, qk->query, value->value.
 
-Two phases (so the GPU-heavy index build can run in one window, e.g. a grid pause):
-    build   — one FV index pass per site over all 12 blocks (no entries rendered)
+Two phases:
+    build   — ONE FV-index pass over the dataset recording ALL 48 layers
+              (4 sites x 12 blocks) at once — RelMax+ActMax sum stores; no entries.
     render  — one gallery entry per (site, block) for that block's consensus top-k
-              (index already built -> cheap; --no-samples skips per-sample saliency)
+              (index reused, GPU-light; --no-samples skips per-sample saliency).
 
 Usage::
-    uv run python -m experiments.scripts.gallery_optimal_actmax --phase build
-    uv run python -m experiments.scripts.gallery_optimal_actmax --phase render --k 5
-    uv run python -m experiments.scripts.gallery_optimal_actmax --phase render --dry-run
+    uv run python -m experiments.scripts.gallery_optimal_actmax --model vit_base --dataset imagenet --phase build
+    uv run python -m experiments.scripts.gallery_optimal_actmax --model vit_base --dataset imagenet --phase render --k 5
 """
 from __future__ import annotations
 
@@ -31,33 +32,28 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-NPZ = REPO_ROOT / "data/results/benchmark/cdet_dapc_vit_small_funny_birds__optimal.npz"
-METHOD = "optimal"                 # greedy (Variant A); the first, complete heuristic
-# Distinct gallery config → own labeled instance ("CP-LRP · heuristic-optimal
-# detectors · activation-max"). Same CP-LRP math as cp_lrp_baseline (aliased in
-# crp_gallery.COMPOSITES); the FV index is shared/copied so no rebuild.
-BASE, DATASET, CONFIG = "vit_small", "funny_birds", "cp_lrp_baseline_optimal_actmax"
+METHOD = "optimal"
+CONFIG = "cp_lrp_baseline_optimal_actmax"
 
-# heuristic npz site  ->  gallery --site
-SITE_MAP = {
-    "residual":  "residual",
-    "proj_drop": "proj_drop",
-    "qk":        "query",     # q_lrp_probe
-    "value":     "value",     # v_lrp_probe
-}
+# heuristic npz site -> gallery --site (SITE_LAYERS key)
+SITE_MAP = {"residual": "residual", "proj_drop": "proj_drop", "qk": "query", "value": "value"}
 BLOCKS = list(range(12))
 
 
-def _load():
-    d = np.load(NPZ, allow_pickle=True)
-    meta = json.loads(str(d["meta"]))
-    return d, meta["D"], len(meta["image_ids"])
+def npz_path(tag: str) -> Path:
+    return REPO_ROOT / f"data/results/benchmark/cdet_dapc_{tag}__optimal.npz"
 
 
-def consensus_top_k(d, D, nimg, npz_site: str, b: int, k: int) -> list[int]:
-    """Consensus most-important detectors for (site, block): invert each image's
-    MoRF order to a rank vector, average across images, take the k smallest
-    (= most-important-first)."""
+def n_images(d) -> int:
+    """Actual #images ranked per (site, block) — may be fewer than meta image_ids
+    (e.g. M2/imagenet ranked 4/combo, not the full candidate list)."""
+    import re
+    js = [int(m.group(1)) for k in d.files
+          if (m := re.match(rf"{METHOD}__residual__b0__img(\d+)__order", k))]
+    return max(js) + 1 if js else 0
+
+
+def consensus_top_k(d, D, nimg, npz_site, b, k):
     orders = np.stack([d[f"{METHOD}__{npz_site}__b{b}__img{j}__order"] for j in range(nimg)])
     ranks = np.empty_like(orders)
     for j in range(nimg):
@@ -65,39 +61,55 @@ def consensus_top_k(d, D, nimg, npz_site: str, b: int, k: int) -> list[int]:
     return [int(i) for i in np.argsort(ranks.mean(0))[:k]]
 
 
-def _compute_cmd(gallery_site: str, blocks: list[int], detectors: list[int],
-                 *, n_ref: int, device: str) -> list[str]:
+def phase_build(args, base, dataset, tag):
+    """One FV pass over the whole pool recording all 48 layers at once."""
+    import torch  # noqa: F401
+    from experiments.crp_gallery import make_concept, SITE_LAYERS, COMPOSITES
+    from experiments.gradinput import (
+        GradTimesInputAttribution, GradTimesInputFeatureVisualization)
+    from experiments.model_datasets import find
+
+    device = args.device
+    mdset = find(base, dataset, device=device)
+    model, normalize, ds = mdset.model, mdset.normalize, mdset.dataset
+    num_heads = model.backbone.blocks[0].attn.num_heads
+    concept = make_concept("embed_dim", num_heads)
+    attribution = GradTimesInputAttribution(model)
+    comp_cls = COMPOSITES[CONFIG]
+    layer_names = [SITE_LAYERS[SITE_MAP[s]][b] for s in SITE_MAP for b in BLOCKS]
+    fv_dir = REPO_ROOT / "data/crp_gallery_cache/fv" / tag / CONFIG
+    print(f"build: {len(layer_names)} layers over {len(ds)} images -> {fv_dir}")
+    if args.dry_run:
+        return
+    fv = GradTimesInputFeatureVisualization(
+        attribution, ds, {ln: concept for ln in layer_names},
+        preprocess_fn=normalize, path=str(fv_dir), device=device, negative_clamp=True)
+    end = len(ds) if not args.fv_end else min(args.fv_end, len(ds))
+    fv.run(comp_cls(), 0, end, batch_size=args.batch_size)
+    print(f"build done: index at {fv_dir}")
+
+
+def _render_cmd(base, dataset, gsite, b, detectors, n_ref, device):
     cmd = [sys.executable, "-m", "experiments.crp_gallery", "compute",
-           "--base", BASE, "--dataset", DATASET, "--config", CONFIG,
-           "--site", gallery_site, "--concept", "embed_dim",
-           "--mode", "activation", "--fv-class", "original",
-           "--rank", "fv_index", "--n", "0", "--n-ref", str(n_ref),
-           "--plot", "heat_rf", "--no-samples", "--device", device]
-    for b in blocks:
-        cmd += ["--blocks", str(b)]
+           "--base", base, "--dataset", dataset, "--config", CONFIG,
+           "--site", gsite, "--blocks", str(b), "--concept", "embed_dim",
+           "--mode", "activation", "--fv-class", "original", "--rank", "fv_index",
+           "--n", "0", "--n-ref", str(n_ref), "--plot", "heat_rf",
+           "--no-samples", "--device", device]
     for det in detectors:
         cmd += ["--detectors", str(det)]
     return cmd
 
 
-def phase_build(args):
-    """One FV-index pass per site over all 12 blocks (no detectors -> no entries,
-    but the index — RelMax+ActMax — is built and mirrored)."""
-    for npz_site, gsite in SITE_MAP.items():
-        cmd = _compute_cmd(gsite, BLOCKS, [], n_ref=args.n_ref, device=args.device)
-        print(f"\n=== BUILD site={gsite} (from heuristic '{npz_site}') ===\n{' '.join(cmd)}")
-        if not args.dry_run:
-            subprocess.run(cmd, cwd=REPO_ROOT, check=True)
-
-
-def phase_render(args):
-    """One entry per (site, block) for that block's consensus top-k detectors."""
-    d, D, nimg = _load()
+def phase_render(args, base, dataset, tag):
+    d = np.load(npz_path(tag), allow_pickle=True)
+    meta = json.loads(str(d["meta"]))
+    D, nimg = meta["D"], n_images(d)
     for npz_site, gsite in SITE_MAP.items():
         for b in BLOCKS:
             dets = consensus_top_k(d, D, nimg, npz_site, b, args.k)
-            cmd = _compute_cmd(gsite, [b], dets, n_ref=args.n_ref, device=args.device)
-            print(f"\n=== RENDER site={gsite} b{b} top{args.k}={dets} ===\n{' '.join(cmd)}")
+            cmd = _render_cmd(base, dataset, gsite, b, dets, args.n_ref, args.device)
+            print(f"RENDER {gsite} b{b} top{args.k}={dets}")
             if not args.dry_run:
                 subprocess.run(cmd, cwd=REPO_ROOT, check=True)
 
@@ -105,15 +117,24 @@ def phase_render(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--model", default="vit_small", help="model axis (M_* value)")
+    ap.add_argument("--dataset", default="funny_birds", help="dataset axis (DS_* value)")
     ap.add_argument("--phase", choices=["build", "render"], required=True)
-    ap.add_argument("--k", type=int, default=5, help="top-k detectors per (site, block)")
-    ap.add_argument("--n-ref", type=int, default=12, help="reference images per detector")
+    ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--n-ref", type=int, default=12)
+    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--fv-end", type=int, default=0, help="cap FV pool (0=full)")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--dry-run", action="store_true", help="print commands, run nothing")
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    if not NPZ.is_file():
-        sys.exit(f"heuristic npz not found: {NPZ}")
-    (phase_build if args.phase == "build" else phase_render)(args)
+
+    tag = f"{args.model}_{args.dataset}"
+    if not npz_path(tag).is_file():
+        sys.exit(f"heuristic npz not found: {npz_path(tag)}")
+    if args.phase == "build":
+        phase_build(args, args.model, args.dataset, tag)
+    else:
+        phase_render(args, args.model, args.dataset, tag)
 
 
 if __name__ == "__main__":
