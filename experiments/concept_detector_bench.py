@@ -380,8 +380,10 @@ def build_web(models_meta):
     method_info_json = json.dumps(METHOD_INFO)
     site_info_json = json.dumps(SITE_INFO)
     model_opts = "".join(opts_model)
+    cachebust = int(max((p.stat().st_mtime for p in WEB_DIR.glob("*.png")), default=0))
     site_opts = "".join(f'<option value="{s}">{SITE_LABEL[s]}</option>' for s in ALL_SITES)
-    method_opts = "".join(f'<option value="{m}">{METHOD_LABEL[m]}</option>' for m in ("chefer", "cp_lrp", "optimal", "random"))
+    method_opts = "".join(f'<option value="{m}">{METHOD_LABEL[m]}</option>'
+                          for m in ("chefer", "cp_lrp", "optimal", "optimal_dual", "random"))
     default_tag = models_meta[0][1]
 
     html = f"""<!DOCTYPE html>
@@ -445,9 +447,9 @@ function refresh() {{
   const noCurve = !AVAIL[`${{tag}}_${{site}}_${{method}}`];
   const img = document.getElementById("curve");
   img.style.display = noCurve ? "none" : "";
-  img.src = noCurve ? "" : `cdet_curves_${{tag}}_${{site}}_${{method}}.png`;
+  img.src = noCurve ? "" : `cdet_curves_${{tag}}_${{site}}_${{method}}.png?v={cachebust}`;
   document.getElementById("nocurve").style.display = noCurve ? "" : "none";
-  document.getElementById("bars").src=`cdet_bars_${{tag}}.png`;
+  document.getElementById("bars").src=`cdet_bars_${{tag}}.png?v={cachebust}`;
   document.getElementById("tblmodel").textContent=tag;
   for (const r of document.querySelectorAll("#tbody tr")) r.style.display = (r.dataset.model===tag)?"":"none";
   const s=SCORES[tag]||{{}};

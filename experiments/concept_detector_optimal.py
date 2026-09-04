@@ -1,52 +1,32 @@
-"""Heuristic optimal ranking for the concept-detector DAPC benchmark.
+"""Heuristic optimal rankings for the concept-detector DAPC benchmark.
 
-Journal `exp:insertion-deletion-bench`, paragraph "Optimal ranking -
-heuristic search": a greedy search for the removal ranking that maximises
-DAPC = area(LeRF) − area(MoRF). Two variants, written verbatim in the
-formulation's members (p_current = M(x|y) at the current removal state,
-τ(S)(x|y) = predicted-class probability with detector set S removed,
-Δ = p_current − τ, the decrease taken from the prediction):
+Journal `exp:insertion-deletion-bench`, "Optimal ranking - heuristic search"
+(+ "Optimal ranking - dual greedy"): greedy searches for the removal ranking
+that maximises DAPC = area(LeRF) − area(MoRF). All quantities are measured on
+predicted-class softmax probabilities (τ), never logits.
 
-* Variant A (O(n^2), ``greedy_order``): repeat — evaluate Δ_c for every
-  remaining single detector at the current state, remove the argmax
-  (highest decrease taken first). n + (n−1) + ... = n(n+1)/2 evaluations.
-* Variant B (O(n^3), ``pair_order``): repeat — evaluate Δ_{c1,c2} for every
-  pair, find the pair with the largest joint decrease, then remove the pair
-  member with the higher individual decrease.
-  (Spec text says "minimizes the Δ_{c1,c2}" — read as maximising the
-  decrease, i.e. minimising the ablated probability τ(c1,c2)(x|y); the
-  literal reading would pick the pair that changes the class LEAST and
-  contradicts the goal.)
+Terms (shared by all variants, defined once at the top):
+    p_current     = M(x|y) at the current removal state
+    tau(keep)     = pred-class softmax prob under a batch of keep-masks
+    Δ_c           = p_current − τ(c)(x|y)   (decrease taken from the prediction)
 
-Everything is measured on predicted-class softmax probabilities (competing
-classes are accounted for by the renormalisation), never on logits.
+Variants (all built from the same `marginal_deltas` primitive):
+    greedy  O(n^2)      per step remove argmax Δ_c (most damaging first)
+    dual    O(n^2)      per step rank TWO: argmax Δ → head (MoRF-first),
+                        argmin Δ → tail (LeRF-first)
+    pair    O(n^3)      per step remove the most damaging pair's stronger member
+                        (infeasible for grids; kept for spec completeness)
 
-Occlusion semantics (checked at startup, ``occlusion_check``): detector =
-one embedding-dim channel of the (B, N, D) tensor at the probe site;
-removal = zero that channel across all tokens — exactly the
-``EmbeddingDimConcept`` masking semantics applied forward-side
-(``concept.mask`` itself is a backward relevance hook and cannot be used in
-no_grad evaluation). Perturbation is batched: every row of a keep-mask is
-an independent eval.
+Occlusion: detector = one embed-dim channel at the (B, N, D) probe site;
+removal = zero that channel across all tokens (forward-side equivalent of
+EmbeddingDimConcept's relevance-stream masking; cf. `occlusion_check`).
 
-SELF-CONTAINED: imports nothing from experiments.concept_detector_bench
-(the shared ≤15-line primitives are inlined here verbatim); only the
-project-wide model/dataset loaders and the attention-substitution
-canonizer are shared infrastructure. Results land in
-``data/results/benchmark/cdet_dapc_<key>__optimal.npz`` and the bench
-renderer merges this side-car.
+Checkpoint/resume: OptimalStore commits the ORDER immediately after it is
+built (the expensive part) and curves right after; a rerun skips finished
+combos. Restart with the same command.
 
-CHECKPOINTING / RESUME: the OptimalStore re-saves after every finished
-sub-result. The expensive artefact of a combo is the removal *order*
-(~1–15 min); it is committed the moment it exists, and the cheap curve
-evaluation (~seconds) afterwards, so a crash mid-combo resumes by
-re-using the stored order. Combos with curves committed are skipped
-entirely. Restart by simply running the same command again.
-
-Usage:
-    VIRTUAL_ENV=$PWD/.venv .venv/bin/python -m experiments.concept_detector_optimal \
-        --action run --model-key vit_small_funny_birds --n-imgs 16
-    ... --action probe --mode pair --site residual --block 0   (single combo pilot/pair demo)
+CLI: --action run --model-key <tag> --mode {greedy,dual,pair} --n-imgs N
+     --action probe --site residual --block 11 --img 0
 """
 from __future__ import annotations
 
@@ -63,43 +43,39 @@ from experiments.models import backbone_transforms
 from experiments.model_datasets import find_by_tag
 from zennit_extensions.canonisation.canonizers import VanillaViTAttentionSubstitutionCanonizer
 
+# ── terms / constants ────────────────────────────────────────────────────────
 REPO = Path(__file__).resolve().parents[1]
 RES_DIR = REPO / "data" / "results" / "benchmark"
 if not torch.cuda.is_available():
-    raise RuntimeError("concept_detector_optimal requires CUDA (spec workloads are batched GPU forwards)")
+    raise RuntimeError("concept_detector_optimal requires CUDA")
 DEVICE = "cuda"
 
-BATCH = 256          # keep-mask rows per forward in tau() (rows are batch-independent)
-N_IMAGES = 16        # bench protocol: 16 correctly-classified images
-SEED = 0             # same seed as the bench → same picks
+BATCH = 256            # keep-mask rows per forward in tau()
+N_IMAGES = 16          # bench protocol images
+SEED = 0               # same seed as the bench → identical picks
 BLOCKS = list(range(12))
 ALL_SITES = ["residual", "proj_drop", "value", "qk"]
 
-# (zoo key, dataset key, ds_extra) — M1 = ViT-S/FB, M2 = ViT-B/ImageNet
 MODELS_CFG = [
     ("vit_base_imagenet", "imagenet", {}),
     ("vit_small_funny_birds", "funny_birds", {"split": "test"}),
 ]
 
+LAYER_NAME = {
+    "residual": "backbone.blocks.{b}",
+    "proj_drop": "backbone.blocks.{b}.attn.proj_drop",
+    "qk": "backbone.blocks.{b}.attn.q_lrp_probe",
+    "value": "backbone.blocks.{b}.attn.v_lrp_probe",
+}
+
 
 def layer_name(site: str, b: int) -> str:
-    return {
-        "residual": f"backbone.blocks.{b}",
-        "proj_drop": f"backbone.blocks.{b}.attn.proj_drop",
-        "qk": f"backbone.blocks.{b}.attn.q_lrp_probe",
-        "value": f"backbone.blocks.{b}.attn.v_lrp_probe",
-    }[site]
+    return LAYER_NAME[site].format(b=b)
 
 
-# ── forward occlusion (zero-ablation) ────────────────────────────────────────
+# ── occlusion (forward zero-ablation) ────────────────────────────────────────
 class ZeroChannelsHook:
-    """Batched keep-mask multiplication on the probed layer's output.
-
-    keep: (R, D) float where row r zeroes the removed detectors of eval r.
-    Applied as out * keep.unsqueeze(1) so out (R, N, D) keeps every token but
-    zeroes the removed channels. (Removal == "channel zeroed across all
-    tokens", cf. EmbeddingDimConcept's relevance-stream masking.)
-    """
+    """out * keep.unsqueeze(1): row r zeroes the removed channels of eval r."""
 
     def __init__(self):
         self.keep = None
@@ -112,31 +88,39 @@ class ZeroChannelsHook:
         return out * self.keep.unsqueeze(1)
 
 
-def occlusion_check(model, xn, pred, site, b, D):
-    """Fail-fast spec verification: removing detector d zeroes exactly channel
-    d across all tokens at the probe site, leaves the rest untouched, and the
-    measured value is a softmax **probability** in [0, 1]."""
-    mod = model.get_submodule(layer_name(site, b))
-    hook = ZeroChannelsHook()
-    hh = mod.register_forward_hook(hook)
-    seen = {}
+def keep_of(removed: np.ndarray, D: int) -> torch.Tensor:
+    """(D,) keep row of the current removal state: 1 = kept, 0 = removed."""
+    keep = torch.ones(D)
+    keep[removed] = 0.0
+    return keep
 
-    def rec(module, inp, out):
-        seen["shape"] = out.shape
-    hr = mod.register_forward_hook(rec)
-    try:
-        base = tau(model, xn, pred, torch.ones(1, D), hook, D)[0]
-        d = 0
-        rows = torch.ones(2, D)
-        rows[1, d] = 0.0
-        tau(model, xn, pred, rows, hook, D)
-        assert seen["shape"][-1] == D, f"probe width {seen['shape'][-1]} != D={D}"
-        assert 0.0 <= float(base) <= 1.0, f"not a probability: {base}"
-    finally:
-        hh.remove()
-        hr.remove()
-    print(f"  [occlusion-check] {site} b{b}: probe (B,N,{D}); keep-mask dims line up; "
-          f"base prob={base:.3f} OK", flush=True)
+
+# ── tau: measured quantity (softmax probability) ─────────────────────────────
+def tau(model, xn, pred, keep_rows, hook, D):
+    """τ(S)(x|y): pred-class softmax prob under keep-mask rows (R, D)."""
+    assert keep_rows.ndim == 2 and keep_rows.shape[1] == D, \
+        f"keep_rows {tuple(keep_rows.shape)} — expected (R, {D})"
+    assert xn.shape[0] == 1, "tau evaluates one image at a time"
+    out = torch.empty(keep_rows.shape[0])
+    with torch.no_grad():
+        for s in range(0, keep_rows.shape[0], BATCH):
+            kb = keep_rows[s:s + BATCH].to(DEVICE)
+            hook.keep = kb
+            logits = model(xn.expand(kb.shape[0], -1, -1, -1))
+            out[s:s + kb.shape[0]] = logits.softmax(-1)[:, pred].cpu()
+    hook.keep = None
+    return out.numpy()
+
+
+# ── marginal deltas: the shared heuristic term ───────────────────────────────
+def marginal_deltas(model, xn, pred, removed, candidates, hook, D):
+    """Δ_c = p_current − τ(c)(x|y) for every candidate at the current state."""
+    keep = keep_of(removed, D)
+    rows = keep.repeat(len(candidates), 1)
+    rows[torch.arange(len(candidates)), torch.from_numpy(candidates)] = 0.0
+    p_ablated = tau(model, xn, pred, rows, hook, D)
+    p_current = tau(model, xn, pred, keep[None], hook, D)[0]
+    return p_current - p_ablated
 
 
 # ── DAPC metric pieces ───────────────────────────────────────────────────────
@@ -148,7 +132,7 @@ def dapc_of(morf: np.ndarray, lerf: np.ndarray) -> float:
     return float(_trapz(lerf, dx=1.0 / n) - _trapz(morf, dx=1.0 / n))
 
 
-def cumulative_keep(D: int, order: np.ndarray) -> torch.Tensor:
+def cumulative_keep(D: int, order) -> torch.Tensor:
     """(D+1, D) keep-masks: row k has channels order[:k] zeroed (removed)."""
     order = torch.as_tensor(order)
     rank = torch.empty(D, dtype=torch.long)
@@ -164,7 +148,105 @@ def prob_curve(model, xn, pred, order, hook, D) -> np.ndarray:
     return tau(model, xn, pred, keep, hook, D)
 
 
-# ── data selection (same protocol as the bench: first 16 correctly-classified) ─
+# ── Variant A: O(n^2) greedy ─────────────────────────────────────────────────
+# repeat:  Δ_c = p_current − τ(c)(x|y);  c* = argmax Δ_c;  remove c*.
+def greedy_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
+    removed = np.zeros(D, dtype=bool)
+    order: list[int] = []
+    t0 = time.time()
+    for step in range(min(D, steps_cap or D)):
+        candidates = np.flatnonzero(~removed)
+        delta = marginal_deltas(model, xn, pred, removed, candidates, hook, D)
+        c = int(candidates[int(np.argmax(delta))])                # argmax Δ_c
+        removed[c] = True
+        order.append(c)
+        if (step + 1) % 32 == 0:
+            print(f"      step {step+1}/{min(D, steps_cap or D)} "
+                  f"({(time.time()-t0)/(step+1):.2f}s/step)", flush=True)
+    return _full_permutation(order, removed, D, steps_cap)
+
+
+# ── dual greedy: O(n^2), two detectors ranked per turn ───────────────────────
+# per turn, same state evaluation as Variant A:
+#   h = argmax_c Δ_c → next-from-top    (strongest: removed first under MoRF)
+#   l = argmin_c Δ_c → next-from-bottom (weakest:  removed last under MoRF,
+#                                        i.e. first under LeRF)
+# final ranking = head ++ reversed(tail); one odd leftover goes to the head.
+def dual_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
+    removed = np.zeros(D, dtype=bool)
+    head: list[int] = []
+    tail: list[int] = []
+    t0, turns = time.time(), 0
+    while np.count_nonzero(~removed) >= 2 and (not steps_cap or turns < steps_cap):
+        candidates = np.flatnonzero(~removed)
+        delta = marginal_deltas(model, xn, pred, removed, candidates, hook, D)
+        hi = int(np.argmax(delta))                                # strongest → head
+        rest = np.ones(len(candidates), dtype=bool)
+        rest[hi] = False                                          # exclude h this turn
+        li = int(np.flatnonzero(rest)[int(np.argmin(delta[rest]))])  # weakest
+        h, l = int(candidates[hi]), int(candidates[li])
+        removed[h] = removed[l] = True
+        head.append(h)
+        tail.append(l)
+        turns += 1
+        if turns % 32 == 0:
+            print(f"      turn {turns}/{D//2} "
+                  f"({(time.time()-t0)/turns:.2f}s/turn, 2 ranks/turn)", flush=True)
+    head.extend(np.flatnonzero(~removed).tolist())
+    full = np.array(head + tail[::-1], dtype=np.int64)
+    assert steps_cap or len(set(full.tolist())) == D == len(full), "not a permutation"
+    return full
+
+
+# ── Variant B pair search: O(n^3) ────────────────────────────────────────────
+# per step: Δ_{c1,c2} = p_current − τ(c1,c2)(x|y) for every pair;
+# (c1*,c2*) = argmax Δ; compare the pair's individual Δ, remove the stronger.
+# (spec text "minimizes the Δ": read as max decrease, i.e. min ablated prob.)
+def pair_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
+    removed = np.zeros(D, dtype=bool)
+    order: list[int] = []
+    t0 = time.time()
+    for step in range(min(D, steps_cap or D)):
+        candidates = np.flatnonzero(~removed)
+        if len(candidates) == 1:
+            removed[candidates[0]] = True
+            order.append(int(candidates[0]))     # last detector: no pair left
+            continue
+        keep = keep_of(removed, D)
+        best_delta, best_pair = -np.inf, None
+        for i in range(len(candidates)):
+            n_j = len(candidates) - i - 1
+            if n_j == 0:
+                continue
+            rows = keep.repeat(n_j, 1)                     # pairs (c_i, c_j), j > i
+            rows[torch.arange(n_j), torch.from_numpy(candidates[i:i + 1]).expand(n_j)] = 0.0
+            rows[torch.arange(n_j), torch.from_numpy(candidates[i + 1:])] = 0.0
+            p_pair = tau(model, xn, pred, rows, hook, D)   # τ(c1,c2)(x|y)
+            j_rel = int(np.argmin(p_pair))                 # max Δ  ==  min ablated prob
+            if -p_pair[j_rel] > best_delta:
+                best_delta = -float(p_pair[j_rel])
+                best_pair = (int(candidates[i]), int(candidates[i + 1 + j_rel]))
+        c1, c2 = best_pair                                 # argmax Δ_{c1,c2}
+        delta_1, delta_2 = marginal_deltas(model, xn, pred, removed,
+                                           np.array([c1, c2]), hook, D)
+        c = c1 if delta_1 >= delta_2 else c2               # higher individual Δ removed
+        removed[c] = True
+        order.append(c)
+        print(f"      step {step+1}/{min(D, steps_cap or D)} "
+              f"({(time.time()-t0)/(step+1):.2f}s/step, "
+              f"pairs/step {len(candidates)*(len(candidates)-1)//2})", flush=True)
+    return _full_permutation(order, removed, D, steps_cap)
+
+
+def _full_permutation(order: list[int], removed: np.ndarray, D: int,
+                      steps_cap: int) -> np.ndarray:
+    full = np.array(order + np.flatnonzero(~removed).tolist(), dtype=np.int64)
+    if not steps_cap:
+        assert len(set(full.tolist())) == D == len(full), f"order not a permutation of {D}"
+    return full
+
+
+# ── data selection: first N_IMAGES correctly-classified, bench seed ──────────
 def select_correct(model, normalize, ds, n):
     perm = torch.randperm(len(ds), generator=torch.Generator().manual_seed(SEED)).tolist()
     picks = []
@@ -180,162 +262,33 @@ def select_correct(model, normalize, ds, n):
     return picks
 
 
-# ── the measurement primitive ────────────────────────────────────────────────
-def keep_of(removed: np.ndarray, D: int) -> torch.Tensor:
-    """(D,) keep row of the current removal state: 1 = kept, 0 = removed."""
-    keep = torch.ones(D)
-    keep[removed] = 0.0
-    return keep
+# ── spec sanity: dims line up, readout is a probability ──────────────────────
+def occlusion_check(model, xn, pred, site, b, D):
+    mod = model.get_submodule(layer_name(site, b))
+    hook = ZeroChannelsHook()
+    hh = mod.register_forward_hook(hook)
+    seen = {}
+
+    def rec(module, inp, out):
+        seen["shape"] = out.shape
+    hr = mod.register_forward_hook(rec)
+    try:
+        base = tau(model, xn, pred, torch.ones(1, D), hook, D)[0]
+        assert seen["shape"][-1] == D, f"probe width {seen['shape'][-1]} != D={D}"
+        assert 0.0 <= float(base) <= 1.0, f"not a probability: {base}"
+    finally:
+        hh.remove()
+        hr.remove()
+    print(f"  [occlusion-check] {site} b{b}: probe (B,N,{D}); dims line up; "
+          f"base prob={base:.3f} OK", flush=True)
 
 
-def tau(model, xn, pred, keep_rows, hook, D):
-    """τ(S)(x|y): predicted-class softmax probability under keep-mask rows.
-
-    keep_rows: (R, D), row r = one perturbation state (1 = detector kept,
-    0 = removed). Rows are batch-independent, chunked to the GPU.
-    """
-    assert keep_rows.ndim == 2 and keep_rows.shape[1] == D, \
-        f"keep_rows {tuple(keep_rows.shape)} — expected (R, {D})"
-    assert xn.shape[0] == 1, "tau evaluates one image at a time"
-    out = torch.empty(keep_rows.shape[0])
-    with torch.no_grad():
-        for s in range(0, keep_rows.shape[0], BATCH):
-            kb = keep_rows[s:s + BATCH].to(DEVICE)
-            hook.keep = kb
-            logits = model(xn.expand(kb.shape[0], -1, -1, -1))
-            out[s:s + kb.shape[0]] = logits.softmax(-1)[:, pred].cpu()
-    hook.keep = None
-    return out.numpy()
-
-
-# ── Variant A: O(n^2) greedy ─────────────────────────────────────────────────
-# repeat:  Δ_c = p_current − τ(c)(x|y)     (decrease for the target class)
-#          c*  = argmax_c Δ_c              (highest decrease taken first)
-#          remove c*, repeat on the new state, until all detectors are removed.
-def greedy_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
-    removed = np.zeros(D, dtype=bool)
-    order: list[int] = []
-    t0 = time.time()
-    for step in range(min(D, steps_cap or D)):
-        candidates = np.flatnonzero(~removed)
-        keep = keep_of(removed, D)                       # zero what `order` removed
-        # τ(c)(x|y) for all remaining c at the current state, one row per candidate
-        rows = keep.repeat(len(candidates), 1)
-        rows[torch.arange(len(candidates)), torch.from_numpy(candidates)] = 0.0
-        p_ablated = tau(model, xn, pred, rows, hook, D)          # τ(c)(x|y) each c
-        p_current = tau(model, xn, pred, keep[None], hook, D)[0]  # M(x|y) at state
-        delta = p_current - p_ablated                             # Δ_c
-        c = int(candidates[int(np.argmax(delta))])                # argmax Δ_c
-        removed[c] = True
-        order.append(c)
-        if (step + 1) % 32 == 0:
-            print(f"      step {step+1}/{min(D, steps_cap or D)} "
-                  f"({(time.time()-t0)/(step+1):.2f}s/step)", flush=True)
-    full = np.array(order + np.flatnonzero(~removed).tolist(), dtype=np.int64)
-    assert len(set(full.tolist())) == D == len(full) or steps_cap, "not a permutation"
-    return full
-
-
-# ── dual greedy: O(n^2), two detectors ranked per turn ───────────────────────
-# same per-turn evaluation as variant A, but both ends of the ranking are
-# built at once. Per turn, at the current removal state:
-#   Δ_c = p_current − τ(c)(x|y)  for every remaining c,
-#   h = argmax_c Δ_c  → next-from-top    (strongest: removed first under MoRF)
-#   l = argmin_c Δ_c  → next-from-bottom (weakest:  removed last under MoRF,
-#                                        i.e. first under LeRF)
-# final ranking = head ++ reversed(tail). Complexity O(n^2) like variant A,
-# with ~half the state evaluations (two ranks per turn; one odd leftover
-# goes to the head for D odd).
-def dual_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
-    removed = np.zeros(D, dtype=bool)
-    head: list[int] = []
-    tail: list[int] = []
-    t0 = time.time()
-    turns = 0
-    while np.count_nonzero(~removed) >= 2 and (not steps_cap or turns < steps_cap):
-        candidates = np.flatnonzero(~removed)
-        keep = keep_of(removed, D)                       # zero what head removed
-        # τ(c)(x|y) for all remaining c at the current state, one row per candidate
-        rows = keep.repeat(len(candidates), 1)
-        rows[torch.arange(len(candidates)), torch.from_numpy(candidates)] = 0.0
-        p_ablated = tau(model, xn, pred, rows, hook, D)          # τ(c)(x|y) each c
-        p_current = tau(model, xn, pred, keep[None], hook, D)[0]  # M(x|y) at state
-        delta = p_current - p_ablated                             # Δ_c
-        hi = int(np.argmax(delta))                                # strongest → head
-        rest_hi = np.ones(len(candidates), dtype=bool)
-        rest_hi[hi] = False                                       # exclude h this turn
-        li = int(np.flatnonzero(rest_hi)[int(np.argmin(delta[rest_hi]))])  # weakest
-        h, l = int(candidates[hi]), int(candidates[li])
-        removed[h] = removed[l] = True
-        head.append(h)
-        tail.append(l)
-        turns += 1
-        if turns % 32 == 0:
-            print(f"      turn {turns}/{D//2} "
-                  f"({(time.time()-t0)/turns:.2f}s/turn, 2 ranks/turn)", flush=True)
-    head.extend(np.flatnonzero(~removed).tolist())   # odd leftover (D odd) or pilot tail
-    full = np.array(head + tail[::-1], dtype=np.int64)
-    assert steps_cap or len(set(full.tolist())) == D == len(full), "not a permutation"
-    return full
-
-
-# ── Variant B: O(n^3) pair search ────────────────────────────────────────────
-# repeat:  Δ_{c1,c2} = p_current − τ(c1,c2)(x|y)   (joint decrease per pair)
-#          (c1*,c2*) = argmax Δ_{c1,c2}            (most damaging pair)
-#          Δ_c1 = p_current − τ(c1), Δ_c2 = p_current − τ(c2)
-#          remove the pair member with the higher individual Δ, and repeat.
-def pair_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
-    removed = np.zeros(D, dtype=bool)
-    order: list[int] = []
-    t0 = time.time()
-    for step in range(min(D, steps_cap or D)):
-        candidates = np.flatnonzero(~removed)
-        r = len(candidates)
-        keep = keep_of(removed, D)
-        if r == 1:
-            removed[candidates[0]] = True
-            order.append(int(candidates[0]))     # last detector: no pair left
-            continue
-        # Δ_{c1,c2} over all remaining pairs (outer loop on c1 so the
-        # r-choose-2 keep-mask rows never materialise at once)
-        best_delta, best_pair = -np.inf, None
-        for i in range(r):
-            n_j = r - i - 1
-            if n_j == 0:
-                continue
-            rows = keep.repeat(n_j, 1)                     # pairs (c_i, c_j), j > i
-            rows[torch.arange(n_j), torch.from_numpy(candidates[i:i + 1]).expand(n_j)] = 0.0
-            rows[torch.arange(n_j), torch.from_numpy(candidates[i + 1:])] = 0.0
-            p_pair = tau(model, xn, pred, rows, hook, D)   # τ(c1,c2)(x|y)
-            j_rel = int(np.argmin(p_pair))                 # max Δ  ==  min ablated prob
-            delta_pair = -float(p_pair[j_rel])             # up to +p_current const
-            if delta_pair > best_delta:
-                best_delta = delta_pair
-                best_pair = (int(candidates[i]), int(candidates[i + 1 + j_rel]))
-        c1, c2 = best_pair                                 # argmax Δ_{c1,c2}
-        # individually: Δ_c1 vs Δ_c2 at the current state
-        rows = keep.repeat(2, 1)
-        rows[0, c1] = 0.0
-        rows[1, c2] = 0.0
-        p_solo = tau(model, xn, pred, rows, hook, D)       # τ(c1), τ(c2)
-        p_current = tau(model, xn, pred, keep[None], hook, D)[0]
-        delta_1, delta_2 = p_current - p_solo[0], p_current - p_solo[1]
-        c = c1 if delta_1 >= delta_2 else c2               # higher Δ removed
-        removed[c] = True
-        order.append(c)
-        print(f"      step {step+1}/{min(D, steps_cap or D)} "
-              f"({(time.time()-t0)/(step+1):.2f}s/step, pairs/step {r*(r-1)//2})", flush=True)
-    full = np.array(order + np.flatnonzero(~removed).tolist(), dtype=np.int64)
-    assert steps_cap or len(set(full.tolist())) == D == len(full), f"order not a permutation of {D}"
-    return full
-
-
-# ── incremental result store (checkpointing) ─────────────────────────────────
+# ── incremental result store (atomic checkpointing) ──────────────────────────
 class OptimalStore:
-    """Side-car npz re-saved after every finished sub-result → resume-safe.
+    """Side-car npz re-saved atomically after every finished sub-result.
 
-    Per combo keys:  <method>__<site>__b<blk>__img<j>__{order,morf,lerf,dapc}
-    Per-layer keys (bench-shaped, (n_imgs,*)): <method>__<site>__b<blk>__{morf,lerf,dapc}
+    Keys per combo:  <method>__<site>__b<blk>__img<j>__{order,morf,lerf,dapc}
+    Layer aggregates (bench-shaped): <method>__<site>__b<blk>__{morf,lerf,dapc}
     """
 
     METHOD = {"greedy": "optimal", "pair": "optimal_pair", "dual": "optimal_dual"}
@@ -355,11 +308,9 @@ class OptimalStore:
         return self.store[k]
 
     def commit(self, key: str, obj) -> None:
-        """Atomic checkpoint: write a temp file, then replace. A crash
-        mid-commit leaves the last complete checkpoint loadable."""
         self.store[key] = obj
         tmp = self.path.with_name(self.path.stem + ".tmp")
-        np.savez(tmp, **self.store)                  # np.savez appends .npz
+        np.savez(tmp, **self.store)
         tmp.with_suffix(".tmp.npz").replace(self.path)
 
 
@@ -373,7 +324,6 @@ ORDER_BUILDERS = {"greedy": greedy_order, "pair": pair_order, "dual": dual_order
 
 def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0) -> dict:
     """One (image, site, block) combo with order-level checkpoint reuse."""
-    assert mode in ORDER_BUILDERS, f"unknown mode {mode!r}"
     keys = combo_keys(OptimalStore.METHOD[mode], site, b, j)
     hook = ZeroChannelsHook()
     hh = model.get_submodule(layer_name(site, b)).register_forward_hook(hook)
@@ -396,7 +346,7 @@ def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0) -> dict
         hh.remove()
 
 
-# ── model loading (shared infrastructure, canonized like the bench) ──────────
+# ── model loading + action drivers ───────────────────────────────────────────
 def load(key):
     model = find_by_tag(key, device=DEVICE).model.eval()
     transform, normalize = backbone_transforms(model.backbone)
@@ -407,6 +357,15 @@ def load(key):
     canon = VanillaViTAttentionSubstitutionCanonizer(block_indices=None)
     handles = canon.apply(model)
     print(f"[{key}] loaded; D={D}, {len(picks)} picks (seed {SEED})", flush=True)
+    return model, ds, normalize, D, picks, handles
+
+
+def _checked(key, site, b):
+    """Load model/ds and run the spec occlusion check on one probe site once."""
+    model, ds, normalize, D, picks, handles = load(key)
+    idx, pred, _ = picks[0]
+    xn = normalize(ds[idx][0].unsqueeze(0)).to(DEVICE)
+    occlusion_check(model, xn, pred, site, b, D)
     return model, ds, normalize, D, picks, handles
 
 
@@ -470,15 +429,6 @@ def action_run(key, mode, sites, blocks, n_imgs):
     finally:
         for h in handles:
             h.remove()
-
-
-def _checked(key, site, b):
-    """Load model/ds and run the spec occlusion check on one probe site once."""
-    model, ds, normalize, D, picks, handles = load(key)
-    idx, pred, _ = picks[0]
-    xn = normalize(ds[idx][0].unsqueeze(0)).to(DEVICE)
-    occlusion_check(model, xn, pred, site, b, D)
-    return model, ds, normalize, D, picks, handles
 
 
 def main():
