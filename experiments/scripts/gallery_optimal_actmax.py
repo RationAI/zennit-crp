@@ -81,11 +81,22 @@ def phase_build(args, base, dataset, tag):
     print(f"build: {len(layer_names)} layers over {len(ds)} images -> {fv_dir}")
     if args.dry_run:
         return
-    fv = GradTimesInputFeatureVisualization(
-        attribution, ds, {ln: concept for ln in layer_names},
-        preprocess_fn=normalize, path=str(fv_dir), device=device, negative_clamp=True)
     end = len(ds) if not args.fv_end else min(args.fv_end, len(ds))
-    fv.run(comp_cls(), 0, end, batch_size=args.batch_size)
+    # Build BOTH the sum- and max-ranked stores (crp_gallery.compute expects both:
+    # sum for the aggregate/local act-max view, max for the gallery's _img views).
+    # Skip either if already present (e.g. sum built by an earlier run).
+    for mt in ("sum", "max"):
+        fv = GradTimesInputFeatureVisualization(
+            attribution, ds, {ln: concept for ln in layer_names},
+            preprocess_fn=normalize, path=str(fv_dir), max_target=mt,
+            device=device, negative_clamp=True)
+        mp = Path(fv.RelMax.PATH)
+        have = mp.exists() and all(any(mp.glob(f"{ln}_data.npy")) for ln in layer_names)
+        if have:
+            print(f"  {mt}-ranked index present, skip")
+            continue
+        print(f"  building {mt}-ranked index over {end} images…")
+        fv.run(comp_cls(), 0, end, batch_size=args.batch_size)
     print(f"build done: index at {fv_dir}")
 
 
