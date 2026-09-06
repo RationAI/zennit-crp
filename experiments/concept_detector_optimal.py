@@ -95,31 +95,87 @@ def keep_of(removed: np.ndarray, D: int) -> torch.Tensor:
     return keep
 
 
+# ── prefix-activation caching: one clean forward per image, suffix per eval ──
+# Occlusion happens at layer_name(site, b) — inside block b — so the stream
+# entering block b is identical for every keep-mask row of the combo. Cache it
+# once and run only blocks[b:] + norm + head per evaluation. Captured with
+# hook.keep=None (the pre-occlusion value), so it equals the recompute-everything
+# path in exact arithmetic. Removal ORDERS come out bit-identical; morf/lerf/DAPC
+# match to ~1e-6 (fp32 rounding: the prefix is captured at batch 1 but the full
+# path computes it inside batch-256/255 chunks, and cuBLAS sums a differently-
+# shaped matmul in a different order — not a bug, below the fp32 noise floor).
+@torch.no_grad()
+def capture_block_inputs(model, xn):
+    """{b: (1, N, D)} residual stream entering each block, for one image."""
+    cache, hs = {}, []
+    for i, blk in enumerate(model.backbone.blocks):
+        hs.append(blk.register_forward_pre_hook(
+            lambda m, args, i=i: cache.__setitem__(i, args[0].detach())))
+    model(xn)
+    for h in hs:
+        h.remove()
+    return cache
+
+
+def make_head_tail(model):
+    """blocks[-1] output (R, N, D) -> logits (R, C). Mirrors each model family's
+    head path: timm builtin heads do norm + pool + cls-linear inside
+    backbone.forward_head; probes apply norm and feed their Head (cls or tokens)."""
+    bb = model.backbone
+    if getattr(model, "head_name", "") == "timm_builtin":       # ImagenetViTBase (+M7)
+        return lambda y: bb.forward_head(bb.norm(y))
+    from experiments.models.probe import Probe
+    if isinstance(model, Probe):
+        if model.head.input_kind == "cls":                      # head(pool(norm(tokens)))
+            return lambda y: model.head(bb.forward_head(bb.norm(y), pre_logits=True))
+        return lambda y: model.head(bb.norm(y))                 # head(tokens after norm)
+    raise ValueError(f"make_head_tail: unsupported model {type(model).__name__}")
+
+
+def make_cached_forward(model, cache, b: int):
+    """forward_fn(R) -> logits (R, C): model suffix resuming at cached block-b input."""
+    head_tail = make_head_tail(model)
+    blocks = model.backbone.blocks
+    A_b = cache[b]                                               # (1, N, D)
+    def forward_fn(R: int):
+        x = A_b.expand(R, -1, -1).contiguous()
+        for i in range(b, len(blocks)):
+            x = blocks[i](x)
+        return head_tail(x)
+    return forward_fn
+
+
 # ── tau: measured quantity (softmax probability) ─────────────────────────────
-def tau(model, xn, pred, keep_rows, hook, D):
-    """τ(S)(x|y): pred-class softmax prob under keep-mask rows (R, D)."""
+def tau(model, xn, pred, keep_rows, hook, D, forward_fn=None):
+    """τ(S)(x|y): pred-class softmax prob under keep-mask rows (R, D).
+
+    ``forward_fn`` (optional) replaces the full forward: a suffix runner from a
+    cached prefix. Signature takes the row count, returns logits (R, classes).
+    """
     assert keep_rows.ndim == 2 and keep_rows.shape[1] == D, \
         f"keep_rows {tuple(keep_rows.shape)} — expected (R, {D})"
     assert xn.shape[0] == 1, "tau evaluates one image at a time"
+    forward = forward_fn if forward_fn is not None \
+        else (lambda R: model(xn.expand(R, -1, -1, -1)))
     out = torch.empty(keep_rows.shape[0])
     with torch.no_grad():
         for s in range(0, keep_rows.shape[0], BATCH):
             kb = keep_rows[s:s + BATCH].to(DEVICE)
             hook.keep = kb
-            logits = model(xn.expand(kb.shape[0], -1, -1, -1))
+            logits = forward(kb.shape[0])
             out[s:s + kb.shape[0]] = logits.softmax(-1)[:, pred].cpu()
     hook.keep = None
     return out.numpy()
 
 
 # ── marginal deltas: the shared heuristic term ───────────────────────────────
-def marginal_deltas(model, xn, pred, removed, candidates, hook, D):
+def marginal_deltas(model, xn, pred, removed, candidates, hook, D, forward_fn=None):
     """Δ_c = p_current − τ(c)(x|y) for every candidate at the current state."""
     keep = keep_of(removed, D)
     rows = keep.repeat(len(candidates), 1)
     rows[torch.arange(len(candidates)), torch.from_numpy(candidates)] = 0.0
-    p_ablated = tau(model, xn, pred, rows, hook, D)
-    p_current = tau(model, xn, pred, keep[None], hook, D)[0]
+    p_ablated = tau(model, xn, pred, rows, hook, D, forward_fn)
+    p_current = tau(model, xn, pred, keep[None], hook, D, forward_fn)[0]
     return p_current - p_ablated
 
 
@@ -141,22 +197,24 @@ def cumulative_keep(D: int, order) -> torch.Tensor:
     return (rank.unsqueeze(0) >= k).float()
 
 
-def prob_curve(model, xn, pred, order, hook, D) -> np.ndarray:
+def prob_curve(model, xn, pred, order, hook, D, forward_fn=None) -> np.ndarray:
     """Predicted-class probability along cumulative removals of ``order``."""
     keep = cumulative_keep(D, order)
     assert keep.shape == (D + 1, D), f"keep {tuple(keep.shape)} != ({D+1},{D})"
-    return tau(model, xn, pred, keep, hook, D)
+    return tau(model, xn, pred, keep, hook, D, forward_fn)
 
 
 # ── Variant A: O(n^2) greedy ─────────────────────────────────────────────────
 # repeat:  Δ_c = p_current − τ(c)(x|y);  c* = argmax Δ_c;  remove c*.
-def greedy_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
+def greedy_order(model, xn, pred, hook, D: int, steps_cap: int = 0,
+                 forward_fn=None) -> np.ndarray:
     removed = np.zeros(D, dtype=bool)
     order: list[int] = []
     t0 = time.time()
     for step in range(min(D, steps_cap or D)):
         candidates = np.flatnonzero(~removed)
-        delta = marginal_deltas(model, xn, pred, removed, candidates, hook, D)
+        delta = marginal_deltas(model, xn, pred, removed, candidates, hook, D,
+                                forward_fn)
         c = int(candidates[int(np.argmax(delta))])                # argmax Δ_c
         removed[c] = True
         order.append(c)
@@ -172,14 +230,16 @@ def greedy_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarra
 #   l = argmin_c Δ_c → next-from-bottom (weakest:  removed last under MoRF,
 #                                        i.e. first under LeRF)
 # final ranking = head ++ reversed(tail); one odd leftover goes to the head.
-def dual_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
+def dual_order(model, xn, pred, hook, D: int, steps_cap: int = 0,
+               forward_fn=None) -> np.ndarray:
     removed = np.zeros(D, dtype=bool)
     head: list[int] = []
     tail: list[int] = []
     t0, turns = time.time(), 0
     while np.count_nonzero(~removed) >= 2 and (not steps_cap or turns < steps_cap):
         candidates = np.flatnonzero(~removed)
-        delta = marginal_deltas(model, xn, pred, removed, candidates, hook, D)
+        delta = marginal_deltas(model, xn, pred, removed, candidates, hook, D,
+                                forward_fn)
         hi = int(np.argmax(delta))                                # strongest → head
         rest = np.ones(len(candidates), dtype=bool)
         rest[hi] = False                                          # exclude h this turn
@@ -202,7 +262,8 @@ def dual_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
 # per step: Δ_{c1,c2} = p_current − τ(c1,c2)(x|y) for every pair;
 # (c1*,c2*) = argmax Δ; compare the pair's individual Δ, remove the stronger.
 # (spec text "minimizes the Δ": read as max decrease, i.e. min ablated prob.)
-def pair_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
+def pair_order(model, xn, pred, hook, D: int, steps_cap: int = 0,
+               forward_fn=None) -> np.ndarray:
     removed = np.zeros(D, dtype=bool)
     order: list[int] = []
     t0 = time.time()
@@ -228,7 +289,7 @@ def pair_order(model, xn, pred, hook, D: int, steps_cap: int = 0) -> np.ndarray:
                 best_pair = (int(candidates[i]), int(candidates[i + 1 + j_rel]))
         c1, c2 = best_pair                                 # argmax Δ_{c1,c2}
         delta_1, delta_2 = marginal_deltas(model, xn, pred, removed,
-                                           np.array([c1, c2]), hook, D)
+                                           np.array([c1, c2]), hook, D, forward_fn)
         c = c1 if delta_1 >= delta_2 else c2               # higher individual Δ removed
         removed[c] = True
         order.append(c)
@@ -322,22 +383,29 @@ def combo_keys(mkey, site, b, j):
 ORDER_BUILDERS = {"greedy": greedy_order, "pair": pair_order, "dual": dual_order}
 
 
-def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0) -> dict:
-    """One (image, site, block) combo with order-level checkpoint reuse."""
+def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0,
+              cache=None) -> dict:
+    """One (image, site, block) combo with order-level checkpoint reuse.
+    ``cache``: block-input activations for this image (see
+    capture_block_inputs); captured here when missing."""
     keys = combo_keys(OptimalStore.METHOD[mode], site, b, j)
     hook = ZeroChannelsHook()
     hh = model.get_submodule(layer_name(site, b)).register_forward_hook(hook)
     try:
+        if cache is None:
+            cache = capture_block_inputs(model, xn)
+        forward_fn = make_cached_forward(model, cache, b)
         if sto.has(keys["order"]):
             order = sto.get(keys["order"])            # resume after mid-combo crash
         else:
-            order = ORDER_BUILDERS[mode](model, xn, pred, hook, D, steps_cap=steps_cap)
+            order = ORDER_BUILDERS[mode](model, xn, pred, hook, D, steps_cap=steps_cap,
+                                         forward_fn=forward_fn)
             sto.commit(keys["order"], order)          # commit expensive artefact 1st
         if steps_cap:
             return {"order": order}
         order_t = torch.from_numpy(order).long()         # one numpy→torch hop
-        morf = prob_curve(model, xn, pred, order_t, hook, D)
-        lerf = prob_curve(model, xn, pred, order_t.flip(0), hook, D)
+        morf = prob_curve(model, xn, pred, order_t, hook, D, forward_fn)
+        lerf = prob_curve(model, xn, pred, order_t.flip(0), hook, D, forward_fn)
         out = {"order": order, "morf": morf, "lerf": lerf, "dapc": dapc_of(morf, lerf)}
         for k in ("morf", "lerf", "dapc"):
             sto.commit(keys[k], out[k])
@@ -398,6 +466,7 @@ def action_run(key, mode, sites, blocks, n_imgs):
             sto.commit("meta", json.dumps({"key": key, "mode": mode, "D": D,
                                            "image_ids": [i for i, _, _ in picks],
                                            "preds": [p for _, p, _ in picks]}))
+        caches = {}                    # img j -> {block: (1, N, D)} prefix activations
         for site in sites:
             for b in blocks:
                 morf_rows, lerf_rows, dapc_rows, pending = [], [], [], []
@@ -413,7 +482,11 @@ def action_run(key, mode, sites, blocks, n_imgs):
                     t0 = time.time()
                     x = ds[idx][0].unsqueeze(0)
                     xn = normalize(x).to(DEVICE)
-                    out = run_combo(model, x, xn, pred, site, b, D, mode, sto, j)
+                    # one clean forward per image, reused by all its 48 combos
+                    if j not in caches:
+                        caches[j] = capture_block_inputs(model, xn)
+                    out = run_combo(model, x, xn, pred, site, b, D, mode, sto, j,
+                                    cache=caches[j])
                     print(f"[{key}] {mkey} {site} b{b} img#{j} "
                           f"dapc={out['dapc']:+.3f} ({time.time()-t0:.0f}s)", flush=True)
                     morf_rows.append(out["morf"])
