@@ -199,8 +199,16 @@ class CondAttribution:
         conditions: list of dict
             The key of a dict are string layer names and their value is a list of integers describing the concept (channel, neuron) index.
             In general, the values are passed to the 'mask_map' function as 'concept_ids' argument.
+            One condition dict produces one heatmap; 'data' is broadcast to match the number of dicts.
+            Several layer keys within one dict cascade the masks along the relevance path (mask at the
+            higher layer first, then at the lower layer). List higher layers first: with
+            'exclude_parallel'=True, wrong ordering raises an error.
         composite: zennit Composite
             Object that describes how relevance is distributed. Should contain a suitable zennit Canonizer.
+        record_layer: list of str
+            Names of layers whose activations and relevances are recorded and returned in the
+            'activations' and 'relevances' dicts. Conditioned layers and 'start_layer' are always
+            recorded as well.
         mask_map: dict of callable or callable
             The keys of the dict are string layer names and the values functions that implement gradient masking. If no dict is used,
             all layers are masked according to the same function. 
@@ -225,7 +233,7 @@ class CondAttribution:
         attrResult: namedtuple object
             Contains the attributes 'heatmap', 'activations', 'relevances' and 'prediction'.
             'heatmap': torch.Tensor
-                Output of the self.attribution_modifier method that defines how 'data'.grad is processed.
+                Output of the self.heatmap_modifier method that defines how 'data'.grad is processed.
             'activations': dict of str and torch.Tensor
                 The keys are the layer names and values are the activations
             'relevances': dict of str and torch.Tensor
