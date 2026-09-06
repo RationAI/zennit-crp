@@ -341,9 +341,14 @@ class CondAttribution:
         # - ``mask_composite`` (NameMapComposite) is entered last for the same
         #   name-resolution reason.
         with composite.context(self.model) as modified:
-            handles, layer_out = self._append_recording_layer_hooks(
+            handles, layer_out, layer_grad = self._append_recording_layer_hooks(
                 record_layer, start_layer, cond_l_names
             )
+            # conditioned layers capture their pre-mask relevance in the MaskHook
+            for l_name in cond_l_names:
+                if l_name in hook_map:
+                    hook_map[l_name].record_name = l_name
+                    hook_map[l_name].record_dict = layer_grad
             with mask_composite.context(self.model):
                 if start_layer:
                     _ = modified(data)
@@ -361,7 +366,7 @@ class CondAttribution:
                 attribution = self.heatmap_modifier(data, on_device)
                 activations, relevances = {}, {}
                 if len(layer_out) > 0:
-                    activations, relevances = self._collect_hook_activation_relevance(layer_out, on_device)
+                    activations, relevances = self._collect_hook_activation_relevance(layer_out, layer_grad, on_device)
                 [h.remove() for h in handles]
 
         return attrResult(attribution, activations, relevances, pred)
@@ -418,9 +423,14 @@ class CondAttribution:
         # registers first so name-based lookups in recording-layer hooks and
         # ``mask_composite`` resolve newly-added submodules.
         with composite.context(self.model) as modified:
-            handles, layer_out = self._append_recording_layer_hooks(
+            handles, layer_out, layer_grad = self._append_recording_layer_hooks(
                 record_layer, start_layer, cond_l_names
             )
+            # conditioned layers capture their pre-mask relevance in the MaskHook
+            for l_name in cond_l_names:
+                if l_name in hook_map:
+                    hook_map[l_name].record_name = l_name
+                    hook_map[l_name].record_dict = layer_grad
             with mask_composite.context(self.model):
                 if start_layer:
                     _ = modified(data_batch)
@@ -464,7 +474,7 @@ class CondAttribution:
                     activations, relevances = {}, {}
                     if len(layer_out) > 0:
                         activations, relevances = self._collect_hook_activation_relevance(
-                            layer_out, on_device, batch_size)
+                            layer_out, layer_grad, on_device, batch_size)
 
                     yield attrResult(heatmap[:batch_size], activations, relevances, pred[:batch_size])
 
@@ -477,12 +487,22 @@ class CondAttribution:
             pbar.close()
 
     @staticmethod
-    def _generate_hook(layer_name, layer_out):
+    def _generate_hook(layer_name, layer_out, layer_grad, record_grad=True):
         def get_tensor_hook(module, input, output):
             if isinstance(output, tuple):
                 output = output[0]
             layer_out[layer_name] = output
-            output.retain_grad()
+            # Record the relevance ARRIVING at this layer via a backward tensor
+            # hook rather than ``retain_grad`` (which, on torch>=2.0, runs after
+            # user tensor hooks and would capture post-mask values at conditioned
+            # layers). For non-conditioned layers there is no mask, so this is the
+            # relevance landing at the layer. Conditioned layers instead capture
+            # the pre-mask gradient inside their ``MaskHook`` (``record_grad`` is
+            # False here for them), because LRP rule hooks can reorder this tensor
+            # hook after the mask.
+            if record_grad and output.requires_grad:
+                output.register_hook(
+                    lambda grad, n=layer_name: layer_grad.__setitem__(n, grad))
 
         return get_tensor_hook
 
@@ -494,7 +514,9 @@ class CondAttribution:
 
         handles = []
         layer_out = {}
+        layer_grad = {}
         record_l_names = record_l_names.copy()
+        cond_set = set(cond_l_names)
 
         for l_name in cond_l_names:
             if l_name not in record_l_names:
@@ -512,7 +534,8 @@ class CondAttribution:
                     "Note, that the condition set then references to the output with OUTPUT_NAME and no longer 'y'.")
 
             if name in record_l_names:
-                h = layer.register_forward_hook(self._generate_hook(name, layer_out))
+                h = layer.register_forward_hook(
+                    self._generate_hook(name, layer_out, layer_grad, record_grad=name not in cond_set))
                 handles.append(h)
                 record_l_names.remove(name)
 
@@ -522,15 +545,18 @@ class CondAttribution:
             warnings.warn(
                 f"Some layer names not found in model: {record_l_names}.")
 
-        return handles, layer_out
+        return handles, layer_out, layer_grad
 
-    def _collect_hook_activation_relevance(self, layer_out, on_device=None, length=None):
+    def _collect_hook_activation_relevance(self, layer_out, layer_grad, on_device=None, length=None):
         """
 
         Parameters:
         ----------
             layer_out: dict
                 contains the intermediate layer outputs
+            layer_grad: dict
+                contains the pre-mask relevance captured at each recorded layer by
+                the backward tensor hook (see ``_generate_hook``)
             on_device: str
                 copy layer_out on cpu or cuda device
             length: int
@@ -544,14 +570,15 @@ class CondAttribution:
             activations[name] = act.to(on_device) if on_device else act
             activations[name].requires_grad = False
 
-            if layer_out[name].grad is None:
+            grad = layer_grad.get(name)
+            if grad is None:
                 rel = torch.zeros_like(activations[name], requires_grad=False)[:length]
                 relevances[name] = rel.to(on_device) if on_device else rel
             else:
-                rel = layer_out[name].grad.detach()[:length]
+                rel = grad.detach()[:length]
                 relevances[name] = rel.to(on_device) if on_device else rel
                 relevances[name].requires_grad = False
-                layer_out[name].grad = None
+                layer_grad[name] = None
 
         return activations, relevances
 

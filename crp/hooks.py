@@ -11,6 +11,13 @@ class MaskHook:
     def __init__(self, fn_list):
 
         self.fn_list = fn_list
+        # Optional pre-mask relevance capture: when set, the gradient arriving at
+        # this layer (before the mask multiply) is stored under ``record_name`` in
+        # ``record_dict``. Used by CondAttribution to record the pre-mask relevance
+        # at conditioned layers, independent of tensor-hook ordering. First write
+        # per backward wins (ignores the second fire on the exclude_parallel path).
+        self.record_name = None
+        self.record_dict = None
 
     def post_forward(self, module, input, output):
         '''Register a backward-hook to the resulting tensor right after the forward.'''
@@ -38,6 +45,11 @@ class MaskHook:
 
     def backward(self, module, grad):
         '''Hook applied during backward-pass'''
+        if self.record_dict is not None and self.record_name is not None:
+            # capture the pre-mask relevance (first fire wins); clone because the
+            # mask_fn below may modify ``grad`` in place
+            if self.record_dict.get(self.record_name) is None:
+                self.record_dict[self.record_name] = grad.detach().clone()
         for mask_fn in self.fn_list:
             grad = mask_fn(grad)
 
@@ -48,7 +60,10 @@ class MaskHook:
         This is used to describe hooks of different modules by a single hook instance.
         Copies retain the same fn_list list.
         '''
-        return self.__class__(fn_list=self.fn_list)
+        c = self.__class__(fn_list=self.fn_list)
+        c.record_name = self.record_name
+        c.record_dict = self.record_dict
+        return c
 
     def remove(self):
         '''When removing hooks, remove all stored mask_fn.'''
