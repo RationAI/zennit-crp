@@ -21,14 +21,10 @@ already implemented — **find the tool below before writing new code.**
 
 
 **Design rules for LRP rule wiring (read before adding modules/rules):**
-- **One module type, many rules — pick the rule in the `layer_map`, never via a
-  module-per-rule.** If a module can take different LRP rules (e.g. a residual
-  `x+branch`), define it ONCE (`ResidualAdd`) and select the rule in the composite
-  `layer_map`: `(ResidualAdd, ResidualRatio | Uniform | ResidualL1)`. Do NOT create
-  a separate module class per rule. 
-- A canonizer installs the single module type so the
-  add is hookable; it does NOT choose the rule.
-- **Never predefine Composite variants unprompted.**
+- **Rules are attached through Composites, not hardwired to modules.** There are multiple ways to attach rules,
+  either by module type (e.g., `nn.Conv2d`) or by module name (e.g., `"features.40"`). Prefer the module type approach unless you have a strong reason to attach by name.
+- A canonizer temporarily modifies the module graph to make it compatible with LRP. Composites take canonizers as input. Canonizers are applied to the model before the attribution is computed.
+- **Never predefine Composite variant classes unprompted.** Always define a new composite in-place, as an instance of one of the `Composite` subclasses, with the rules and canonizers you need. Avoid explosion of composite classes.
 
 ---
 
@@ -40,19 +36,10 @@ attr = attribution(data, conditions, composite,
                    record_layer=[...], mask_map=ChannelConcept.mask)
 attr.heatmap, attr.prediction, attr.activations[lname], attr.relevances[lname]
 ```
-- **`conditions`** = list of dicts. `"y"` = output target class; other keys are
-  `layer_name: [concept_ids]`. One dict → one heatmap.
-  `[{"features.40": [35], "features.36": [24], "y": [46]}]`.
-  Multi-layer = cascading; **list higher layers first**.
-- **`mask_map`** = the concept's `mask` (default `ChannelConcept.mask`; for ViT pass
-  `concept.mask`). This is what restricts relevance to the chosen concept ids.
-- **`record_layer`** = layers whose `activations`/`relevances` you want back.
-- **`start_layer` / `init_rel`** = begin backprop mid-network instead of at `"y"`.
-- **`exclude_parallel=True`** (default) zeroes parallel branches between conditioned
-  layers (isolates the path); `False` = standard full backward.
-- **`attribution.generate(data, conditions, composite, batch_size=…)`** = generator
-  that expands many conditions over one forward pass (≈2× faster than looping calls).
-  Use it to score all channels of a layer.
+Parameter details: see the `CondAttribution.__call__` docstring. The trap:
+multi-layer conditions cascade — `[{"features.40": [35], "features.36": [24], "y": [46]}]`
+masks channel 35 in `features.40`, then channel 24 in `features.36`, ending at target 46.
+**List higher layers first**.
 
 ---
 

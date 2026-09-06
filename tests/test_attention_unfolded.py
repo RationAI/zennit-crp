@@ -955,33 +955,6 @@ class TestPALRPRules:
         assert not hasattr(m, "pos_embed_add")
         assert type(m)._pos_embed is original_method
 
-    def test_default_composite_identity_with_pos_embed_canonizer(self):
-        """Default recipe with the pos-embed canonizer (PosEmbedAdd installed
-        but UNmapped) is byte-identical to the same composite with the
-        canonizer removed — i.e. structure by default, rule by opt-in."""
-        from zennit_extensions.lrp_composites import COMPOSITES
-        from zennit_extensions.canonisation.canonizers import VanillaViTPosEmbedCanonizer
-        from crp.attribution import CondAttribution
-
-        m = timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=10).eval()
-        attr = CondAttribution(m)
-        torch.manual_seed(0)
-        x = torch.randn(1, 3, 224, 224).requires_grad_(True)
-
-        comp_full = COMPOSITES["attnlrp_baseline"]()
-        with comp_full.context(m):
-            out_full = attr(x.detach().clone().requires_grad_(True), [{"y": [1]}], comp_full)
-            hm_full = out_full.heatmap.detach().clone()
-
-        comp_no = COMPOSITES["attnlrp_baseline"]()
-        comp_no.canonizers = [c for c in comp_no.canonizers
-                               if not isinstance(c, VanillaViTPosEmbedCanonizer)]
-        with comp_no.context(m):
-            out_no = attr(x.detach().clone().requires_grad_(True), [{"y": [1]}], comp_no)
-            hm_no = out_no.heatmap.detach().clone()
-
-        assert torch.equal(hm_full, hm_no)
-
     def test_lemma31_conservation_restored_by_sink(self):
         """Lemma 3.1: ignoring PE relevance violates conservation; with
         :class:`PosEmbedSink` the stashed ``R(P)`` plus the token-stream

@@ -46,6 +46,7 @@ dependencies = [
   "scikit-learn>=1.7.2",
   "polars>=1.0",
   "safetensors>=0.4",
+  "lxt>=2.1",
 ]
 
 [project.optional-dependencies]

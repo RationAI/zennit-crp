@@ -196,9 +196,12 @@ def chefer_transformer_attribution(model, attribution, composite, xn: torch.Tens
     eye = torch.eye(n_tok, device=xn.device).unsqueeze(0)
     r = None
     blocks_out = [] if return_blocks else None
+    # g-convention: the recorded relevance is g×act seeded with grad=1, so it is
+    # scaled by the target logit (the reference seeds R=1); divide it back out.
+    scale = float(logit.detach())
     for b, ln in enumerate(softmax_layers):
         g = grads[b]                                                # (1,h,T,T)
-        cam = res.relevances[ln]                                    # (1,h,T,T)  R_A
+        cam = res.relevances[ln] / scale                            # (1,h,T,T)  R_A
         c = (g * cam).clamp(min=0).mean(dim=1)                      # (1,T,T)
         ab = eye + c                                                # NO row-norm (code-exact)
         r = ab if r is None else ab @ r

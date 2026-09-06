@@ -26,7 +26,14 @@ scope.
 Sourced from 'Transformer Interpretability Beyond Attention Visualization',
 https://doi.org/10.1109/CVPR46437.2021.00084
 """
-from zennit_extensions.rules.attnlrp import EpsilonAdd, MatmulAttnLRP
+from zennit.core import stabilize
+from zennit.rules import ZPlus
+
+from zennit_extensions.rules.attnlrp import (
+    EpsilonAdd,
+    GradTimesInputMultiInputBasicHook,
+    MatmulAttnLRP,
+)
 
 
 def safe_divide(a, b):
@@ -93,3 +100,48 @@ class CheferAdd(EpsilonAdd):
 
     def copy(self):
         return CheferAdd()
+
+
+# ── grad×input variants (LXT g-convention: g→R ×output, split, R→g ÷input) ─────
+# Same boundary conversion as the AttnLRP g-wrappers. The relevance split is
+# identical to the relevance-space rules above, so the recovered R = g⊙x matches
+# them to the ÷input stabilizer (1e-10); the reference reproduction is preserved.
+
+class CheferMatmulGradInput(CheferMatmul):
+    """CheferMatmul in the grad×input convention."""
+
+    def backward(self, module, grad_input, grad_output):
+        rel_out = grad_output[0] * self.stored_tensors["output"]
+        r_a, r_b = super().backward(module, grad_input, (rel_out,))
+        a, b = self.stored_tensors["a"], self.stored_tensors["b"]
+        return (r_a / stabilize(a, 1e-10), r_b / stabilize(b, 1e-10))
+
+    def copy(self):
+        return CheferMatmulGradInput()
+
+
+class CheferAddGradInput(CheferAdd):
+    """CheferAdd in the grad×input convention."""
+
+    def backward(self, module, grad_input, grad_output):
+        rel_out = grad_output[0] * self.stored_tensors["output"]
+        r_x, r_b = super().backward(module, grad_input, (rel_out,))
+        x, branch = self.stored_tensors["x"], self.stored_tensors["branch"]
+        return (r_x / stabilize(x, 1e-10), r_b / stabilize(branch, 1e-10))
+
+    def copy(self):
+        return CheferAddGradInput()
+
+
+class ZPlusGradInput(GradTimesInputMultiInputBasicHook):
+    """z⁺ (α1β0, bias-excluded) in the grad×input convention."""
+
+    def __init__(self, stabilizer=1e-9, zero_params=None):
+        proto = ZPlus(stabilizer, zero_params)
+        super().__init__(
+            input_modifiers=proto.input_modifiers,
+            param_modifiers=proto.param_modifiers,
+            output_modifiers=proto.output_modifiers,
+            gradient_mapper=proto.gradient_mapper,
+            reducer=proto.reducer,
+        )

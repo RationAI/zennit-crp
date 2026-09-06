@@ -1,5 +1,7 @@
 """LXT-way LayerNorm (σ-detached + ε) and selectable bias handling
-(``bias_mode``: absorb / omit / distribute, AttnLRP Appendix A.2.1) for
+(``bias_mode``: absorb / omit / distribute, AttnLRP Appendix A.2.1) for the
+LayerNorm rule — the softmax rule carries no bias modes (the paper specifies a
+single Prop. 3.1 variant) — for
 ``LayerNormEpsilon`` and ``SoftmaxAttnLRP``.
 """
 
@@ -126,41 +128,6 @@ class TestLayerNormEpsilonBiasModes:
             LayerNormEpsilon(bias_mode="banana")
 
 
-class TestSoftmaxBiasModes:
-    def _run(self, bias_mode, x, rel):
-        return _hooked_relevance(
-            SoftmaxAlongLastDim(), SoftmaxAttnLRP(bias_mode=bias_mode), x, rel
-        )
-
-    def test_absorb_is_proposition_31(self):
-        x = torch.randn(2, 3, 5, 5, dtype=torch.float64)
-        rel = torch.randn(2, 3, 5, 5, dtype=torch.float64)
-        s = torch.softmax(x, dim=-1)
-        expected = x * (rel - s * rel.sum(dim=-1, keepdim=True))
-        assert torch.allclose(self._run("absorb", x, rel), expected, rtol=1e-12, atol=1e-12)
-
-    def test_distribute_conserves_exactly(self):
-        x = torch.randn(2, 3, 5, 5, dtype=torch.float64)
-        rel = torch.randn(2, 3, 5, 5, dtype=torch.float64)
-        relevance = self._run("distribute", x, rel)
-        assert torch.allclose(
-            relevance.sum(dim=-1), rel.sum(dim=-1), rtol=1e-10, atol=1e-12
-        )
-
-    def test_omit_conserves_up_to_stabilizer(self):
-        x = torch.randn(2, 3, 5, 5, dtype=torch.float64)
-        rel = torch.randn(2, 3, 5, 5, dtype=torch.float64)
-        relevance = self._run("omit", x, rel)
-        assert torch.allclose(relevance.sum(dim=-1), rel.sum(dim=-1), rtol=1e-3, atol=1e-4)
-
-    def test_modes_differ_from_absorb(self):
-        x = torch.randn(2, 3, 5, 5, dtype=torch.float64)
-        rel = torch.randn(2, 3, 5, 5, dtype=torch.float64)
-        absorb = self._run("absorb", x, rel)
-        assert not torch.allclose(absorb, self._run("distribute", x, rel))
-        assert not torch.allclose(absorb, self._run("omit", x, rel))
-
-
 class TestLayerNormSubstitutionCanonizer:
     def _toy_model(self):
         model = nn.Sequential(
@@ -209,9 +176,9 @@ class TestLayerNormSubstitutionCanonizer:
 
 class TestCompositeSmoke:
     @pytest.mark.parametrize("mode", ["absorb", "omit", "distribute"])
-    def test_attnlrp_composite_accepts_bias_modes(self, mode):
-        from zennit_extensions.lrp_composites.attnlrp import AttnLRPBaselineComposite
-        from zennit_extensions.lrp_composites.cp_lrp import CPLRPComposite
+    def test_layernorm_epsilon_accepts_bias_modes(self, mode):
+        # LayerNormEpsilon carries the bias modes; no shipped composite uses it now
+        # (cp_lrp's LayerNorm is σ-detach substitution + autograd).
+        from zennit_extensions.rules.attnlrp import LayerNormEpsilon
 
-        AttnLRPBaselineComposite(softmax_bias_mode=mode, layernorm_bias_mode=mode)
-        CPLRPComposite(layernorm_bias_mode=mode)
+        LayerNormEpsilon(bias_mode=mode)

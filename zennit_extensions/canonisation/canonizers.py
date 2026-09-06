@@ -3,6 +3,7 @@ from typing import Callable, List, Optional, Sequence
 import torch
 import torch.nn as nn
 from timm.layers import GluMlp, Mlp, SwiGLU
+from timm.layers.norm import LayerNorm as TimmLayerNorm
 from timm.models.eva import EvaAttention, EvaBlock
 from timm.models.vision_transformer import (
     Attention as TimmAttention, Block as TimmBlock, VisionTransformer,
@@ -16,9 +17,8 @@ from zennit_extensions.attention_unfolded import (
     TimmAttentionUnfolded,
 )
 
-#: timm MLP/FFN container types whose ``nn.Linear`` children are FFN linears
-#: (paper Table B.5 gives these γ-LRP, everything else ε-LRP).
-FFN_CONTAINER_TYPES = (Mlp, GluMlp, SwiGLU)
+from torchvision.models.vision_transformer import MLPBlock as _TorchvisionMLPBlock
+FFN_CONTAINER_TYPES = (Mlp, GluMlp, SwiGLU, _TorchvisionMLPBlock)
 
 
 def _extract_block_index(parent_name: str) -> Optional[int]:
@@ -115,11 +115,17 @@ class EvaAttentionSubstitutionCanonizer(Canonizer):
 class LayerNormSubstitutionCanonizer(Canonizer):
     """Replace every plain ``nn.LayerNorm`` with
     :class:`~zennit_extensions.attention_unfolded.LayerNormDetachedStd`
-    (σ detached — the LXT LayerNorm treatment). Matches exact type only, not
-    subclasses (e.g. timm's channels-first ``LayerNorm2d`` has a different
-    forward and must not be swapped). No LRP-rule decisions — the composite
+    (σ detached — the LXT LayerNorm treatment). Matches ``nn.LayerNorm`` and
+    ``timm.layers.norm.LayerNorm`` (forward-identical subclass; without it the
+    canonizer silently no-ops on every timm model). Other subclasses (e.g.
+    timm's channels-first ``LayerNorm2d``) have a different forward and are
+    deliberately NOT swapped. No LRP-rule decisions — the composite
     ``layer_map`` assigns the rule to the substituted type.
     """
+
+    #: exact types eligible for substitution (forward computes F.layer_norm
+    #: over the trailing normalized_shape dims)
+    SUBSTITUTABLE_TYPES = (nn.LayerNorm, TimmLayerNorm)
 
     def __init__(self):
         self.parent: Optional[nn.Module] = None
@@ -131,7 +137,7 @@ class LayerNormSubstitutionCanonizer(Canonizer):
         instances: List[LayerNormSubstitutionCanonizer] = []
         for _parent_name, parent in root_module.named_modules():
             for attr_name, child in parent.named_children():
-                if type(child) is not nn.LayerNorm:
+                if type(child) not in self.SUBSTITUTABLE_TYPES:
                     continue
                 inst = self.copy()
                 inst.register(parent, attr_name, child)

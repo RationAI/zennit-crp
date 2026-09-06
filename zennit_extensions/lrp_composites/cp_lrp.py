@@ -1,76 +1,70 @@
-"""CP-LRP composite — value-path-only conservative propagation.
+"""CP-LRP composite — grad×input (g-convention), LXT-parity certified.
 
-Attention is unfolded, but the Q and K probes carry a ``StopGradient`` so
-relevance flows only through the value path: the attention weights are treated
-as constants and the softmax / Q·Kᵀ bilinear conduct no relevance. Residual adds
-use the Otsuki ratio split; linears γ-LRP.
+The backward stream carries ``g`` with relevance ``R = g ⊙ x`` at every tensor;
+the input heatmap is ``x.grad * x`` (one line, no adapter). For CRP the per-layer
+relevance is ``g × activation`` (the read-outs in :mod:`experiments.gradinput`).
+
+This is the recipe of ``tutorials/vit_crp/lxt_reference.ipynb`` (Path A / A2):
+|Δ| ≈ 1e-8 vs LXT on the fused torchvision model; cross-skeleton r = 1.0 under the
+unified canonization.
+
+* patch-embed conv → :class:`GammaGradInput` (γ=0.25)
+* FFN linears (:class:`FFNLinear` marker) + classifier ``head`` →
+  :class:`GammaGradInput` (γ=0.10)
+* bare ``nn.Linear`` (qkv / proj) → no hook = ε in the g-convention
+* GELU → :class:`IdentityGradTimesInput` (``y/(x+ε)``)
+* Q/K probes → :class:`StopGradient` (CP-LRP AH-rule: softmax a graph constant)
+* LayerNorm → σ-detach substitution, rule-free (autograd in g = ε-rule)
+* residual adds → rule-free (autograd in g = conserving ε-split)
 
 Sourced from 'XAI for Transformers: Better Explanations through Conservative
-Propagation', https://proceedings.mlr.press/v162/ali22a.html
+Propagation', https://proceedings.mlr.press/v162/ali22a.html (AH-rule via
+StopGradient + Gradient×Input extraction).
 """
 from __future__ import annotations
 
 import torch.nn as nn
-from zennit.composites import LayerMapComposite
-from zennit.rules import Gamma, Pass
+from zennit.core import Composite
 
 from zennit_extensions.attention_unfolded import (
+    FFNLinear,
     KInspectionLayer,
-    LayerNormDetachedStd,
-    LayerScaleMul,
     QInspectionLayer,
-    ResidualAdd,
-    ScaleByConstant,
-    SoftmaxAlongLastDim,
 )
 from zennit_extensions.canonisation.canonizers import (
-    EvaAttentionSubstitutionCanonizer,
-    EvaBlockResidualCanonizer,
+    FFNLinearSubstitutionCanonizer,
     LayerNormSubstitutionCanonizer,
     VanillaViTAttentionSubstitutionCanonizer,
-    VanillaViTBlockResidualCanonizer,
-    VanillaViTPosEmbedCanonizer,
 )
 from zennit_extensions.cp_lrp import StopGradient
-from zennit_extensions.rules.attnlrp import LayerNormEpsilon
-from zennit_extensions.rules.residuals_otsuki2024 import ResidualRatio
+from zennit_extensions.rules.attnlrp import GammaGradInput, IdentityGradTimesInput
 
 
-class CPLRPComposite(LayerMapComposite):
-    """CP-LRP (Ali et al., 2022): StopGradient on the Q/K probes, so the softmax
-    is a graph constant and relevance flows via ``context = attn @ v`` only.
-    γ=0.10 linears / γ=0.25 patch conv; Otsuki ratio residual split; LayerScale
-    → ``Pass`` (bias-free elementwise linear γ-multiply, ε-attribution ≈
-    identity). LayerNorm is handled the Ali-et-al. way (the origin of the
-    σ-detach heuristic): :class:`LayerNormSubstitutionCanonizer` +
-    :class:`LayerNormEpsilon`, with ``layernorm_bias_mode`` selecting the β
-    handling; unsubstituted LayerNorm subclasses fall back to ``Pass``.
-    """
+class CPLRPComposite(Composite):
+    """CP-LRP in the grad×input convention (timm/torchvision ViT skeletons)."""
 
-    def __init__(self, *, linear_gamma: float = 0.10, conv_gamma: float = 0.25,
-                 epsilon: float = 1e-6, layernorm_bias_mode: str = "absorb",
-                 canonizers=None):
+    def __init__(self, *, conv_gamma: float = 0.25, linear_gamma: float = 0.10,
+                 gelu_epsilon: float = 1e-10, canonizers=None):
+        self._gamma_conv = GammaGradInput(gamma=conv_gamma)
+        self._gamma_lin = GammaGradInput(gamma=linear_gamma)
+        self._gelu = IdentityGradTimesInput(epsilon=gelu_epsilon)
+        self._stop = StopGradient()
         canonizers = list(canonizers or []) + [
-            VanillaViTBlockResidualCanonizer(),
-            EvaBlockResidualCanonizer(layerscale_uniform=True),
-            VanillaViTPosEmbedCanonizer(),
-            EvaAttentionSubstitutionCanonizer(block_indices=None),
-            VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
             LayerNormSubstitutionCanonizer(),
+            FFNLinearSubstitutionCanonizer(),
+            VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
         ]
-        layer_map = [
-            (nn.Linear, Gamma(gamma=linear_gamma)),
-            (nn.Conv2d, Gamma(gamma=conv_gamma)),
-            (nn.GELU, Pass()),
-            (LayerNormDetachedStd, LayerNormEpsilon(epsilon=epsilon, bias_mode=layernorm_bias_mode)),
-            (nn.LayerNorm, Pass()),
-            (nn.Dropout, Pass()),
-            (SoftmaxAlongLastDim, Pass()),
-            (ScaleByConstant, Pass()),
-            (ResidualAdd, ResidualRatio(epsilon=epsilon)),
-            (LayerScaleMul, Pass()),
-            (QInspectionLayer, StopGradient()),
-            (KInspectionLayer, StopGradient()),
-            (nn.Identity, Pass()),
-        ]
-        super().__init__(layer_map=layer_map, canonizers=canonizers)
+        super().__init__(module_map=self._module_map, canonizers=canonizers)
+
+    def _module_map(self, ctx, name, module):
+        if isinstance(module, nn.Conv2d):
+            return self._gamma_conv
+        if isinstance(module, FFNLinear):
+            return self._gamma_lin
+        if isinstance(module, nn.Linear) and name.split(".")[-1] == "head":
+            return self._gamma_lin
+        if isinstance(module, nn.GELU):
+            return self._gelu
+        if isinstance(module, (QInspectionLayer, KInspectionLayer)):
+            return self._stop
+        return None

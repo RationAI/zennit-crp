@@ -1,21 +1,22 @@
 """LRP composites — one module per source paper.
 
-Only the math lives here; setup provenance is recorded in the experiment
-journal, not in source code. :data:`COMPOSITES` is the single name→class
-registry — gathered data, web manifests and CLIs reference these name strings,
-so keep them stable.
+Two reference-verified composites, both grad×input (g-convention). Only the math
+lives here; setup provenance is in the experiment journal. :data:`COMPOSITES` is
+the single name→class registry — keep the name strings stable (gathered data /
+web manifests reference them).
 """
-from zennit_extensions.lrp_composites.attnlrp import AttnLRPBaselineComposite
 from zennit_extensions.lrp_composites.chefer2021 import CheferLRPComposite
 from zennit_extensions.lrp_composites.cp_lrp import CPLRPComposite
 
+#: Both composites use the grad×input (g-convention) backward: uniform read-out
+#: heatmap = ``x.grad·x``, per-layer relevance = ``g × activation``
+#: (:mod:`experiments.gradinput`).
+#: * ``cp_lrp_baseline`` — CP-LRP, the LXT-certified recipe that reproduces
+#:   AttnLRP for ViTs (``tutorials/vit_crp/lxt_reference.ipynb``).
+#: * ``chefer_lrp`` — Chefer CVPR'21, verified vs the reference NPZs.
 COMPOSITES = {
     "cp_lrp_baseline": CPLRPComposite,
-    "attnlrp_baseline": AttnLRPBaselineComposite,
     "chefer_lrp": CheferLRPComposite,
 }
 
-__all__ = [
-    "AttnLRPBaselineComposite", "CheferLRPComposite", "CPLRPComposite",
-    "COMPOSITES",
-]
+__all__ = ["CheferLRPComposite", "CPLRPComposite", "COMPOSITES"]

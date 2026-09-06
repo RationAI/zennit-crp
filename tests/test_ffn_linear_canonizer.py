@@ -13,7 +13,6 @@ from zennit.rules import Epsilon, Gamma
 
 from zennit_extensions.attention_unfolded import FFNLinear
 from zennit_extensions.canonisation.canonizers import FFNLinearSubstitutionCanonizer
-from zennit_extensions.lrp_composites.attnlrp import AttnLRPBaselineComposite
 
 torch.manual_seed(0)
 
@@ -74,21 +73,3 @@ class TestFFNLinearSubstitutionCanonizer:
         finally:
             for inst in first:
                 inst.remove()
-
-
-class TestCompositeTable4Split:
-    def test_rule_assignment_matches_name_split(self, vit_tiny):
-        comp = AttnLRPBaselineComposite()
-        comp.register(vit_tiny)
-        try:
-            checked = 0
-            for name, mod in vit_tiny.named_modules():
-                if isinstance(mod, nn.Linear):
-                    hook = comp.mapping({}, name, mod)
-                    expected = Gamma if ".mlp." in name else Epsilon
-                    assert isinstance(hook, expected), (name, type(hook).__name__)
-                    checked += 1
-            assert checked >= 25  # 24 FFN + head (attention linears are inside
-            # the unfolded containers, also plain nn.Linear → ε)
-        finally:
-            comp.remove()

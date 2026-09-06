@@ -5,10 +5,9 @@ Covers the rules added / touched by the one-file-per-paper reorg:
 * :class:`MatmulAttnLRP` (AttnLRP Eq. 15) — the vectorized backward must equal
   the literal per-index summation and conserve relevance to ε.
 * :class:`EpsilonAdd` (AttnLRP residual add) — signed-sum conservation.
-* ``CPLRPComposite`` — a characterization test pinning the attribution on a
-  seeded ``vit_tiny`` so relocations cannot silently change its behaviour.
-* ``AttnLRPBaselineComposite`` — builds, attributes, and applies the Table-4
-  name split (FFN → γ, attention projections → ε).
+* ``CPLRPComposite`` / ``CheferLRPComposite`` — characterization tests pinning
+  the attribution on a seeded ``vit_tiny`` so relocations cannot silently
+  change their behaviour.
 
 Run::
 
@@ -28,9 +27,7 @@ from zennit.core import stabilize
 from zennit.rules import Gamma, Epsilon
 
 from zennit_extensions.rules.chefer2021 import CheferAdd
-from zennit_extensions.lrp_composites import (
-    AttnLRPBaselineComposite, CheferLRPComposite, CPLRPComposite,
-)
+from zennit_extensions.lrp_composites import CheferLRPComposite, CPLRPComposite
 
 
 # ── MatmulAttnLRP: vectorized backward == literal Eq. 15 ─────────────────────
@@ -133,53 +130,18 @@ def test_cp_lrp_baseline_characterization():
     with comp.context(model) as mod:
         out = mod(x)
         cls = int(out.argmax(1))
-        rel, = torch.autograd.grad(out[0, cls], x)
+        out[0, cls].backward()
+    R = x.grad * x                              # grad×input read-out
     assert cls == 9
-    assert torch.isfinite(rel).all()
-    # Reference values re-pinned 2026-08-19 after the LayerNormSubstitutionCanonizer
-    # fix (it now matches timm.layers.norm.LayerNorm, so the sigma-detach + LN
-    # epsilon rule actually engage on timm models; previously LNs silently fell
-    # to the Pass fallback).
-    assert rel.sum().item() == pytest.approx(4.064746e-01, rel=1e-3)
-    assert rel.abs().sum().item() == pytest.approx(4.370023e-01, rel=1e-3)
-
-
-# ── attnlrp_baseline: builds, attributes, Table-4 name split ─────────────────
-
-
-def test_attnlrp_baseline_attributes():
-    torch.manual_seed(0)
-    model = timm.create_model("vit_tiny_patch16_224", pretrained=False).eval()
-    x = torch.randn(1, 3, 224, 224, requires_grad=True)
-    comp = AttnLRPBaselineComposite()
-    with comp.context(model) as mod:
-        out = mod(x)
-        rel, = torch.autograd.grad(out[0, int(out.argmax(1))], x)
-    assert torch.isfinite(rel).all() and (rel != 0).any()
-
-
-def test_attnlrp_baseline_ffn_gamma_projection_epsilon():
-    """Table B.5 split via the FFNLinear marker: after canonization FFN linears
-    are FFNLinear (→ γ), every unmarked linear (qkv/proj/head) stays nn.Linear
-    (→ ε)."""
-    from zennit_extensions.attention_unfolded import FFNLinear
-
-    model = timm.create_model("vit_tiny_patch16_224", pretrained=False).eval()
-    comp = AttnLRPBaselineComposite()
-    with comp.context(model) as mod:
-        fc1 = mod.blocks[0].mlp.fc1
-        fc2 = mod.blocks[0].mlp.fc2
-        qkv = mod.blocks[0].attn.qkv
-        head = mod.head
-        assert isinstance(fc1, FFNLinear) and isinstance(fc2, FFNLinear)
-        assert type(qkv) is nn.Linear and type(head) is nn.Linear
-        assert isinstance(comp.mapping({}, "fc1", fc1), Gamma)
-        assert type(comp.mapping({}, "qkv", qkv)) is Epsilon
-        assert type(comp.mapping({}, "head", head)) is Epsilon
+    assert torch.isfinite(R).all()
+    # grad×input (g-convention) values, pinned 2026-08-25 — CPLRPComposite is now
+    # the LXT-certified g-convention recipe (heatmap = x.grad·x).
+    assert R.sum().item() == pytest.approx(8.596211e-02, rel=1e-3)
+    assert R.abs().sum().item() == pytest.approx(1.525319e+00, rel=1e-3)
 
 
 def test_chefer_lrp_attributes():
-    from zennit.rules import ZPlus
+    from zennit_extensions.rules.chefer2021 import ZPlusGradInput
 
     torch.manual_seed(0)
     model = timm.create_model("vit_tiny_patch16_224", pretrained=False).eval()
@@ -187,11 +149,12 @@ def test_chefer_lrp_attributes():
     comp = CheferLRPComposite()
     with comp.context(model) as mod:
         out = mod(x)
-        rel, = torch.autograd.grad(out[0, int(out.argmax(1))], x)
+        out[0, int(out.argmax(1))].backward()
+    R = x.grad * x                              # grad×input read-out
     # builds + attributes; finite, non-trivial (the reference reads R_A at the
     # softmax, so pixel values here are off-path smoke only).
-    assert torch.isfinite(rel).all() and (rel != 0).any()
-    # z+ (α1β0, bias-excluded) on every linear.
+    assert torch.isfinite(R).all() and (R != 0).any()
+    # z⁺ (α1β0, bias-excluded) in grad×input on every linear.
     lin = next(m for n, m in model.named_modules()
                if isinstance(m, nn.Linear) and n.endswith("mlp.fc1"))
-    assert isinstance(comp.mapping({}, "blocks.0.mlp.fc1", lin), ZPlus)
+    assert isinstance(comp._module_map({}, "blocks.0.mlp.fc1", lin), ZPlusGradInput)
