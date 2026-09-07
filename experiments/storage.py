@@ -79,8 +79,16 @@ def persistent(subrel: _PathLike) -> Path:
 
 def sync(src: _PathLike, dst: _PathLike) -> Path:
     """Copy directory tree ``src`` → ``dst`` (merge, overwrite). No-op if ``src``
-    is missing/empty. Returns ``dst``. This is a plain copy — no fstype logic."""
+    is missing/empty. Returns ``dst``. This is a plain copy — no fstype logic.
+
+    Set ``ZENNIT_NO_MIRROR=1`` to skip mirroring entirely (both the scratch→persist
+    push and the persist→scratch hydrate). The persist mirror only exists to survive
+    a pod bounce; when the persist root is on network storage (NFS/GPFS), copying a
+    large small-file FV index there is slow and can wedge the build in an
+    uninterruptible RPC wait. Skipping it keeps everything on local scratch."""
     src, dst = Path(src), Path(dst)
+    if os.environ.get("ZENNIT_NO_MIRROR"):
+        return dst
     if _nonempty(src):
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(src, dst, dirs_exist_ok=True)
