@@ -22,11 +22,13 @@ Design (see the approved plan / AGENTS.md):
 * **Composites are taken AS-IS** from the python source; the web only displays
   their summary + hyperparameters (``composite.json``). Nothing here defines or
   mutates a composite.
-* **Relevance-sign flavours.** By default negative relevance is dropped from the
-  FV index, the rankings, the scores and the displayed maps (the "clamped"
-  flavour); ``--include-negative`` computes a parallel flavour that keeps it. The
-  two live in separate caches (``<config>--negincl``) and entry subtrees
-  (``<config>/negincl/``) and the web suffixes the instance labels accordingly.
+* **Relevance-sign flavours.** By default the full **signed** relevance is kept
+  (negatives included) throughout the FV index, rankings, scores and displayed
+  maps — this is the default and the flavour to use. ``--no-include-negative`` is
+  an opt-in *positive-only* variant that clamps negatives away; it lives in
+  separate caches (``<config>--negincl`` marks the signed default) and entry
+  subtrees, with the web suffixing the instance labels accordingly. Do not choose
+  the positive-only variant as a default — only when positive-only is explicitly wanted.
 
 Compute nothing on your own — only the combinations explicitly requested.
 
@@ -207,7 +209,7 @@ def resolve_layers(model, site: str, blocks: List[int], *,
 
 def rank_scores(rank_mode: str, *, attribution, ds, sel, layer, concept, composite,
                 normalize, device, fv, batch_size: int = 32,
-                include_negative: bool = False) -> np.ndarray:
+                include_negative: bool = True) -> np.ndarray:
     """Per-detector relevance score vector for one layer (higher = more relevant).
 
     * ``class_conditional`` (default) — mean over a sample of correctly-classified
@@ -215,7 +217,8 @@ def rank_scores(rank_mode: str, *, attribution, ds, sel, layer, concept, composi
       true target logit (``{"y":[c]}``). Idiom from ``head_relevance_by_class``.
     * ``fv_index`` — mean over the FV RelMax index (whole-dataset, target-agnostic).
 
-    ``include_negative=False`` (default) scores by positive relevance only.
+    ``include_negative=True`` (default) scores by the full signed relevance;
+    ``include_negative=False`` is the opt-in positive-only variant.
     """
     if rank_mode == "fv_index":
         _, rel_c_sorted, _ = load_maximization(fv.RelMax.PATH, layer)
@@ -344,12 +347,12 @@ def pick_samples(dataset: str, ds) -> List[dict]:
 
 
 def local_relevances(attribution, x, target: int, layer: str, *, concept, composite,
-                     normalize, device: str, include_negative: bool = False) -> np.ndarray:
+                     normalize, device: str, include_negative: bool = True) -> np.ndarray:
     """Per-detector relevance of ONE input image at ``layer`` (local analysis):
     initialise relevance at the image's true class and read it on each concept.
     Returns a ``(n_det,)`` vector — argsort gives the detectors most relevant to
-    *this* image. ``include_negative=False`` (default) scores positive relevance
-    only."""
+    *this* image. ``include_negative=True`` (default) scores the full signed
+    relevance; ``include_negative=False`` is the opt-in positive-only variant."""
     xin = normalize(x[None].to(device)).requires_grad_(True)
     res = attribution(xin, [{"y": [int(target)]}], composite, record_layer=[layer],
                       mask_map=concept.mask)
@@ -361,7 +364,7 @@ def local_relevances(attribution, x, target: int, layer: str, *, concept, compos
 def render_local_entry(fv, attribution, ds, x, target: int, layer: str, cid: int, *,
                        mode: str, n_ref: int, composite, concept, normalize, device: str,
                        crop: bool, plot: str, out_dir: Path, meta_extra: dict,
-                       fv_class: str = "original", include_negative: bool = False) -> float:
+                       fv_class: str = "original", include_negative: bool = True) -> float:
     """Local analysis of one detector for one input image: the leftmost column is
     the query image + its *conditional* CRP heatmap; the remaining columns are the
     detector's dataset **representatives** so the reader can tell what the locally-
@@ -415,7 +418,7 @@ def save_sample_image(ds, sample: dict, out_path: Path) -> None:
 
 
 def save_sample_heat(attribution, x, target: int, *, composite, normalize, device: str,
-                     out_path: Path, include_negative: bool = False) -> None:
+                     out_path: Path, include_negative: bool = True) -> None:
     """Save the sample input's OWN overall relevance heatmap — the full-model LRP
     attribution to its true class (all concepts, input space), the standard CRP
     saliency for that image. Instance-specific (the composite/model differ per
@@ -577,7 +580,7 @@ def save_sample_ood(model, x, *, normalize, device: str, out_path: Path,
 # layer — so the layer dropdown lists each block exactly once per instance.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def instance_key(config: str, concept_kind: str, include_negative: bool = False) -> str:
+def instance_key(config: str, concept_kind: str, include_negative: bool = True) -> str:
     key = f"{config}::{concept_kind}"
     return f"{key}::negincl" if include_negative else key
 
@@ -588,8 +591,9 @@ _CONFIG_LABELS = {
 }
 
 
-def instance_label(config: str, concept_kind: str, include_negative: bool = False) -> str:
-    suffix = " (negative included)" if include_negative else " (neg. clamped away)"
+def instance_label(config: str, concept_kind: str, include_negative: bool = True) -> str:
+    # signed relevance is the default → no marker; positive-only is the opt-in variant
+    suffix = "" if include_negative else " (positive-only · opt-in)"
     base = _CONFIG_LABELS.get(config, config)
     if concept_kind == "embed_dim":
         return f"{base} · axis-aligned{suffix}"
@@ -618,7 +622,7 @@ def class_conditional_references(attribution, fv, ds, layer: str, cid: int, *, n
                                  mode: str, composite, concept, normalize, device: str,
                                  fv_class: str = "original",
                                  query_target: Optional[int] = None,
-                                 include_negative: bool = False):
+                                 include_negative: bool = True):
     """Top-``n_ref`` reference samples for a concept **with class-conditional CRP
     heatmaps**, as defined in the CRP paper.
 
@@ -747,7 +751,7 @@ def build_rows(samples, heatmaps, *, plot: str, crop: bool, signed: bool = False
 def render_entry(fv, attribution, ds, layer: str, cid: int, *, mode: str, n_ref: int,
                  composite, concept, normalize, device: str, crop: bool, plot: str,
                  out_dir: Path, meta_extra: dict, fv_class: str = "original",
-                 include_negative: bool = False) -> None:
+                 include_negative: bool = True) -> None:
     """Render + write one detector's figure (png+pdf) and meta.json (merge-not-wipe).
 
     Retrieve the reference images + their **class-conditional** CRP heatmaps (see
@@ -781,7 +785,7 @@ def record_job(spec: dict) -> None:
     base,dataset,config,site,concept,fv_class,include_negative)."""
     key = (spec["base"], spec["dataset"], spec["config"], spec["site"],
            spec["concept"], spec.get("fv_class", "original"),
-           bool(spec.get("include_negative", False)))
+           bool(spec.get("include_negative", True)))
     jobs = []
     if JOBS_PATH.exists():
         for line in JOBS_PATH.read_text().splitlines():
@@ -791,7 +795,7 @@ def record_job(spec: dict) -> None:
             j = json.loads(line)
             jk = (j["base"], j["dataset"], j["config"], j["site"],
                   j["concept"], j.get("fv_class", "original"),
-                  bool(j.get("include_negative", False)))
+                  bool(j.get("include_negative", True)))
             if jk != key:
                 jobs.append(j)
     jobs.append(spec)
@@ -963,7 +967,7 @@ def run_spec(spec: dict, device: str) -> None:
         raise typer.BadParameter(f"--fv-class must be one of {FV_CLASS_LABELS}, got {fv_class!r}")
     # Relevance-sign flavour: default drops negative relevance (index, rankings,
     # scores, displayed maps); include_negative keeps the fully signed quantities.
-    include_negative = bool(spec.get("include_negative", False))
+    include_negative = bool(spec.get("include_negative", True))
 
     # Model + dataset via the ModelDataset registry (experiments/model_datasets).
     # The pair's flat tag (mdset.tag == f"{base}_{dataset}") names the FV cache /
@@ -1214,7 +1218,7 @@ def compute(
     classes: List[int] = typer.Option([], "--classes", help="restrict ranking to these classes"),
     n_rank: int = typer.Option(8, "--n-rank", help="correct images per class for ranking"),
     fv_end: int = typer.Option(0, "--fv-end", help="cap FV-index samples (0 = full dataset)"),
-    include_negative: bool = typer.Option(False, "--include-negative/--no-include-negative", help="keep negative relevance in the FV index, rankings, scores and displayed maps (default: dropped); renders a parallel '<config>/negincl' flavour"),
+    include_negative: bool = typer.Option(True, "--include-negative/--no-include-negative", help="keep negative relevance in the FV index, rankings, scores and displayed maps (DEFAULT). Pass --no-include-negative only for the opt-in positive-only variant (clamps negatives; rendered in a separate subtree). The signed/default flavour is the one to use unless you specifically want positive-only."),
     checkpoint: Optional[str] = typer.Option(None, "--checkpoint", help="explicit best.pt path (finetuned-probe models only)"),
     device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", "--device"),
 ):

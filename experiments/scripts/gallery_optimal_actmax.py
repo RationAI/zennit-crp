@@ -95,7 +95,7 @@ def phase_build(args, base, dataset, tag):
         fv = GradTimesInputFeatureVisualization(
             attribution, ds, {ln: concept for ln in layer_names},
             preprocess_fn=normalize, path=str(fv_dir), max_target=mt,
-            device=device, negative_clamp=True)
+            device=device, negative_clamp=False)   # signed relevance (gallery default)
         mp = Path(fv.RelMax.PATH)
         have = mp.exists() and all(any(mp.glob(f"{ln}_data.npy")) for ln in layer_names)
         if have:
@@ -106,13 +106,13 @@ def phase_build(args, base, dataset, tag):
     print(f"build done: index at {fv_dir}")
 
 
-def _render_cmd(base, dataset, gsite, b, detectors, n_ref, device, concept, refs):
+def _render_cmd(base, dataset, gsite, b, detectors, n_ref, device, concept, refs, samples):
     cmd = [sys.executable, "-m", "experiments.crp_gallery", "compute",
            "--base", base, "--dataset", dataset, "--config", CONFIG,
            "--site", gsite, "--blocks", str(b), "--concept", concept,
            "--mode", "activation", "--fv-class", "original", "--rank", "fv_index",
            "--n", "0", "--n-ref", str(n_ref), "--plot", "heat_rf",
-           "--no-samples", "--device", device]
+           "--samples" if samples else "--no-samples", "--device", device]
     for r in refs:
         cmd += ["--refs", r]
     for det in detectors:
@@ -129,7 +129,7 @@ def phase_render(args, base, dataset, tag):
         for b in args.blocks:
             dets = consensus_top_k(d, D, nimg, npz_site, b, args.k)
             cmd = _render_cmd(base, dataset, gsite, b, dets, args.n_ref, args.device,
-                              args.concept, args.refs)
+                              args.concept, args.refs, args.samples)
             print(f"RENDER {gsite} b{b} top{args.k}={dets}")
             if not args.dry_run:
                 subprocess.run(cmd, cwd=REPO_ROOT, check=True)
@@ -145,6 +145,9 @@ def main():
     ap.add_argument("--sites", nargs="*", default=list(SITE_MAP),
                     help=f"heuristic npz sites (default all): {list(SITE_MAP)}")
     ap.add_argument("--blocks", type=int, nargs="*", default=BLOCKS)
+    ap.add_argument("--samples", dest="samples", action="store_true", default=True,
+                    help="render per-sample local (_img) views (default on)")
+    ap.add_argument("--no-samples", dest="samples", action="store_false")
     ap.add_argument("--refs", nargs="*", default=["actsum", "actmax"],
                     help="aggregate ref modes for the heuristic reps")
     ap.add_argument("--k", type=int, default=5)
