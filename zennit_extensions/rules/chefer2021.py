@@ -75,10 +75,16 @@ class CheferAdd(EpsilonAdd):
 
     Reuses :class:`~zennit_extensions.rules.attnlrp.EpsilonAdd`'s tensor capture;
     overrides the backward with Chefer's z-rule split (:func:`safe_divide`) plus
-    absolute-mass renormalization over **GLOBAL** sums (incl. the batch
-    dimension), matching their ``Add.relprop`` (``layers_ours.py:97-120``):
-    ``a_fact = safe_divide(|Σa|, |Σa|+|Σb|) · ΣR``. Equal to a per-sample
-    formulation at ``B=1``; conserves only the global sum for ``B>1``.
+    absolute-mass renormalization, matching their ``Add.relprop``
+    (``layers_ours.py:97-120``): ``a_fact = safe_divide(|Σa|, |Σa|+|Σb|) · ΣR``.
+
+    The reference sums over the WHOLE tensor including the batch, which only
+    ever ran at ``B=1``. Reproducing that literally couples every sample in a
+    batch through one shared factor — wrong once the FV index builds at ``B>1``.
+    Chefer attribution is defined per image, so the sums here reduce over the
+    non-batch dims only (``keepdim``), keeping each sample independent. This is
+    identical to the reference at ``B=1`` (batch dim is size 1) and correct for
+    any batch.
 
     Attach to :class:`~zennit_extensions.attention_unfolded.ResidualAdd`
     and :class:`~zennit_extensions.attention_unfolded.PosEmbedAdd`.
@@ -91,12 +97,17 @@ class CheferAdd(EpsilonAdd):
         s = safe_divide(rel, self.stored_tensors["output"])
         a = x * s
         b = branch * s
-        denom = a.sum().abs() + b.sum().abs()
-        a_fact = safe_divide(a.sum().abs(), denom) * rel.sum()
-        b_fact = safe_divide(b.sum().abs(), denom) * rel.sum()
-        a = a * safe_divide(a_fact, a.sum())
-        b = b * safe_divide(b_fact, b.sum())
-        return (a, b)
+        dims = tuple(range(1, rel.ndim))          # per-sample: reduce all but batch
+        a_sum = a.sum(dims, keepdim=True)
+        b_sum = b.sum(dims, keepdim=True)
+        r_sum = rel.sum(dims, keepdim=True)
+        denom = a_sum.abs() + b_sum.abs()
+        a = a * safe_divide(safe_divide(a_sum.abs(), denom) * r_sum, a_sum)
+        b = b * safe_divide(safe_divide(b_sum.abs(), denom) * r_sum, b_sum)
+        # A branch the forward broadcast (batch-1 ``pos_embed``) must have its
+        # gradient reduced to the input's own shape — the reduction autograd
+        # applies to a broadcast ``+`` operand. No-op for a full-batch branch.
+        return (a.sum_to_size(*x.shape), b.sum_to_size(*branch.shape))
 
     def copy(self):
         return CheferAdd()
