@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from crp.concepts import EmbeddingDimConcept
+from crp.concepts import EmbeddingDimConcept, HeadConcept
 from experiments.datasets import load_eval_dataset
 from experiments.gradinput import GradTimesInputAttribution
 from experiments.models import backbone_transforms
@@ -121,15 +121,17 @@ def select_correct(model, normalize, ds, n):
 
 
 # ── ranking psi (per-detector importance under an LRP composite) ───────────────
-def rank_psi(attribution, normalize, x, cls, method, num_heads, sites):
+def rank_psi(attribution, normalize, x, cls, method, num_heads, sites, blocks, concept):
+    """``concept``: a Concept instance whose ``attribute`` reduces a
+    (B, N, embed_dim) relevance to (B, n_detectors) — EmbeddingDimConcept
+    (n=embed_dim) or HeadConcept (n=num_heads)."""
     comp = COMPOSITE[method]()
-    concept = EmbeddingDimConcept(num_heads=num_heads)
-    layers = [layer_name(s, b) for s in sites for b in BLOCKS]
+    layers = [layer_name(s, b) for s in sites for b in blocks]
     xin = normalize(x).clone().detach().requires_grad_(True)
     res = attribution(xin, [{"y": [int(cls)]}], comp, record_layer=layers)
     return {(s, b): concept.attribute(res.relevances[layer_name(s, b)],
                                       abs_norm=False)[0].detach().cpu()
-            for s in sites for b in BLOCKS}
+            for s in sites for b in blocks}
 
 
 # ── zero-ablation perturbation curve ───────────────────────────────────────────
@@ -144,11 +146,18 @@ def rank_psi(attribution, normalize, x, cls, method, num_heads, sites):
 # sites the concept classes address. Detections are per-dim; a head-level bench
 # would only widen keep to the head's dim slice (HeadConcept's mapping).
 class ZeroChannelsHook:
-    def __init__(self):
-        self.keep = None   # (chunk, D) float, per-sample channel keep-mask
+    def __init__(self, head_dim=None):
+        self.keep = None       # (chunk, D_search) float, per-sample keep-mask
+        self.head_dim = head_dim   # head concept: expand each head bit over its dims
 
     def __call__(self, module, inp, out):
-        return out if self.keep is None else out * self.keep.unsqueeze(1)
+        if self.keep is None:
+            return out
+        keep = self.keep
+        if self.head_dim is not None:
+            # (chunk, num_heads) -> (chunk, num_heads*head_dim) contiguous slices
+            keep = keep.repeat_interleave(self.head_dim, dim=-1)
+        return out * keep.unsqueeze(1)
 
 
 def cumulative_keep(D, order):
@@ -175,29 +184,50 @@ def prob_curve(model, normalize, x, pred, order, hook):
 
 
 # ── per-model run ──────────────────────────────────────────────────────────────
-def run_model(key, tag, dataset, extra, label):
-    out_path = RES_DIR / f"cdet_dapc_{key}.npz"
+def run_model(key, tag, dataset, extra, label, concept="embed_dim",
+              sites=None, blocks=None):
+    is_head = concept == "head"
+    suffix = "__head" if is_head else ""
+    out_path = RES_DIR / f"cdet_dapc_{key}{suffix}.npz"
     if out_path.exists():
         print(f"[{tag}] exists → skip")
         return
-    print(f"[{tag}] loading {key}…")
+    print(f"[{tag}] loading {key}… (concept={concept})")
     model = find_by_tag(key, device=DEVICE).model.eval()
     transform, normalize = backbone_transforms(model.backbone)
     ds = load_eval_dataset(dataset, transform, extra)
     num_heads = model.backbone.blocks[0].attn.num_heads
-    D = int(model.backbone.embed_dim)
+    embed_dim = int(model.backbone.embed_dim)
+    run_blocks = list(blocks) if blocks is not None else BLOCKS
+    run_sites = list(sites) if sites is not None else ALL_SITES
+
+    # head concept: detectors = heads (D_search=num_heads); the occlusion hook
+    # widens each head bit over its contiguous head_dim slice of embed_dim.
+    if is_head:
+        head_dim = embed_dim // num_heads
+        D = num_heads
+        concept_obj = HeadConcept(num_heads=num_heads)
+    else:
+        head_dim = None
+        D = embed_dim
+        concept_obj = EmbeddingDimConcept(num_heads=num_heads)
+
     picks = select_correct(model, normalize, ds, N_IMAGES)
-    print(f"[{tag}] {len(picks)} correct images, D={D}, heads={num_heads}")
+    print(f"[{tag}] {len(picks)} correct images, D={D}, heads={num_heads}, "
+          f"embed_dim={embed_dim}, sites={run_sites}, blocks={run_blocks}")
 
     # (1) rankings for the two LRP methods (composite context canonizes the model).
     # Both composites are grad×input → relevance = g×activation (GradTimesInputAttribution).
     attribution = GradTimesInputAttribution(model)
     psi = {}
     for method in ("cp_lrp", "chefer"):
+        m_sites = [s for s in METHOD_SITES[method] if s in run_sites]
+        if not m_sites:
+            continue
         for j, (idx, pred, _) in enumerate(picks):
             x = ds[idx][0].unsqueeze(0).to(DEVICE)
             psi[(method, j)] = rank_psi(attribution, normalize, x, pred, method,
-                                        num_heads, METHOD_SITES[method])
+                                        num_heads, m_sites, run_blocks, concept_obj)
         print(f"[{tag}] ranked {method}")
 
     # (2) zero-ablation curves on the attention-unfolded model
@@ -205,11 +235,14 @@ def run_model(key, tag, dataset, extra, label):
     handles = canon.apply(model)
     store = {}
     try:
-        for method in METHODS:
-            for site in METHOD_SITES[method]:
-                for b in BLOCKS:
+        # optimal / optimal_dual curves come from the side-car (concept_detector_optimal);
+        # here we compute only the ranking-based LRP methods + random.
+        bench_methods = [m for m in METHODS if m == "random" or (m, 0) in psi]
+        for method in bench_methods:
+            for site in (s for s in METHOD_SITES[method] if s in run_sites):
+                for b in run_blocks:
                     mod = model.get_submodule(layer_name(site, b))
-                    hook = ZeroChannelsHook()
+                    hook = ZeroChannelsHook(head_dim=head_dim)
                     hh = mod.register_forward_hook(hook)
                     morf = np.zeros((len(picks), D + 1), np.float32)
                     lerf = np.zeros_like(morf)
@@ -240,7 +273,8 @@ def run_model(key, tag, dataset, extra, label):
             h.remove()
 
     meta = {"key": key, "tag": tag, "label": label, "dataset": dataset, "D": D,
-            "num_heads": int(num_heads), "seed": SEED, "k_random": K_RANDOM,
+            "concept": concept, "embed_dim": embed_dim, "num_heads": int(num_heads),
+            "sites": run_sites, "blocks": run_blocks, "seed": SEED, "k_random": K_RANDOM,
             "image_ids": [i for i, _, _ in picks], "preds": [p for _, p, _ in picks]}
     RES_DIR.mkdir(parents=True, exist_ok=True)
     np.savez(out_path, meta=json.dumps(meta), **store)
@@ -494,9 +528,23 @@ def make_outputs():
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--concept", choices=["embed_dim", "head"], default="embed_dim")
+    ap.add_argument("--sites", nargs="*", default=None,
+                    help=f"subset of {ALL_SITES} (default: all)")
+    ap.add_argument("--blocks", type=int, nargs="*", default=None,
+                    help="subset of blocks 0-11 (default: all)")
+    ap.add_argument("--no-web", action="store_true",
+                    help="skip building the web page")
+    args = ap.parse_args()
     for key, tag, dataset, extra, label in MODELS_CFG:
-        run_model(key, tag, dataset, extra, label)
-    make_outputs()
+        run_model(key, tag, dataset, extra, label, concept=args.concept,
+                  sites=args.sites, blocks=args.blocks)
+    if args.concept == "embed_dim" and not args.no_web:
+        make_outputs()
+    else:
+        print(f"[{args.concept}] measurement npz written; web outputs deferred")
 
 
 if __name__ == "__main__":

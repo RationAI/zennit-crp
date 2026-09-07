@@ -75,17 +75,23 @@ def layer_name(site: str, b: int) -> str:
 
 # ── occlusion (forward zero-ablation) ────────────────────────────────────────
 class ZeroChannelsHook:
-    """out * keep.unsqueeze(1): row r zeroes the removed channels of eval r."""
+    """out * keep.unsqueeze(1): row r zeroes the removed detectors of eval r.
+    For the head concept ``head_dim`` is set, and each head bit in ``keep``
+    (width num_heads) is expanded over its contiguous head_dim channel slice."""
 
-    def __init__(self):
+    def __init__(self, head_dim=None):
         self.keep = None
+        self.head_dim = head_dim
 
     def __call__(self, module, inp, out):
         if self.keep is None:
             return out
-        assert out.shape[-1] == self.keep.shape[-1], \
-            f"keep-mask width {self.keep.shape[-1]} != layer width {out.shape[-1]}"
-        return out * self.keep.unsqueeze(1)
+        keep = self.keep
+        if self.head_dim is not None:
+            keep = keep.repeat_interleave(self.head_dim, dim=-1)
+        assert out.shape[-1] == keep.shape[-1], \
+            f"keep-mask width {keep.shape[-1]} != layer width {out.shape[-1]}"
+        return out * keep.unsqueeze(1)
 
 
 def keep_of(removed: np.ndarray, D: int) -> torch.Tensor:
@@ -324,9 +330,12 @@ def select_correct(model, normalize, ds, n):
 
 
 # ── spec sanity: dims line up, readout is a probability ──────────────────────
-def occlusion_check(model, xn, pred, site, b, D):
+def occlusion_check(model, xn, pred, site, b, D, head_dim=None):
+    """D = search width (num_heads for the head concept, else embed_dim). The layer
+    tensor is always embed_dim wide; head_dim expands the keep-mask back to it."""
+    width = D * head_dim if head_dim is not None else D
     mod = model.get_submodule(layer_name(site, b))
-    hook = ZeroChannelsHook()
+    hook = ZeroChannelsHook(head_dim=head_dim)
     hh = mod.register_forward_hook(hook)
     seen = {}
 
@@ -335,12 +344,12 @@ def occlusion_check(model, xn, pred, site, b, D):
     hr = mod.register_forward_hook(rec)
     try:
         base = tau(model, xn, pred, torch.ones(1, D), hook, D)[0]
-        assert seen["shape"][-1] == D, f"probe width {seen['shape'][-1]} != D={D}"
+        assert seen["shape"][-1] == width, f"probe width {seen['shape'][-1]} != {width}"
         assert 0.0 <= float(base) <= 1.0, f"not a probability: {base}"
     finally:
         hh.remove()
         hr.remove()
-    print(f"  [occlusion-check] {site} b{b}: probe (B,N,{D}); dims line up; "
+    print(f"  [occlusion-check] {site} b{b}: probe (B,N,{width}); D={D}; dims line up; "
           f"base prob={base:.3f} OK", flush=True)
 
 
@@ -354,8 +363,9 @@ class OptimalStore:
 
     METHOD = {"greedy": "optimal", "pair": "optimal_pair", "dual": "optimal_dual"}
 
-    def __init__(self, key: str):
-        self.path = RES_DIR / f"cdet_dapc_{key}__optimal.npz"
+    def __init__(self, key: str, concept: str = "embed_dim"):
+        suffix = "__head_optimal" if concept == "head" else "__optimal"
+        self.path = RES_DIR / f"cdet_dapc_{key}{suffix}.npz"
         self.store = {}
         if self.path.exists():
             z = np.load(self.path, allow_pickle=True)
@@ -384,12 +394,13 @@ ORDER_BUILDERS = {"greedy": greedy_order, "pair": pair_order, "dual": dual_order
 
 
 def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0,
-              cache=None) -> dict:
+              cache=None, head_dim=None) -> dict:
     """One (image, site, block) combo with order-level checkpoint reuse.
     ``cache``: block-input activations for this image (see
-    capture_block_inputs); captured here when missing."""
+    capture_block_inputs); captured here when missing.
+    ``head_dim``: set for the head concept (keep-mask expanded over head slices)."""
     keys = combo_keys(OptimalStore.METHOD[mode], site, b, j)
-    hook = ZeroChannelsHook()
+    hook = ZeroChannelsHook(head_dim=head_dim)
     hh = model.get_submodule(layer_name(site, b)).register_forward_hook(hook)
     try:
         if cache is None:
@@ -415,39 +426,47 @@ def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0,
 
 
 # ── model loading + action drivers ───────────────────────────────────────────
-def load(key):
+def load(key, concept="embed_dim"):
     model = find_by_tag(key, device=DEVICE).model.eval()
     transform, normalize = backbone_transforms(model.backbone)
     cfg = next(c for c in MODELS_CFG if c[0] == key)
     ds = load_eval_dataset(cfg[1], transform, cfg[2])
-    D = int(model.backbone.embed_dim)
+    embed_dim = int(model.backbone.embed_dim)
+    num_heads = model.backbone.blocks[0].attn.num_heads
+    if concept == "head":
+        head_dim = embed_dim // num_heads
+        D = num_heads
+    else:
+        head_dim = None
+        D = embed_dim
     picks = select_correct(model, normalize, ds, N_IMAGES)
     canon = VanillaViTAttentionSubstitutionCanonizer(block_indices=None)
     handles = canon.apply(model)
-    print(f"[{key}] loaded; D={D}, {len(picks)} picks (seed {SEED})", flush=True)
-    return model, ds, normalize, D, picks, handles
+    print(f"[{key}] loaded (concept={concept}); D={D}, embed_dim={embed_dim}, "
+          f"heads={num_heads}, {len(picks)} picks (seed {SEED})", flush=True)
+    return model, ds, normalize, D, picks, handles, head_dim
 
 
-def _checked(key, site, b):
+def _checked(key, site, b, concept="embed_dim"):
     """Load model/ds and run the spec occlusion check on one probe site once."""
-    model, ds, normalize, D, picks, handles = load(key)
+    model, ds, normalize, D, picks, handles, head_dim = load(key, concept)
     idx, pred, _ = picks[0]
     xn = normalize(ds[idx][0].unsqueeze(0)).to(DEVICE)
-    occlusion_check(model, xn, pred, site, b, D)
-    return model, ds, normalize, D, picks, handles
+    occlusion_check(model, xn, pred, site, b, D, head_dim=head_dim)
+    return model, ds, normalize, D, picks, handles, head_dim
 
 
-def action_probe(key, site, block, mode, img_i, steps_cap):
-    model, ds, normalize, D, picks, handles = _checked(key, site, block)
+def action_probe(key, site, block, mode, img_i, steps_cap, concept="embed_dim"):
+    model, ds, normalize, D, picks, handles, head_dim = _checked(key, site, block, concept)
     try:
         idx, pred, _ = picks[img_i]
         print(f"probe[{mode}] {key} {site} b{block} img#{img_i} (ds {idx}), D={D}", flush=True)
         x = ds[idx][0].unsqueeze(0)
         xn = normalize(x).to(DEVICE)
-        sto = OptimalStore(key)
+        sto = OptimalStore(key, concept)
         t0 = time.time()
         out = run_combo(model, x, xn, pred, site, block, D, mode, sto, img_i,
-                        steps_cap=steps_cap)
+                        steps_cap=steps_cap, head_dim=head_dim)
         dt = time.time() - t0
         print(f"PROBE_RESULT {mode} {key} D={D} wall={dt:.1f}s", flush=True)
         if not steps_cap:
@@ -457,13 +476,14 @@ def action_probe(key, site, block, mode, img_i, steps_cap):
             h.remove()
 
 
-def action_run(key, mode, sites, blocks, n_imgs):
-    model, ds, normalize, D, picks, handles = _checked(key, sites[0], blocks[0])
-    sto = OptimalStore(key)
+def action_run(key, mode, sites, blocks, n_imgs, concept="embed_dim"):
+    model, ds, normalize, D, picks, handles, head_dim = _checked(key, sites[0], blocks[0], concept)
+    sto = OptimalStore(key, concept)
     mkey = OptimalStore.METHOD[mode]
     try:
         if not sto.has("meta"):
             sto.commit("meta", json.dumps({"key": key, "mode": mode, "D": D,
+                                           "concept": concept,
                                            "image_ids": [i for i, _, _ in picks],
                                            "preds": [p for _, p, _ in picks]}))
         caches = {}                    # img j -> {block: (1, N, D)} prefix activations
@@ -486,7 +506,7 @@ def action_run(key, mode, sites, blocks, n_imgs):
                     if j not in caches:
                         caches[j] = capture_block_inputs(model, xn)
                     out = run_combo(model, x, xn, pred, site, b, D, mode, sto, j,
-                                    cache=caches[j])
+                                    cache=caches[j], head_dim=head_dim)
                     print(f"[{key}] {mkey} {site} b{b} img#{j} "
                           f"dapc={out['dapc']:+.3f} ({time.time()-t0:.0f}s)", flush=True)
                     morf_rows.append(out["morf"])
@@ -517,12 +537,14 @@ def main():
     ap.add_argument("--sites", nargs="*", default=ALL_SITES)
     ap.add_argument("--blocks", nargs="*", type=int, default=BLOCKS)
     ap.add_argument("--n-imgs", type=int, default=N_IMAGES)
+    ap.add_argument("--concept", choices=["embed_dim", "head"], default="embed_dim")
     args = ap.parse_args()
     if args.action == "probe":
         action_probe(args.model_key, args.site, args.block, args.mode, args.img,
-                     args.steps_cap)
+                     args.steps_cap, concept=args.concept)
     else:
-        action_run(args.model_key, args.mode, args.sites, args.blocks, args.n_imgs)
+        action_run(args.model_key, args.mode, args.sites, args.blocks, args.n_imgs,
+                   concept=args.concept)
 
 
 if __name__ == "__main__":
