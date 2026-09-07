@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -78,7 +79,11 @@ def phase_build(args, base, dataset, tag):
     attribution = GradTimesInputAttribution(model)
     comp_cls = COMPOSITES[CONFIG]
     layer_names = [SITE_LAYERS[SITE_MAP[s]][b] for s in args.sites for b in args.blocks]
-    fv_dir = REPO_ROOT / "data/crp_gallery_cache/fv" / tag / CONFIG
+    # share the FV cache root with crp_gallery.compute (CRP_GALLERY_CACHE), so the
+    # build-phase index is reused by the render phase instead of rebuilt.
+    cache_root = Path(os.environ.get("CRP_GALLERY_CACHE",
+                                     str(REPO_ROOT / "data/crp_gallery_cache")))
+    fv_dir = cache_root / "fv" / tag / CONFIG
     print(f"build: {len(layer_names)} layers over {len(ds)} images -> {fv_dir}")
     if args.dry_run:
         return
