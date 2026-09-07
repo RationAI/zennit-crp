@@ -1131,17 +1131,33 @@ def run_spec(spec: dict, device: str) -> None:
         if include_negative:
             entries_root = entries_root / "negincl"
         # Aggregate view: top reference images across the dataset (needs FV).
+        # One entry per (detector, ref mode): ref = quantity{relevance,activation}
+        # × reduction{sum→fv, max→fv_max}. The frontend's ref selector switches
+        # between them (relsum/relmax/actsum/actmax).
         if not only_samples:
+            ref_fvs = {"sum": fv, "max": fv_max}
+            agg_refs = spec.get("refs") or list(REF_MODES)
             for cid in ids:
-                out_dir = entries_root / site / f"block{b}" / concept_kind / str(cid)
-                render_entry(fv, attribution, ds, layer, cid, mode=mode, n_ref=n_ref,
-                             composite=comp_cls(), concept=concept, normalize=normalize,
-                             device=device, crop=crop, plot=plot, out_dir=out_dir,
-                             fv_class=fv_class, include_negative=include_negative,
-                             meta_extra={
-                                 **base_meta, "sample": "aggregate", "sample_label": "Aggregate",
-                                 "rank": rank_of.get(int(cid)), "relevance": float(scores[int(cid)]),
-                             })
+                for ref_name in agg_refs:
+                    ref_quantity, ref_reduction, _lbl = REF_MODES[ref_name]
+                    ref_fv = ref_fvs[ref_reduction]
+                    if ref_fv is None:
+                        continue                     # max store absent (aligned fv_class)
+                    if fv_class == "aligned" and ref_quantity != "relevance":
+                        continue                     # aligned index is relevance-only
+                    out_dir = (entries_root / site / f"block{b}" / concept_kind
+                               / str(cid) / ref_name)
+                    render_entry(ref_fv, attribution, ds, layer, cid, mode=ref_quantity,
+                                 n_ref=n_ref, composite=comp_cls(), concept=concept,
+                                 normalize=normalize, device=device, crop=crop, plot=plot,
+                                 out_dir=out_dir, fv_class=fv_class,
+                                 include_negative=include_negative,
+                                 meta_extra={
+                                     **base_meta, "sample": "aggregate",
+                                     "sample_label": "Aggregate", "ref": ref_name,
+                                     "rank": rank_of.get(int(cid)),
+                                     "relevance": float(scores[int(cid)]),
+                                 })
         # Local analysis per fixed input image: rank detectors on THAT image, then
         # show each with the query heatmap + its dataset representatives (needs FV).
         img_root = entries_root / site / f"block{b}" / concept_kind / "_img"
@@ -1193,6 +1209,7 @@ def compute(
     samples: bool = typer.Option(True, "--samples/--no-samples", help="also render the fixed single-image comparison views (lizard, cheeseburger, …)"),
     only_samples: bool = typer.Option(False, "--only-samples", help="render ONLY the single-image views (skip FV index + aggregate; reuse existing aggregate entries)"),
     rank: str = typer.Option("class_conditional", "--rank", help="class_conditional | fv_index"),
+    refs: List[str] = typer.Option([], "--refs", help=f"aggregate representative ref modes to render (default all): {tuple(REF_MODES)}"),
     fv_class: str = typer.Option("original", "--fv-class", help=f"FV index flavour: {', '.join(FV_CLASS_LABELS.keys())}"),
     classes: List[int] = typer.Option([], "--classes", help="restrict ranking to these classes"),
     n_rank: int = typer.Option(8, "--n-rank", help="correct images per class for ranking"),
@@ -1209,7 +1226,7 @@ def compute(
         "base": base, "dataset": dataset, "config": config, "site": site,
         "blocks": list(blocks), "concept": concept, "n": n, "detectors": list(detectors),
         "n_ref": n_ref, "mode": mode, "plot": plot, "crop": crop, "samples": samples,
-        "only_samples": only_samples, "rank": rank, "fv_class": fv_class,
+        "only_samples": only_samples, "rank": rank, "refs": list(refs), "fv_class": fv_class,
         "classes": list(classes), "n_rank": n_rank, "fv_end": fv_end,
         "include_negative": include_negative,
         "checkpoint": checkpoint,

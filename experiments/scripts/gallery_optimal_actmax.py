@@ -40,8 +40,9 @@ SITE_MAP = {"residual": "residual", "proj_drop": "proj_drop", "qk": "query", "va
 BLOCKS = list(range(12))
 
 
-def npz_path(tag: str) -> Path:
-    return REPO_ROOT / f"data/results/benchmark/cdet_dapc_{tag}__optimal.npz"
+def npz_path(tag: str, concept: str = "embed_dim") -> Path:
+    suffix = "__head_optimal" if concept == "head" else "__optimal"
+    return REPO_ROOT / f"data/results/benchmark/cdet_dapc_{tag}{suffix}.npz"
 
 
 def n_images(d) -> int:
@@ -49,7 +50,7 @@ def n_images(d) -> int:
     (e.g. M2/imagenet ranked 4/combo, not the full candidate list)."""
     import re
     js = [int(m.group(1)) for k in d.files
-          if (m := re.match(rf"{METHOD}__residual__b0__img(\d+)__order", k))]
+          if (m := re.match(rf"{METHOD}__\w+__b\d+__img(\d+)__order", k))]
     return max(js) + 1 if js else 0
 
 
@@ -73,10 +74,10 @@ def phase_build(args, base, dataset, tag):
     mdset = find(base, dataset, device=device)
     model, normalize, ds = mdset.model, mdset.normalize, mdset.dataset
     num_heads = model.backbone.blocks[0].attn.num_heads
-    concept = make_concept("embed_dim", num_heads)
+    concept = make_concept(args.concept, num_heads)
     attribution = GradTimesInputAttribution(model)
     comp_cls = COMPOSITES[CONFIG]
-    layer_names = [SITE_LAYERS[SITE_MAP[s]][b] for s in SITE_MAP for b in BLOCKS]
+    layer_names = [SITE_LAYERS[SITE_MAP[s]][b] for s in args.sites for b in args.blocks]
     fv_dir = REPO_ROOT / "data/crp_gallery_cache/fv" / tag / CONFIG
     print(f"build: {len(layer_names)} layers over {len(ds)} images -> {fv_dir}")
     if args.dry_run:
@@ -100,26 +101,30 @@ def phase_build(args, base, dataset, tag):
     print(f"build done: index at {fv_dir}")
 
 
-def _render_cmd(base, dataset, gsite, b, detectors, n_ref, device):
+def _render_cmd(base, dataset, gsite, b, detectors, n_ref, device, concept, refs):
     cmd = [sys.executable, "-m", "experiments.crp_gallery", "compute",
            "--base", base, "--dataset", dataset, "--config", CONFIG,
-           "--site", gsite, "--blocks", str(b), "--concept", "embed_dim",
+           "--site", gsite, "--blocks", str(b), "--concept", concept,
            "--mode", "activation", "--fv-class", "original", "--rank", "fv_index",
            "--n", "0", "--n-ref", str(n_ref), "--plot", "heat_rf",
            "--no-samples", "--device", device]
+    for r in refs:
+        cmd += ["--refs", r]
     for det in detectors:
         cmd += ["--detectors", str(det)]
     return cmd
 
 
 def phase_render(args, base, dataset, tag):
-    d = np.load(npz_path(tag), allow_pickle=True)
+    d = np.load(npz_path(tag, args.concept), allow_pickle=True)
     meta = json.loads(str(d["meta"]))
     D, nimg = meta["D"], n_images(d)
-    for npz_site, gsite in SITE_MAP.items():
-        for b in BLOCKS:
+    for npz_site in args.sites:
+        gsite = SITE_MAP[npz_site]
+        for b in args.blocks:
             dets = consensus_top_k(d, D, nimg, npz_site, b, args.k)
-            cmd = _render_cmd(base, dataset, gsite, b, dets, args.n_ref, args.device)
+            cmd = _render_cmd(base, dataset, gsite, b, dets, args.n_ref, args.device,
+                              args.concept, args.refs)
             print(f"RENDER {gsite} b{b} top{args.k}={dets}")
             if not args.dry_run:
                 subprocess.run(cmd, cwd=REPO_ROOT, check=True)
@@ -131,6 +136,12 @@ def main():
     ap.add_argument("--model", default="vit_small", help="model axis (M_* value)")
     ap.add_argument("--dataset", default="funny_birds", help="dataset axis (DS_* value)")
     ap.add_argument("--phase", choices=["build", "render"], required=True)
+    ap.add_argument("--concept", choices=["embed_dim", "head"], default="embed_dim")
+    ap.add_argument("--sites", nargs="*", default=list(SITE_MAP),
+                    help=f"heuristic npz sites (default all): {list(SITE_MAP)}")
+    ap.add_argument("--blocks", type=int, nargs="*", default=BLOCKS)
+    ap.add_argument("--refs", nargs="*", default=["actsum", "actmax"],
+                    help="aggregate ref modes for the heuristic reps")
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--n-ref", type=int, default=12)
     ap.add_argument("--batch-size", type=int, default=32)
@@ -140,8 +151,8 @@ def main():
     args = ap.parse_args()
 
     tag = f"{args.model}_{args.dataset}"
-    if not npz_path(tag).is_file():
-        sys.exit(f"heuristic npz not found: {npz_path(tag)}")
+    if not npz_path(tag, args.concept).is_file():
+        sys.exit(f"heuristic npz not found: {npz_path(tag, args.concept)}")
     if args.phase == "build":
         phase_build(args, args.model, args.dataset, tag)
     else:
