@@ -288,14 +288,15 @@ class _Store(dict):
         return list(self.keys())
 
 
-def load_model_store(key):
+def load_model_store(key, concept="embed_dim"):
     """Bench npz merged with the optional optimal-ranking side-car
-    (``cdet_dapc_<key>__optimal.npz``, produced by
+    (``cdet_dapc_<key>[__head]_optimal.npz``, produced by
     :mod:`experiments.concept_detector_optimal`; keys ``optimal__*``)."""
-    z = np.load(RES_DIR / f"cdet_dapc_{key}.npz", allow_pickle=True)
+    suffix = "__head" if concept == "head" else ""
+    z = np.load(RES_DIR / f"cdet_dapc_{key}{suffix}.npz", allow_pickle=True)
     meta = json.loads(str(z["meta"]))
     store = _Store({k: z[k] for k in z.files})
-    opt = RES_DIR / f"cdet_dapc_{key}__optimal.npz"
+    opt = RES_DIR / f"cdet_dapc_{key}{suffix}_optimal.npz"
     if opt.exists():
         zo = np.load(opt, allow_pickle=True)
         for k in zo.files:
@@ -309,12 +310,13 @@ def mean_dapc(z, method, site, b):
     return float(z[k].mean()) if k in z.files else float("nan")
 
 
-def combined_scores(z):
-    """Baseline-subtracted mean over comparable sites × blocks, per method."""
-    rand = np.array([[mean_dapc(z, "random", s, b) for b in BLOCKS] for s in COMPARABLE])
+def combined_scores(z, sites, blocks):
+    """Baseline-subtracted mean over (comparable ∩ run) sites × blocks, per method."""
+    comp = [s for s in sites if s in COMPARABLE] or sites
+    rand = np.array([[mean_dapc(z, "random", s, b) for b in blocks] for s in comp])
     out = {}
     for method in ("cp_lrp", "chefer", "optimal", "optimal_dual"):
-        m = np.array([[mean_dapc(z, method, s, b) for b in BLOCKS] for s in COMPARABLE])
+        m = np.array([[mean_dapc(z, method, s, b) for b in blocks] for s in comp])
         out[method] = float(np.nanmean(m - rand))
     return out
 
@@ -327,11 +329,16 @@ def _save(fig, path_noext):
     plt.close(fig)
 
 
-def curve_figure(z, tag, site, method, D):
-    fig, axes = plt.subplots(3, 4, figsize=(13, 8.4), squeeze=False)
+def curve_figure(z, tag, site, method, D, blocks, fig_dir):
+    ncol = min(4, len(blocks))
+    nrow = int(np.ceil(len(blocks) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(3.25 * ncol, 2.8 * nrow), squeeze=False)
     x = np.arange(D + 1)                     # absolute count of detectors removed
-    for b in BLOCKS:
-        ax = axes.flat[b]
+    for ax in axes.flat:
+        ax.axis("off")
+    for i, b in enumerate(blocks):
+        ax = axes.flat[i]
+        ax.axis("on")
         mo = z[f"{method}__{site}__b{b}__morf"]
         le = z[f"{method}__{site}__b{b}__lerf"]
         for cur, col, lab in ((mo, "tab:red", "MoRF"), (le, "tab:blue", "LeRF")):
@@ -341,17 +348,16 @@ def curve_figure(z, tag, site, method, D):
         ax.set_title(f"block {b}", fontsize=9)
         ax.set_ylim(-0.02, 1.02)
         ax.tick_params(labelsize=7)
-        if b == 0:
+        if i == 0:
             ax.legend(fontsize=7, loc="lower left")
     fig.suptitle(f"{tag} · {SITE_LABEL[site]} · {METHOD_LABEL[method]} — "
                  f"predicted-class prob vs fraction of detectors zeroed", fontsize=11)
     fig.supxlabel("detectors removed (absolute count)", fontsize=9)
     fig.tight_layout(rect=(0, 0.02, 1, 0.98))
-    _save(fig, FIG_DIR / f"cdet_curves_{tag}_{site}_{method}")
+    _save(fig, fig_dir / f"cdet_curves_{tag}_{site}_{method}")
 
 
-def bars_figure(z, tag):
-    sites = ALL_SITES
+def bars_figure(z, tag, sites, blocks, fig_dir):
     xs = np.arange(len(sites))
     width = 0.16
     fig, ax = plt.subplots(figsize=(8.5, 4.2))
@@ -364,7 +370,7 @@ def bars_figure(z, tag):
             # missing blocks contribute NaN and shrink the s.e.m. base
             if s not in METHOD_SITES[method]:
                 vals.append(np.nan); errs.append(0); continue
-            per_block = [mean_dapc(z, method, s, b) for b in BLOCKS]
+            per_block = [mean_dapc(z, method, s, b) for b in blocks]
             n_ok = int(np.sum(~np.isnan(per_block)))
             vals.append(float(np.nanmean(per_block)) if n_ok else np.nan)
             errs.append(float(np.nanstd(per_block) / np.sqrt(n_ok)) if n_ok > 1 else 0)
@@ -373,30 +379,32 @@ def bars_figure(z, tag):
     ax.axhline(0, color="0.3", lw=0.8)
     ax.set_xticks(xs); ax.set_xticklabels([SITE_LABEL[s] for s in sites], fontsize=8, rotation=15)
     ax.set_ylabel("mean DAPC (higher = better)")
-    ax.set_title(f"{tag} — DAPC per site (mean over 12 blocks × {N_IMAGES} images)")
+    ax.set_title(f"{tag} — DAPC per site (mean over {len(blocks)} blocks × {N_IMAGES} images)")
     ax.legend(fontsize=8)
     fig.tight_layout()
-    _save(fig, FIG_DIR / f"cdet_bars_{tag}")
+    _save(fig, fig_dir / f"cdet_bars_{tag}")
 
 
 # ── web page (minimal, static; model/site/method selectors swap the curve img) ─
-def build_web(models_meta):
+def build_web(models_meta, sites, blocks, web_dir, concept="embed_dim"):
+    detector_word = "attention heads" if concept == "head" else "embedding-dim channels"
+    comp = [s for s in sites if s in COMPARABLE] or sites
     rows_html, opts_model = [], []
     web_scores, curve_avail = {}, {}
     for key, tag, label in models_meta:
-        _, z = load_model_store(key)
-        sc = combined_scores(z)
+        _, z = load_model_store(key, concept)
+        sc = combined_scores(z, sites, blocks)
         web_scores[tag] = sc
-        # a method's curve grid exists only once all 12 blocks are stored
-        for s in ALL_SITES:
+        # a method's curve grid exists only once all run blocks are stored
+        for s in sites:
             for m in METHODS:
                 curve_avail[f"{tag}_{s}_{m}"] = s in METHOD_SITES[m] and all(
-                    f"{m}__{s}__b{b}__morf" in z.files for b in BLOCKS)
+                    f"{m}__{s}__b{b}__morf" in z.files for b in blocks)
         opts_model.append(f'<option value="{tag}">{label}</option>')
         # per (site, block) DAPC table
         trows = []
-        for s in ALL_SITES:
-            for b in BLOCKS:
+        for s in sites:
+            for b in blocks:
                 cells = []
                 vals = {m: mean_dapc(z, m, s, b) for m in METHODS}
                 best = max((v for v in vals.values() if not np.isnan(v)), default=float("nan"))
@@ -414,16 +422,17 @@ def build_web(models_meta):
     method_info_json = json.dumps(METHOD_INFO)
     site_info_json = json.dumps(SITE_INFO)
     model_opts = "".join(opts_model)
-    cachebust = int(max((p.stat().st_mtime for p in WEB_DIR.glob("*.png")), default=0))
-    site_opts = "".join(f'<option value="{s}">{SITE_LABEL[s]}</option>' for s in ALL_SITES)
+    cachebust = int(max((p.stat().st_mtime for p in web_dir.glob("*.png")), default=0))
+    site_opts = "".join(f'<option value="{s}">{SITE_LABEL[s]}</option>' for s in sites)
     method_opts = "".join(f'<option value="{m}">{METHOD_LABEL[m]}</option>'
                           for m in ("chefer", "cp_lrp", "optimal", "optimal_dual", "random"))
     default_tag = models_meta[0][1]
+    comp_label = "/".join(comp)
 
     html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Concept-detector Insertion-Deletion (DAPC)</title>
+<title>Concept-detector Insertion-Deletion (DAPC) — {concept}</title>
 <style>
  body {{ font-family: system-ui, sans-serif; background:#f9f9f7; color:#0b0b0b; margin:0; padding:0 0 40px; }}
  header {{ padding:12px 20px; border-bottom:1px solid #e1e0d9; background:#fcfcfb; }}
@@ -440,9 +449,9 @@ def build_web(models_meta):
  .scores {{ font-size:13px; margin:10px 0; }} .scores b {{ font-size:15px; }}
  .info {{ font-size:12px; color:#52514e; margin:6px 0; }}
 </style></head><body>
-<header><h1>Concept-detector Insertion-Deletion — DAPC</h1>
-<div class="sub">Rank a layer's embedding-dim detectors (embedding-dim channels), zero-ablate MoRF/LeRF, area between the curves (DAPC; higher = better).
-Occlusion: detector channel zeroed at the probe site; measured value = softmax probability of the predicted class; curve x-axis = absolute number of detectors removed.
+<header><h1>Concept-detector Insertion-Deletion — DAPC ({concept})</h1>
+<div class="sub">Rank a layer's detectors ({detector_word}), zero-ablate MoRF/LeRF, area between the curves (DAPC; higher = better).
+Occlusion: detector zeroed at the probe site; measured value = softmax probability of the predicted class; curve x-axis = absolute number of detectors removed.
 CP-LRP skips query/key (StopGradient). N={N_IMAGES} images, detectors one-by-one, seed {SEED}.</div></header>
 <div class="wrap">
  <div class="controls">
@@ -488,43 +497,50 @@ function refresh() {{
   for (const r of document.querySelectorAll("#tbody tr")) r.style.display = (r.dataset.model===tag)?"":"none";
   const s=SCORES[tag]||{{}};
   document.getElementById("scores").innerHTML =
-    `combined score (baseline-subtracted mean over ${{'residual/proj_drop/value'}}): `+
+    `combined score (baseline-subtracted mean over ${{'{comp_label}'}}): `+
     `Optimal (greedy, dual) <b>${{fmt(s.optimal_dual)}}</b> · `+
     `Optimal (greedy) <b>${{fmt(s.optimal)}}</b> · `+
     `Chefer <b>${{fmt(s.chefer)}}</b> · CP-LRP <b>${{fmt(s.cp_lrp)}}</b> · Random 0.000`;
 }}
 M.value="{default_tag}"; [M,S,Me].forEach(e=>e.addEventListener("change",refresh)); refresh();
 </script></body></html>"""
-    WEB_DIR.mkdir(parents=True, exist_ok=True)
-    (WEB_DIR / "index.html").write_text(html)
+    web_dir.mkdir(parents=True, exist_ok=True)
+    (web_dir / "index.html").write_text(html)
 
 
-def make_outputs():
-    FIG_DIR.mkdir(parents=True, exist_ok=True)
+def make_outputs(concept="embed_dim"):
+    suffix = "__head" if concept == "head" else ""
+    fig_dir = FIG_DIR.with_name(FIG_DIR.name + ("_head" if concept == "head" else ""))
+    web_dir = WEB_DIR.with_name(WEB_DIR.name + ("_head" if concept == "head" else ""))
+    fig_dir.mkdir(parents=True, exist_ok=True)
     models_meta = []
+    run_sites, run_blocks = ALL_SITES, BLOCKS
     for key, tag, dataset, extra, label in MODELS_CFG:
-        if not (RES_DIR / f"cdet_dapc_{key}.npz").exists():
+        if not (RES_DIR / f"cdet_dapc_{key}{suffix}.npz").exists():
             print(f"[{tag}] no result npz → skip outputs")
             continue
-        meta, z = load_model_store(key)
+        meta, z = load_model_store(key, concept)
         D = meta["D"]
-        for site in ALL_SITES:
+        run_sites = meta.get("sites", ALL_SITES)
+        run_blocks = meta.get("blocks", BLOCKS)
+        for site in run_sites:
             for method in METHODS:
                 if site in METHOD_SITES[method] and all(
-                        f"{method}__{site}__b{b}__morf" in z for b in BLOCKS):
-                    curve_figure(z, tag, site, method, D)
-        bars_figure(z, tag)
+                        f"{method}__{site}__b{b}__morf" in z for b in run_blocks):
+                    curve_figure(z, tag, site, method, D, run_blocks, fig_dir)
+        bars_figure(z, tag, run_sites, run_blocks, fig_dir)
         models_meta.append((key, tag, label))
-        sc = combined_scores(z)
-        print(f"[{tag}] combined  chefer={sc['chefer']:+.3f}  cp_lrp={sc['cp_lrp']:+.3f}")
+        sc = combined_scores(z, run_sites, run_blocks)
+        print(f"[{tag}] combined  chefer={sc['chefer']:+.3f}  cp_lrp={sc['cp_lrp']:+.3f}"
+              f"  optimal={sc['optimal']:+.3f}  optimal_dual={sc['optimal_dual']:+.3f}")
     if models_meta:
         # copy the figures next to the html so the static page is self-contained
         for key, tag, label in models_meta:
-            for p in FIG_DIR.glob(f"cdet_*{tag}*.png"):
-                (WEB_DIR).mkdir(parents=True, exist_ok=True)
-                (WEB_DIR / p.name).write_bytes(p.read_bytes())
-        build_web(models_meta)
-        print(f"web → {WEB_DIR/'index.html'}")
+            for p in fig_dir.glob(f"cdet_*{tag}*.png"):
+                web_dir.mkdir(parents=True, exist_ok=True)
+                (web_dir / p.name).write_bytes(p.read_bytes())
+        build_web(models_meta, run_sites, run_blocks, web_dir, concept)
+        print(f"web → {web_dir/'index.html'}")
 
 
 def main():
@@ -541,10 +557,8 @@ def main():
     for key, tag, dataset, extra, label in MODELS_CFG:
         run_model(key, tag, dataset, extra, label, concept=args.concept,
                   sites=args.sites, blocks=args.blocks)
-    if args.concept == "embed_dim" and not args.no_web:
-        make_outputs()
-    else:
-        print(f"[{args.concept}] measurement npz written; web outputs deferred")
+    if not args.no_web:
+        make_outputs(args.concept)
 
 
 if __name__ == "__main__":
