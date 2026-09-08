@@ -39,24 +39,28 @@
 <body>
   <header>
     <h2>CRP composite gallery</h2>
-    <p class="meta-line">Saliency maps + representative images per LRP/CRP composite. Pick a
-      model, an experiment instance (composite × concept basis — SAE or axis-aligned), an image
-      sample (or the dataset aggregate), and a layer. Only computed combinations are listed.</p>
+    <p class="meta-line">For each concept <em>detector</em>, the images that most excite it plus their
+      conditional CRP heatmaps — so you can see what a detector responds to and where. Pick a
+      <strong>model</strong>, an <strong>instance</strong> (LRP composite × concept basis), a
+      <strong>layer</strong>, an <strong>image sample</strong> (a fixed input, or the dataset
+      <em>aggregate</em>), and a <strong>reference ranking</strong>. Only computed combinations are listed.</p>
+    <p class="meta-line"><strong>Concept basis:</strong> <em>attention heads</em> — one concept per
+      head; or <em>axis-aligned</em> — one concept per embedding dimension (standard CRP). The
+      composite (<em>CP-LRP</em> or <em>Chefer</em>) sets the relevance rule; the
+      <em>heuristic-optimal</em> instances instead show the detectors an occlusion search ranked most
+      important. Relevance is <strong>signed by default</strong> (negatives kept); a
+      <em>positive-only</em> instance is the opt-in exception.</p>
     <p class="meta-line">Each detector figure has three sub-rows: <strong>image</strong> (reference
       or query), <strong>relevance</strong> (its conditional CRP heatmap), and <strong>RF crop</strong>
-      — the image clipped to the heatmap's high-relevance region with low-relevance pixels faded,
-      showing which part of the image the concept latches onto.</p>
-    <p class="meta-line"><strong>FV index</strong> picks how the reference index was conditioned:
-      <em>original</em> = stock CRP, every dataset image attributed on its ground-truth label;
-      <em>condition-class-aligned</em> = every image attributed on its top-3 predicted classes with
-      p&nbsp;&gt;&nbsp;10% (one pass per class), references stored per conditioning class and served
-      only when the explanation conditions on the same class.</p>
-    <p class="meta-line">Heatmaps are <strong>class-conditional</strong>, per the CRP paper: relevance
-      is initialised at the output on the sample's true class, masked at the concept, and propagated
-      to the input (condition set <em>θ = {L:class, l:concept}</em>). This differs from
-      <code>FeatureVisualization.get_max_reference</code>, which starts the backward pass at the layer
-      seeded with the layer <em>activation</em> and drops the class condition — that made the displayed
-      heatmap inconsistent with the relevance used to rank the reference samples.</p>
+      — the image clipped to the heatmap's high-relevance region, showing where the concept latches on.
+      The <em>aggregate</em> sample shows the top dataset images for a detector; a named sample shows
+      that one input's locally most-relevant detectors.</p>
+    <p class="meta-line"><strong>Reference ranking</strong> orders the shown images by how the detector
+      scores them: <em>rel</em> (attributed relevance) or <em>act</em> (raw activation), each reduced
+      over tokens by <em>sum</em> or <em>max</em> — i.e. relsum / relmax / actsum / actmax.</p>
+    <p class="meta-line">Heatmaps are <strong>class-conditional</strong> (CRP): relevance is initialised
+      at the predicted/true class, masked at the concept, and propagated to the input
+      (<em>θ = {L:class, l:concept}</em>).</p>
   </header>
 
   <div class="selects">
