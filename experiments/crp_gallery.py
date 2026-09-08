@@ -990,15 +990,10 @@ def run_spec(spec: dict, device: str) -> None:
 
     md = f"{base}_{dataset}"
     comp_cls = COMPOSITES[config]
-    # CP-LRP StopGradients the Q/K probes (AH rule), so a heatmap conditioned at the
-    # query/key site has no gradient path to the input — it comes out degenerate
-    # (uniform/blank). Refuse those combinations rather than emit empty entries.
-    # (Mirrors concept_detector_bench.METHOD_SITES excluding qk for cp_lrp.)
-    if comp_cls is COMPOSITES["cp_lrp_baseline"] and site in ("query", "key"):
-        print(f"[{md}/{config}] site '{site}' skipped: this composite StopGradients "
-              f"Q/K, so its conditional heatmaps there are degenerate. Use chefer_lrp "
-              f"for query/key attribution.")
-        return
+    # Note: CP-LRP StopGradients the Q/K probes, so a heatmap conditioned at the
+    # query/key site has no gradient path to the input and comes out blank. That is
+    # the faithful, expected result for CP-LRP at q/k (use chefer_lrp for a non-blank
+    # q/k attribution) — we render it rather than hide it.
     if site in PROBE_SITES:
         # Probe layers exist only after the composite canonizes the model — validate
         # the names against the canonized module set, not the bare model.
