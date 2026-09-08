@@ -83,7 +83,10 @@ def phase_build(args, base, dataset, tag):
     # build-phase index is reused by the render phase instead of rebuilt.
     cache_root = Path(os.environ.get("CRP_GALLERY_CACHE",
                                      str(REPO_ROOT / "data/crp_gallery_cache")))
-    fv_dir = cache_root / "fv" / tag / CONFIG
+    # crp_gallery.run_spec (the render side) reads the index from
+    # "<config>--negincl" for the signed default (include_negative=True). Build to
+    # the SAME dir so the render reuses this index instead of rebuilding it.
+    fv_dir = cache_root / "fv" / tag / (CONFIG + "--negincl")
     print(f"build: {len(layer_names)} layers over {len(ds)} images -> {fv_dir}")
     if args.dry_run:
         return
