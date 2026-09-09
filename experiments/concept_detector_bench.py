@@ -296,7 +296,9 @@ def load_model_store(key, concept="embed_dim"):
     z = np.load(RES_DIR / f"cdet_dapc_{key}{suffix}.npz", allow_pickle=True)
     meta = json.loads(str(z["meta"]))
     store = _Store({k: z[k] for k in z.files})
-    opt = RES_DIR / f"cdet_dapc_{key}{suffix}_optimal.npz"
+    # side-car name must match OptimalStore: "__head_optimal" (head) / "__optimal" (embed).
+    sidecar = "__head_optimal" if concept == "head" else "__optimal"
+    opt = RES_DIR / f"cdet_dapc_{key}{sidecar}.npz"
     if opt.exists():
         zo = np.load(opt, allow_pickle=True)
         for k in zo.files:
@@ -521,8 +523,17 @@ def make_outputs(concept="embed_dim"):
             continue
         meta, z = load_model_store(key, concept)
         D = meta["D"]
-        run_sites = meta.get("sites", ALL_SITES)
-        run_blocks = meta.get("blocks", BLOCKS)
+        # Render every site/block the merged store actually has data for (any method),
+        # not just the bench run's sites — so heuristic (optimal) sites present only in
+        # the side-car (e.g. residual/proj_drop for head) still appear on the page.
+        import re as _re
+        present = [(_m.group(1), int(_m.group(2)))
+                   for k in z.files
+                   if (_m := _re.match(r"\w+__(\w+)__b(\d+)__dapc$", k))]
+        site_order = {s: i for i, s in enumerate(ALL_SITES)}
+        run_sites = sorted({s for s, _ in present}, key=lambda s: site_order.get(s, 99)) \
+            or list(meta.get("sites", ALL_SITES))
+        run_blocks = sorted({b for _, b in present}) or list(meta.get("blocks", BLOCKS))
         for site in run_sites:
             for method in METHODS:
                 if site in METHOD_SITES[method] and all(
