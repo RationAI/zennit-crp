@@ -37,7 +37,10 @@ METHOD = "optimal"
 CONFIG = "cp_lrp_baseline_optimal_actmax"
 
 # heuristic npz site -> gallery --site (SITE_LAYERS key)
-SITE_MAP = {"residual": "residual", "proj_drop": "proj_drop", "qk": "query", "value": "value"}
+# npz site -> gallery SITE_LAYERS key. Vanilla merges q/k into "qk" (ranked via q,
+# gallery site "query"); DINOv3/Eva splits them into separate "query"/"key".
+SITE_MAP = {"residual": "residual", "proj_drop": "proj_drop", "qk": "query",
+            "query": "query", "key": "key", "value": "value"}
 BLOCKS = list(range(12))
 
 
