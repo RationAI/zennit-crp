@@ -32,6 +32,7 @@ from zennit_extensions.attention_unfolded import (
     QInspectionLayer,
 )
 from zennit_extensions.canonisation.canonizers import (
+    EvaAttentionSubstitutionCanonizer,
     FFNLinearSubstitutionCanonizer,
     LayerNormSubstitutionCanonizer,
     VanillaViTAttentionSubstitutionCanonizer,
@@ -41,7 +42,7 @@ from zennit_extensions.rules.attnlrp import GammaGradInput, IdentityGradTimesInp
 
 
 class CPLRPComposite(Composite):
-    """CP-LRP in the grad×input convention (timm/torchvision ViT skeletons)."""
+    """CP-LRP in the grad×input convention (timm/torchvision ViT + Eva/DINOv3 skeletons)."""
 
     def __init__(self, *, conv_gamma: float = 0.25, linear_gamma: float = 0.10,
                  gelu_epsilon: float = 1e-10, canonizers=None):
@@ -53,6 +54,12 @@ class CPLRPComposite(Composite):
             LayerNormSubstitutionCanonizer(),
             FFNLinearSubstitutionCanonizer(),
             VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
+            # Eva/DINOv3 attention: unfold so the Q/K probes exist for the AH-rule
+            # StopGradient. Its isinstance(EvaAttention) filter is disjoint from the
+            # vanilla one, so both coexist. Eva block residual + LayerScale stay
+            # rule-free autograd (conserving in the g-convention), so no Eva block
+            # canonizer is needed here.
+            EvaAttentionSubstitutionCanonizer(block_indices=None),
         ]
         super().__init__(module_map=self._module_map, canonizers=canonizers)
 

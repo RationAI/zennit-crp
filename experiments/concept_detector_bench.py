@@ -30,7 +30,8 @@ from experiments.datasets import load_eval_dataset
 from experiments.gradinput import GradTimesInputAttribution
 from experiments.models import backbone_transforms
 from experiments.model_datasets import find_by_tag
-from zennit_extensions.canonisation.canonizers import VanillaViTAttentionSubstitutionCanonizer
+from zennit_extensions.canonisation.canonizers import (
+    EvaAttentionSubstitutionCanonizer, VanillaViTAttentionSubstitutionCanonizer)
 from zennit_extensions.lrp_composites import CPLRPComposite, CheferLRPComposite
 
 REPO = Path(__file__).resolve().parents[1]
@@ -50,17 +51,35 @@ MODELS_CFG = [
     ("vit_base_imagenet", "m2_vitb_in", "imagenet", {}, "M2 · ViT-B/16 · ImageNet-1k val"),
     ("vit_small_funny_birds", "m1_vits_fb", "funny_birds", {"split": "test"},
      "M1 · ViT-S/16 · FunnyBirds test"),
+    ("vit_dinov3_base_imagenet", "m6_dinob_in", "imagenet", {},
+     "M6 · DINOv3-B/16 · ImageNet-1k val"),
+    ("vit_dinov3_small_funny_birds", "m5_dinos_fb", "funny_birds", {"split": "test"},
+     "M5 · DINOv3-S/16 · FunnyBirds test"),
 ]
 
-# query and key are merged into one "qk" site: under zero-ablation, dropping
-# embedding-dim d from q and from k both delete the identical term q_id·k_jd from
-# every attention score, so the perturbation is bit-identical. We perturb via the
-# q-probe (== k) and rank by the q-probe relevance.
-ALL_SITES = ["residual", "proj_drop", "value", "qk"]
-COMPARABLE = ["residual", "proj_drop", "value"]   # cp_lrp is defined here
-METHOD_SITES = {"cp_lrp": COMPARABLE, "chefer": ALL_SITES, "random": ALL_SITES,
-                "optimal": ALL_SITES, "optimal_dual": ALL_SITES}
+# Vanilla ViT: q and k merge into one "qk" site — under zero-ablation, dropping
+# embedding-dim d from q and from k delete the identical term q_id·k_jd, so the
+# perturbation is bit-identical (ranked via the q-probe). DINOv3/Eva applies RoPE
+# before the score, so that equivalence breaks; q and k are kept as SEPARATE
+# "query"/"key" sites there.
+ALL_SITES = ["residual", "proj_drop", "value", "qk"]            # vanilla ViT
+ALL_SITES_EVA = ["residual", "proj_drop", "value", "query", "key"]  # DINOv3 (split q/k)
+COMPARABLE = ["residual", "proj_drop", "value"]   # cp_lrp valid sites (no StopGradient)
+QK_SITES = ("qk", "query", "key")                 # StopGradient sites cp_lrp can't attribute
 METHODS = ["cp_lrp", "chefer", "optimal", "optimal_dual", "random"]
+
+
+def is_eva(model) -> bool:
+    """DINOv3/Eva backbones use timm EvaAttention (RoPE, register tokens)."""
+    from timm.models.eva import EvaAttention
+    return isinstance(model.backbone.blocks[0].attn, EvaAttention)
+
+
+def method_sites(method: str, sites):
+    """Sites a method can attribute: cp_lrp is undefined at q/k (StopGradient)."""
+    if method == "cp_lrp":
+        return [s for s in sites if s in COMPARABLE]
+    return list(sites)
 COMPOSITE = {"cp_lrp": CPLRPComposite, "chefer": CheferLRPComposite}
 METHOD_LABEL = {"cp_lrp": "CP-LRP", "chefer": "Chefer", "optimal": "Optimal (greedy)",
                 "optimal_dual": "Optimal (greedy, dual)", "random": "Random"}
@@ -82,9 +101,12 @@ SITE_INFO = {
     "proj_drop": "site: attention output projection (attn.proj_drop)",
     "value": "site: value probe in the unfolded-attention substitution (pre-projection V)",
     "qk": "site: query/key probe (q and k ablation of the same dim is bit-identical; ranked via q)",
+    "query": "site: query probe (DINOv3: q and k split — RoPE breaks q==k equivalence)",
+    "key": "site: key probe (DINOv3: q and k split — RoPE breaks q==k equivalence)",
 }
 SITE_LABEL = {"residual": "residual (block out)", "proj_drop": "attn.proj_drop",
-              "value": "value", "qk": "query/key (shared dim)"}
+              "value": "value", "qk": "query/key (shared dim)",
+              "query": "query", "key": "key"}
 
 
 def layer_name(site: str, b: int) -> str:
@@ -92,6 +114,8 @@ def layer_name(site: str, b: int) -> str:
         "residual": f"backbone.blocks.{b}",
         "proj_drop": f"backbone.blocks.{b}.attn.proj_drop",
         "qk": f"backbone.blocks.{b}.attn.q_lrp_probe",
+        "query": f"backbone.blocks.{b}.attn.q_lrp_probe",
+        "key": f"backbone.blocks.{b}.attn.k_lrp_probe",
         "value": f"backbone.blocks.{b}.attn.v_lrp_probe",
     }[site]
 
@@ -199,7 +223,8 @@ def run_model(key, tag, dataset, extra, label, concept="embed_dim",
     num_heads = model.backbone.blocks[0].attn.num_heads
     embed_dim = int(model.backbone.embed_dim)
     run_blocks = list(blocks) if blocks is not None else BLOCKS
-    run_sites = list(sites) if sites is not None else ALL_SITES
+    # DINOv3/Eva splits q/k into separate query/key sites (RoPE); vanilla merges to qk.
+    run_sites = list(sites) if sites is not None else (ALL_SITES_EVA if is_eva(model) else ALL_SITES)
 
     # head concept: detectors = heads (D_search=num_heads); the occlusion hook
     # widens each head bit over its contiguous head_dim slice of embed_dim.
@@ -221,7 +246,7 @@ def run_model(key, tag, dataset, extra, label, concept="embed_dim",
     attribution = GradTimesInputAttribution(model)
     psi = {}
     for method in ("cp_lrp", "chefer"):
-        m_sites = [s for s in METHOD_SITES[method] if s in run_sites]
+        m_sites = method_sites(method, run_sites)
         if not m_sites:
             continue
         for j, (idx, pred, _) in enumerate(picks):
@@ -230,16 +255,20 @@ def run_model(key, tag, dataset, extra, label, concept="embed_dim",
                                         num_heads, m_sites, run_blocks, concept_obj)
         print(f"[{tag}] ranked {method}")
 
-    # (2) zero-ablation curves on the attention-unfolded model
-    canon = VanillaViTAttentionSubstitutionCanonizer(block_indices=None)
-    handles = canon.apply(model)
+    # (2) zero-ablation curves on the attention-unfolded model. Apply both attention
+    # canonizers; their isinstance filters are disjoint (TimmAttention vs EvaAttention),
+    # so exactly one fires per model family (unfolds the q/k/v probe sites).
+    handles = []
+    for c in (VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
+              EvaAttentionSubstitutionCanonizer(block_indices=None)):
+        handles += c.apply(model)
     store = {}
     try:
         # optimal / optimal_dual curves come from the side-car (concept_detector_optimal);
         # here we compute only the ranking-based LRP methods + random.
         bench_methods = [m for m in METHODS if m == "random" or (m, 0) in psi]
         for method in bench_methods:
-            for site in (s for s in METHOD_SITES[method] if s in run_sites):
+            for site in (s for s in method_sites(method, run_sites)):
                 for b in run_blocks:
                     mod = model.get_submodule(layer_name(site, b))
                     hook = ZeroChannelsHook(head_dim=head_dim)
@@ -370,7 +399,7 @@ def bars_figure(z, tag, sites, blocks, fig_dir):
         for s in sites:
             # tolerant to partially-computed methods (e.g. optimal mid-run):
             # missing blocks contribute NaN and shrink the s.e.m. base
-            if s not in METHOD_SITES[method]:
+            if s not in method_sites(method, sites):
                 vals.append(np.nan); errs.append(0); continue
             per_block = [mean_dapc(z, method, s, b) for b in blocks]
             n_ok = int(np.sum(~np.isnan(per_block)))
@@ -400,7 +429,7 @@ def build_web(models_meta, sites, blocks, web_dir, concept="embed_dim"):
         # a method's curve grid exists only once all run blocks are stored
         for s in sites:
             for m in METHODS:
-                curve_avail[f"{tag}_{s}_{m}"] = s in METHOD_SITES[m] and all(
+                curve_avail[f"{tag}_{s}_{m}"] = s in method_sites(m, sites) and all(
                     f"{m}__{s}__b{b}__morf" in z.files for b in blocks)
         opts_model.append(f'<option value="{tag}">{label}</option>')
         # per (site, block) DAPC table
@@ -536,7 +565,7 @@ def make_outputs(concept="embed_dim"):
         run_blocks = sorted({b for _, b in present}) or list(meta.get("blocks", BLOCKS))
         for site in run_sites:
             for method in METHODS:
-                if site in METHOD_SITES[method] and all(
+                if site in method_sites(method, run_sites) and all(
                         f"{method}__{site}__b{b}__morf" in z for b in run_blocks):
                     curve_figure(z, tag, site, method, D, run_blocks, fig_dir)
         bars_figure(z, tag, run_sites, run_blocks, fig_dir)

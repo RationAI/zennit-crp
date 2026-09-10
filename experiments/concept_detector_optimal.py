@@ -41,7 +41,8 @@ import torch
 from experiments.datasets import load_eval_dataset
 from experiments.models import backbone_transforms
 from experiments.model_datasets import find_by_tag
-from zennit_extensions.canonisation.canonizers import VanillaViTAttentionSubstitutionCanonizer
+from zennit_extensions.canonisation.canonizers import (
+    EvaAttentionSubstitutionCanonizer, VanillaViTAttentionSubstitutionCanonizer)
 
 # ── terms / constants ────────────────────────────────────────────────────────
 REPO = Path(__file__).resolve().parents[1]
@@ -59,12 +60,18 @@ ALL_SITES = ["residual", "proj_drop", "value", "qk"]
 MODELS_CFG = [
     ("vit_base_imagenet", "imagenet", {}),
     ("vit_small_funny_birds", "funny_birds", {"split": "test"}),
+    ("vit_dinov3_base_imagenet", "imagenet", {}),
+    ("vit_dinov3_small_funny_birds", "funny_birds", {"split": "test"}),
 ]
 
+# DINOv3/Eva splits q/k into "query"/"key" (RoPE breaks the vanilla q==k merge);
+# run those with --sites residual proj_drop value query key.
 LAYER_NAME = {
     "residual": "backbone.blocks.{b}",
     "proj_drop": "backbone.blocks.{b}.attn.proj_drop",
     "qk": "backbone.blocks.{b}.attn.q_lrp_probe",
+    "query": "backbone.blocks.{b}.attn.q_lrp_probe",
+    "key": "backbone.blocks.{b}.attn.k_lrp_probe",
     "value": "backbone.blocks.{b}.attn.v_lrp_probe",
 }
 
@@ -112,11 +119,20 @@ def keep_of(removed: np.ndarray, D: int) -> torch.Tensor:
 # shaped matmul in a different order — not a bug, below the fp32 noise floor).
 @torch.no_grad()
 def capture_block_inputs(model, xn):
-    """{b: (1, N, D)} residual stream entering each block, for one image."""
+    """{b: (1, N, D)} residual stream entering each block, for one image. For Eva/
+    DINOv3 the block also receives a ``rope`` kwarg; capture it verbatim under the
+    ``"rope"`` key so the cached suffix can pass the exact rotary embedding the full
+    forward used (recomputing it is model-specific and fragile)."""
     cache, hs = {}, []
     for i, blk in enumerate(model.backbone.blocks):
         hs.append(blk.register_forward_pre_hook(
             lambda m, args, i=i: cache.__setitem__(i, args[0].detach())))
+
+    def grab_rope(m, args, kwargs):
+        r = kwargs.get("rope")
+        if r is not None:
+            cache["rope"] = r
+    hs.append(model.backbone.blocks[0].register_forward_pre_hook(grab_rope, with_kwargs=True))
     model(xn)
     for h in hs:
         h.remove()
@@ -135,6 +151,8 @@ def make_head_tail(model):
         if model.head.input_kind == "cls":                      # head(pool(norm(tokens)))
             return lambda y: model.head(bb.forward_head(bb.norm(y), pre_logits=True))
         return lambda y: model.head(bb.norm(y))                 # head(tokens after norm)
+    if getattr(model, "head_name", "").startswith("canvit"):    # ImagenetDinoV3Base
+        return lambda y: model.head(bb.norm(y)[:, 0])           # separate head on post-norm cls
     raise ValueError(f"make_head_tail: unsupported model {type(model).__name__}")
 
 
@@ -143,10 +161,14 @@ def make_cached_forward(model, cache, b: int):
     head_tail = make_head_tail(model)
     blocks = model.backbone.blocks
     A_b = cache[b]                                               # (1, N, D)
+    # DINOv3/Eva blocks need the rotary embedding passed explicitly (captured verbatim
+    # from the full forward). Without it RoPE silently becomes identity and the
+    # cached-suffix logits are wrong. None for vanilla ViT.
+    rope = cache.get("rope")
     def forward_fn(R: int):
         x = A_b.expand(R, -1, -1).contiguous()
         for i in range(b, len(blocks)):
-            x = blocks[i](x)
+            x = blocks[i](x, rope=rope) if rope is not None else blocks[i](x)
         return head_tail(x)
     return forward_fn
 
@@ -440,8 +462,12 @@ def load(key, concept="embed_dim"):
         head_dim = None
         D = embed_dim
     picks = select_correct(model, normalize, ds, N_IMAGES)
-    canon = VanillaViTAttentionSubstitutionCanonizer(block_indices=None)
-    handles = canon.apply(model)
+    # Both attention canonizers; disjoint isinstance filters (TimmAttention vs
+    # EvaAttention) → exactly one fires per model family, unfolding the q/k/v probes.
+    handles = []
+    for c in (VanillaViTAttentionSubstitutionCanonizer(block_indices=None),
+              EvaAttentionSubstitutionCanonizer(block_indices=None)):
+        handles += c.apply(model)
     print(f"[{key}] loaded (concept={concept}); D={D}, embed_dim={embed_dim}, "
           f"heads={num_heads}, {len(picks)} picks (seed {SEED})", flush=True)
     return model, ds, normalize, D, picks, handles, head_dim
