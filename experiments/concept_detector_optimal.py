@@ -55,7 +55,7 @@ BATCH = 256            # keep-mask rows per forward in tau()
 N_IMAGES = 16          # bench protocol images
 SEED = 0               # same seed as the bench → identical picks
 BLOCKS = list(range(12))
-ALL_SITES = ["residual", "proj_drop", "value", "qk"]
+ALL_SITES = ["residual", "proj_drop", "head_out", "value", "qk"]
 
 MODELS_CFG = [
     ("vit_base_imagenet", "imagenet", {}),
@@ -73,6 +73,9 @@ LAYER_NAME = {
     "query": "backbone.blocks.{b}.attn.q_lrp_probe",
     "key": "backbone.blocks.{b}.attn.k_lrp_probe",
     "value": "backbone.blocks.{b}.attn.v_lrp_probe",
+    # merged per-head context Z, after the head mix and before the output
+    # projection: the last tensor whose coordinates belong to exactly one head
+    "head_out": "backbone.blocks.{b}.attn.ctx_lrp_probe",
 }
 
 

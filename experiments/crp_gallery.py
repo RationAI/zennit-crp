@@ -176,10 +176,18 @@ SITE_LAYERS = {
     # canonizer inserts on the (B, N, embed_dim) value tensor, alongside q/k
     # (attention_unfolded.py). Same canonized-context caveat as query/key.
     "value": [f"backbone.blocks.{b}.attn.v_lrp_probe" for b in range(12)],
+    # Merged per-head context Z, after the token mix and before the output
+    # projection. For the DAPC benchmark this site is provably the same
+    # measurement as "value" (zero-ablation of a coordinate of V forces the
+    # matching coordinate of Z to zero, and token-summed grad x input is
+    # conserved across the linear mix), but that equality holds only for the
+    # SUM reduction: RelMax, ActSum and ActMax all differ here, so the gallery
+    # needs this site in its own right. Same canonized-context caveat.
+    "head_out": [f"backbone.blocks.{b}.attn.ctx_lrp_probe" for b in range(12)],
 }
 
 # Sites whose layer names materialize only after canonization (Q/K/V probes).
-PROBE_SITES = frozenset({"query", "key", "value"})
+PROBE_SITES = frozenset({"query", "key", "value", "head_out"})
 
 
 def resolve_layers(model, site: str, blocks: List[int], *,

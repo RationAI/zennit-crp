@@ -62,9 +62,9 @@ MODELS_CFG = [
 # perturbation is bit-identical (ranked via the q-probe). DINOv3/Eva applies RoPE
 # before the score, so that equivalence breaks; q and k are kept as SEPARATE
 # "query"/"key" sites there.
-ALL_SITES = ["residual", "proj_drop", "value", "qk"]            # vanilla ViT
-ALL_SITES_EVA = ["residual", "proj_drop", "value", "query", "key"]  # DINOv3 (split q/k)
-COMPARABLE = ["residual", "proj_drop", "value"]   # cp_lrp valid sites (no StopGradient)
+ALL_SITES = ["residual", "proj_drop", "head_out", "value", "query", "key", "qk"]   # vanilla ViT
+ALL_SITES_EVA = ["residual", "proj_drop", "head_out", "value", "query", "key"]     # DINOv3 (split q/k)
+COMPARABLE = ["residual", "proj_drop", "head_out", "value"]   # cp_lrp valid sites (no StopGradient)
 QK_SITES = ("qk", "query", "key")                 # StopGradient sites cp_lrp can't attribute
 METHODS = ["cp_lrp", "chefer", "optimal", "optimal_dual", "random"]
 
@@ -100,11 +100,15 @@ SITE_INFO = {
     "residual": "site: block output (residual stream after skip-add)",
     "proj_drop": "site: attention output projection (attn.proj_drop)",
     "value": "site: value probe in the unfolded-attention substitution (pre-projection V)",
+    "head_out": ("site: merged per-head context Z, after the head mix and before the output "
+                 "projection — the last tensor whose coordinates belong to exactly one head, "
+                 "hence the measurement site of a whole-head detector"),
     "qk": "site: query/key probe (q and k ablation of the same dim is bit-identical; ranked via q)",
     "query": "site: query probe (DINOv3: q and k split — RoPE breaks q==k equivalence)",
     "key": "site: key probe (DINOv3: q and k split — RoPE breaks q==k equivalence)",
 }
 SITE_LABEL = {"residual": "residual (block out)", "proj_drop": "attn.proj_drop",
+              "head_out": "head output Z (pre-projection)",
               "value": "value", "qk": "query/key (shared dim)",
               "query": "query", "key": "key"}
 
@@ -117,6 +121,7 @@ def layer_name(site: str, b: int) -> str:
         "query": f"backbone.blocks.{b}.attn.q_lrp_probe",
         "key": f"backbone.blocks.{b}.attn.k_lrp_probe",
         "value": f"backbone.blocks.{b}.attn.v_lrp_probe",
+        "head_out": f"backbone.blocks.{b}.attn.ctx_lrp_probe",
     }[site]
 
 
@@ -213,9 +218,13 @@ def run_model(key, tag, dataset, extra, label, concept="embed_dim",
     is_head = concept == "head"
     suffix = "__head" if is_head else ""
     out_path = RES_DIR / f"cdet_dapc_{key}{suffix}.npz"
+    # Resumable: an existing store is extended, not overwritten. Combos already
+    # present are skipped, so adding a site or a block costs only the new work.
+    prev, prev_meta = {}, None
     if out_path.exists():
-        print(f"[{tag}] exists → skip")
-        return
+        _z = np.load(out_path, allow_pickle=True)
+        prev = {k: _z[k] for k in _z.files if k != "meta"}
+        prev_meta = json.loads(str(_z["meta"]))
     print(f"[{tag}] loading {key}… (concept={concept})")
     model = find_by_tag(key, device=DEVICE).model.eval()
     transform, normalize = backbone_transforms(model.backbone)
@@ -238,15 +247,23 @@ def run_model(key, tag, dataset, extra, label, concept="embed_dim",
         concept_obj = EmbeddingDimConcept(num_heads=num_heads)
 
     picks = select_correct(model, normalize, ds, N_IMAGES)
+    if prev_meta is not None and prev_meta.get("image_ids") != [i for i, _, _ in picks]:
+        raise SystemExit(
+            f"[{tag}] {out_path.name} was built on a different image sample "
+            f"({len(prev_meta.get('image_ids', []))} ids vs {len(picks)} now); "
+            "merging would mix samples. Move the file aside to rebuild it.")
+    done = {k.rsplit("__", 1)[0] for k in prev if k.endswith("__dapc")}
     print(f"[{tag}] {len(picks)} correct images, D={D}, heads={num_heads}, "
-          f"embed_dim={embed_dim}, sites={run_sites}, blocks={run_blocks}")
+          f"embed_dim={embed_dim}, sites={run_sites}, blocks={run_blocks}, "
+          f"{len(done)} combos already stored")
 
     # (1) rankings for the two LRP methods (composite context canonizes the model).
     # Both composites are grad×input → relevance = g×activation (GradTimesInputAttribution).
     attribution = GradTimesInputAttribution(model)
     psi = {}
     for method in ("cp_lrp", "chefer"):
-        m_sites = method_sites(method, run_sites)
+        m_sites = [s for s in method_sites(method, run_sites)
+                   if any(f"{method}__{s}__b{b}" not in done for b in run_blocks)]
         if not m_sites:
             continue
         for j, (idx, pred, _) in enumerate(picks):
@@ -270,6 +287,8 @@ def run_model(key, tag, dataset, extra, label, concept="embed_dim",
         for method in bench_methods:
             for site in (s for s in method_sites(method, run_sites)):
                 for b in run_blocks:
+                    if f"{method}__{site}__b{b}" in done:
+                        continue
                     mod = model.get_submodule(layer_name(site, b))
                     hook = ZeroChannelsHook(head_dim=head_dim)
                     hh = mod.register_forward_hook(hook)
@@ -301,12 +320,15 @@ def run_model(key, tag, dataset, extra, label, concept="embed_dim",
         for h in handles:
             h.remove()
 
+    all_sites = list(dict.fromkeys((prev_meta or {}).get("sites", []) + run_sites))
+    all_blocks = sorted(set((prev_meta or {}).get("blocks", [])) | set(run_blocks))
     meta = {"key": key, "tag": tag, "label": label, "dataset": dataset, "D": D,
             "concept": concept, "embed_dim": embed_dim, "num_heads": int(num_heads),
-            "sites": run_sites, "blocks": run_blocks, "seed": SEED, "k_random": K_RANDOM,
+            "sites": all_sites, "blocks": all_blocks, "seed": SEED, "k_random": K_RANDOM,
             "image_ids": [i for i, _, _ in picks], "preds": [p for _, p, _ in picks]}
     RES_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez(out_path, meta=json.dumps(meta), **store)
+    merged = {**prev, **store}
+    np.savez(out_path, meta=json.dumps(meta), **merged)
     print(f"[{tag}] saved {out_path}")
 
 
@@ -591,10 +613,15 @@ def main():
                     help=f"subset of {ALL_SITES} (default: all)")
     ap.add_argument("--blocks", type=int, nargs="*", default=None,
                     help="subset of blocks 0-11 (default: all)")
+    ap.add_argument("--models", nargs="*", default=None,
+                    help="subset of model keys (default: all in MODELS_CFG)")
     ap.add_argument("--no-web", action="store_true",
                     help="skip building the web page")
     args = ap.parse_args()
-    for key, tag, dataset, extra, label in MODELS_CFG:
+    cfg = [c for c in MODELS_CFG if args.models is None or c[0] in args.models]
+    if not cfg:
+        raise SystemExit(f"no model matched {args.models}; known: {[c[0] for c in MODELS_CFG]}")
+    for key, tag, dataset, extra, label in cfg:
         run_model(key, tag, dataset, extra, label, concept=args.concept,
                   sites=args.sites, blocks=args.blocks)
     if not args.no_web:

@@ -35,7 +35,8 @@ __all__ = [
     "AddBias", "BilinearMatmul", "ChunkAlongLastDim", "EvaAttentionUnfolded",
     "FFNLinear", "KInspectionLayer", "LRPInspectionLayer", "LayerNormDetachedStd",
     "LayerScaleMul", "PosEmbedAdd",
-    "QInspectionLayer", "ReshapeMergeHeads", "ResidualAdd", "RotaryEmbedding",
+    "CtxInspectionLayer", "QInspectionLayer", "ReshapeMergeHeads", "ResidualAdd",
+    "RotaryEmbedding",
     "ScaleByConstant", "SoftmaxAlongLastDim", "TimmAttentionUnfolded",
     "VInspectionLayer",
 ]
@@ -289,6 +290,15 @@ class KInspectionLayer(LRPInspectionLayer):
     pass
 
 
+class CtxInspectionLayer(LRPInspectionLayer):
+    """Probe on the merged per-head context ``Z`` (B, N, D_v), after
+    ``ReshapeMergeHeads`` and before the output projection. This is the last
+    tensor whose coordinates still belong to exactly one head: the merge is a
+    pure reindex, so coordinate ``e`` here is coordinate ``e`` of ``v`` and the
+    head boundaries are the same contiguous ranges. It is therefore the
+    measurement site of a whole-head concept detector."""
+
+
 class VInspectionLayer(LRPInspectionLayer):
     """V-slot probe. Under CP-LRP stays a pure identity so relevance flows
     through the value path unchanged."""
@@ -366,6 +376,7 @@ class TimmAttentionUnfolded(nn.Module):
         self.q_lrp_probe = QInspectionLayer()
         self.k_lrp_probe = KInspectionLayer()
         self.v_lrp_probe = VInspectionLayer()
+        self.ctx_lrp_probe = CtxInspectionLayer()
 
     def forward(
         self,
@@ -397,6 +408,7 @@ class TimmAttentionUnfolded(nn.Module):
 
         ctx = self.context(weights, v)
         out = self.reshape(ctx)
+        out = self.ctx_lrp_probe(out)
         out = self.norm(out)
         out = self.proj(out)
         out = self.proj_drop(out)
@@ -492,6 +504,7 @@ class EvaAttentionUnfolded(nn.Module):
         self.q_lrp_probe = QInspectionLayer()
         self.k_lrp_probe = KInspectionLayer()
         self.v_lrp_probe = VInspectionLayer()
+        self.ctx_lrp_probe = CtxInspectionLayer()
 
     def forward(
         self,
@@ -528,6 +541,7 @@ class EvaAttentionUnfolded(nn.Module):
 
         ctx = self.context(weights, v)
         out = self.reshape(ctx)
+        out = self.ctx_lrp_probe(out)
         out = self.norm(out)
         out = self.proj(out)
         out = self.proj_drop(out)
