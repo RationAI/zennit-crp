@@ -141,7 +141,6 @@ paper, not a throwaway:
 | Activation vs relevance examples | `mode="activation"` vs `"relevance"` |
 | Concept↔class atlas | `compute_stats` / `get_stats_reference` |
 | Zoom to the neuron's receptive field | `rf=True` |
-| ViT instead of CNN | swap composite → `AttnLRP*Composite`, concept → `HeadConcept`/…, layer → a `*_probe`/`proj_drop` site, `mask_map=concept.mask` |
 
 ## Storage & persistence
 

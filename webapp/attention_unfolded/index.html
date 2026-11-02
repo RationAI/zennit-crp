@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attention Unfolded</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#F5F7F4; --panel:#FFFFFF; --ink:#1C2126; --muted:#69737D; --line:#D5DAD3; --line-strong:#AEB6AC;
+  --h0:#137F8E; --h0-soft:#D6EEF1; --h1:#C2651C; --h1-soft:#F8E3D0;
+  --none-soft:#E9ECE8;
+  --down:#FFE27A; --down-ink:#3B2F00; --up:#CFE2FA; --up-ink:#0E2A4C;
+  --sel:#1C2126; --sel-ink:#FFFFFF;
+  --code:#F0F2EE;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#15181B; --panel:#1D2126; --ink:#E6E9EC; --muted:#98A2AC; --line:#2F353C; --line-strong:#4A525B;
+    --h0:#55C3D0; --h0-soft:#123A40; --h1:#EA9A5F; --h1-soft:#40270F;
+    --none-soft:#272C32;
+    --down:#8A7614; --down-ink:#FFF4C6; --up:#1D3A5E; --up-ink:#D6E6FB;
+    --sel:#E6E9EC; --sel-ink:#15181B;
+    --code:#12151A;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#15181B; --panel:#1D2126; --ink:#E6E9EC; --muted:#98A2AC; --line:#2F353C; --line-strong:#4A525B;
+  --h0:#55C3D0; --h0-soft:#123A40; --h1:#EA9A5F; --h1-soft:#40270F;
+  --none-soft:#272C32;
+  --down:#8A7614; --down-ink:#FFF4C6; --up:#1D3A5E; --up-ink:#D6E6FB;
+  --sel:#E6E9EC; --sel-ink:#15181B;
+  --code:#12151A;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 "IBM Plex Sans",system-ui,sans-serif}
+.wrap{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:24px;padding:24px;max-width:1500px;margin:0 auto}
+@media (max-width:1000px){.wrap{grid-template-columns:1fr}.side{position:static}}
+header{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px 24px;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:12px}
+h1{font-size:20px;font-weight:600;margin:0;letter-spacing:-.01em}
+header p{margin:0;color:var(--muted);max-width:70ch}
+.dims{font-family:"JetBrains Mono",monospace;font-size:12px;color:var(--muted)}
+main{display:flex;flex-direction:column;gap:30px;min-width:0}
+section.stage{display:flex;flex-direction:column;gap:10px}
+.stage-head{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+.stage-head h2{font-size:15px;font-weight:600;margin:0}
+.stage-head .eq{font-family:"JetBrains Mono",monospace;font-size:12px;color:var(--muted)}
+.stage-head .note{font-size:12px;color:var(--muted);max-width:80ch}
+.scroll{overflow-x:auto;padding-bottom:4px}
+.mm{display:grid;grid-template-columns:max-content max-content;gap:8px 14px;align-items:start;width:max-content}
+.mm .corner{align-self:end;justify-self:end;color:var(--muted);font-size:12px;padding-bottom:22px;text-align:right;max-width:220px}
+.opgroup{display:flex;gap:10px;align-items:start}
+.row-of{display:flex;gap:36px;align-items:start;flex-wrap:wrap}
+.arrow{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding-top:22px;color:var(--muted);font-size:11px;font-family:"JetBrains Mono",monospace;min-width:74px;text-align:center;line-height:1.35}
+.arrow b{font-size:16px;color:var(--ink);font-weight:400;display:block;margin:4px 0}
+.arrow .id{opacity:.7}
+.matrix{display:inline-grid;gap:2px;align-content:start}
+.matrix .title{grid-column:1/-1;font-size:12px;font-weight:600;height:18px;white-space:nowrap;display:flex;align-items:end;gap:6px}
+.matrix .title small{font-weight:400;color:var(--muted);font-family:"JetBrains Mono",monospace;font-size:11px}
+.matrix .cap{grid-column:1/-1;font-size:11px;color:var(--muted);line-height:1.35;padding-top:3px;max-width:100%;white-space:normal}
+.lbl{font-size:10px;color:var(--muted);font-family:"JetBrains Mono",monospace;display:flex;align-items:center}
+.lbl.col{justify-content:center;height:16px;white-space:nowrap}
+.lbl.col.h0{color:var(--h0)} .lbl.col.h1{color:var(--h1)}
+.lbl.row{justify-content:flex-end;padding-right:6px;width:74px;height:28px;white-space:nowrap}
+.lbl.row.h0{color:var(--h0)} .lbl.row.h1{color:var(--h1)}
+.cell{width:52px;height:28px;display:flex;align-items:center;justify-content:center;
+  font:11.5px/1 "JetBrains Mono",monospace;font-variant-numeric:tabular-nums;
+  border:1px solid var(--line);background:var(--panel);cursor:pointer;position:relative;user-select:none}
+.cell::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;background:var(--hb,transparent)}
+.cell[data-heads="0"]{--hb:var(--h0)} .cell[data-heads="1"]{--hb:var(--h1)}
+.cell[data-heads="01"]{--hb:linear-gradient(90deg,var(--h0) 50%,var(--h1) 50%)}
+.cell.param[data-heads="0"]{background:var(--h0-soft)}
+.cell.param[data-heads="1"]{background:var(--h1-soft)}
+.cell.param[data-heads=""],.cell.input{background:var(--none-soft)}
+.cell.input{border-style:dashed}
+.cell:hover{border-color:var(--line-strong);z-index:1}
+.cell:focus-visible{outline:2px solid var(--h0);outline-offset:1px;z-index:2}
+.cell.down{background:var(--down);color:var(--down-ink);border-color:var(--down)}
+.cell.up{background:var(--up);color:var(--up-ink);border-color:var(--up)}
+.cell.sel{background:var(--sel);color:var(--sel-ink);border-color:var(--sel);z-index:2}
+.cell.dim{opacity:.38}
+.side{position:sticky;top:16px;align-self:start;display:flex;flex-direction:column;gap:14px}
+.card{background:var(--panel);border:1px solid var(--line);padding:14px 16px;display:flex;flex-direction:column;gap:8px}
+.card h3{margin:0;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.big{font-family:"JetBrains Mono",monospace;font-size:15px;font-weight:500}
+.expr{font-family:"JetBrains Mono",monospace;font-size:11.5px;line-height:1.55;background:var(--code);padding:8px 10px;white-space:pre-wrap;word-break:break-word;margin:0}
+.legend{display:flex;flex-direction:column;gap:6px;font-size:12px}
+.legend div{display:flex;align-items:center;gap:8px}
+.sw{width:22px;height:14px;border:1px solid var(--line);flex:none;position:relative}
+.sw.h0{background:var(--h0-soft)} .sw.h0::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;background:var(--h0)}
+.sw.h1{background:var(--h1-soft)} .sw.h1::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;background:var(--h1)}
+.sw.mix::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;background:linear-gradient(90deg,var(--h0) 50%,var(--h1) 50%)}
+.sw.down{background:var(--down)} .sw.up{background:var(--up)} .sw.sel{background:var(--sel)}
+.sw.input{background:var(--none-soft);border-style:dashed}
+.counts{font-family:"JetBrains Mono",monospace;font-size:11.5px;display:grid;grid-template-columns:auto auto;gap:2px 12px}
+.counts span:nth-child(even){text-align:right}
+.heads-line{font-size:12px}
+.heads-line b.h0{color:var(--h0)} .heads-line b.h1{color:var(--h1)}
+button{font:inherit;font-size:12px;padding:4px 10px;border:1px solid var(--line-strong);background:var(--panel);color:var(--ink);cursor:pointer}
+button:hover{border-color:var(--ink)}
+.callout{border-left:3px solid var(--h1);padding:6px 12px;font-size:13px;background:var(--panel);max-width:90ch}
+.callout b{font-weight:600}
+table.ops{border-collapse:collapse;font-size:12px;width:max-content;max-width:100%}
+table.ops th,table.ops td{text-align:left;padding:3px 14px 3px 0;border-bottom:1px solid var(--line);vertical-align:top}
+table.ops th{font-weight:600;color:var(--muted);font-size:11px;letter-spacing:.05em;text-transform:uppercase}
+table.ops td:first-child,table.ops td:nth-child(2){font-family:"JetBrains Mono",monospace;font-size:11.5px;white-space:nowrap}
+table.ops td.k-lin{color:var(--ink);font-weight:500}
+table.ops td.k-id{color:var(--muted)}
+@media (prefers-reduced-motion:no-preference){.cell{transition:background-color .12s,color .12s}}
+.cell.const{background:var(--none-soft);border-style:dotted}
+.cell.empty{cursor:default;color:var(--muted);border-style:dotted;background:transparent}
+.sw.const{background:var(--none-soft);border-style:dotted}
+.switch{display:flex;gap:0;border:1px solid var(--line-strong);width:max-content}
+.switch button{border:0;border-right:1px solid var(--line-strong);padding:6px 14px;font-weight:500;color:var(--muted);background:var(--panel)}
+.switch button:last-child{border-right:0}
+.switch button.on{background:var(--ink);color:var(--bg)}
+.switch button:hover:not(.on){color:var(--ink)}
+header .desc{margin:0;color:var(--muted);max-width:90ch;font-size:13px;flex-basis:100%}
+header .desc code{font-family:"JetBrains Mono",monospace;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Attention Unfolded</h1>
+  <div class="switch" role="tablist" aria-label="model">
+    <button type="button" data-model="vit" role="tab">ViT-B/16</button>
+    <button type="button" data-model="dinov3" role="tab">DINOv3 S/16</button>
+  </div>
+  <p>One transformer block, attention branch, every op in forward order, every number shown. Click any cell: yellow = everything downstream that depends on it, blue = everything upstream it depends on.</p>
+  <p class="desc" id="model-desc"></p>
+  <span class="dims" id="dims"></span>
+</header>
+
+<main id="main"></main>
+
+<aside class="side">
+  <div class="card" id="selcard">
+    <h3>Selected cell</h3>
+    <div id="sel-label" class="big">—</div>
+    <div id="sel-heads" class="heads-line"></div>
+    <pre class="expr" id="sel-expr"></pre>
+    <div>
+      <h3 style="margin-bottom:4px">Downstream cells by stage</h3>
+      <div class="counts" id="sel-counts"></div>
+    </div>
+    <div><button id="clear" type="button">Clear selection</button> <span style="font-size:11px;color:var(--muted)">or press Esc</span></div>
+  </div>
+  <div class="card">
+    <h3>Legend</h3>
+    <div class="legend">
+      <div><span class="sw h0"></span>head 0 parameter (tinted) · head-0-only value (bar)</div>
+      <div><span class="sw h1"></span>head 1 parameter · head-1-only value</div>
+      <div><span class="sw mix"></span>value depends on parameters of <b>both</b> heads</div>
+      <div><span class="sw input"></span>block-side input a = norm1(x), taken as given</div>
+      <div><span class="sw const"></span>graph constant (RoPE sin/cos), no parameters</div>
+      <div><span class="sw sel"></span>selected</div>
+      <div><span class="sw down"></span>downstream: depends on the selected cell</div>
+      <div><span class="sw up"></span>upstream: selected cell depends on it</div>
+    </div>
+    <p style="margin:4px 0 0;font-size:12px;color:var(--muted)">Parameters are random (fixed seed), rounded to 2 decimals; intermediate values computed exactly, shown to 2 decimals. Matrices are laid out so each result cell sits at the crossing of the operand row to its left and the operand column above it. Files: <code>index.html</code> (shell), <code>graph.js</code> (engine), <code>model_vit.js</code>, <code>model_dinov3.js</code> (per-model config).</p>
+  </div>
+</aside>
+</div>
+<script src="model_vit.js"></script>
+<script src="model_dinov3.js"></script>
+<script src="graph.js"></script>
+</body>
+</html>

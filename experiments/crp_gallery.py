@@ -1037,6 +1037,14 @@ def run_spec(spec: dict, device: str) -> None:
         fv_dirname = config if fv_class == "original" else f"{config}--aligned"
         if include_negative:
             fv_dirname += "--negincl"
+        # The index stores one score per DETECTOR per layer, and what a detector
+        # is depends on the concept: embed_dim gives embed_dim entries, head
+        # gives num_heads. Keying only on (model, config) therefore lets a head
+        # run reuse an embed_dim index and select embedding-dim ids as if they
+        # were head ids (IndexError: head 287 out of [0, 6)). embed_dim keeps
+        # the bare name so existing caches stay valid.
+        if concept_kind != "embed_dim":
+            fv_dirname += f"--{concept_kind}"
         fv_dir = Path(CACHE_ROOT) / "fv" / model_tag / fv_dirname
         rel = fv_dir.relative_to(CACHE_ROOT)                 # fv/<model_tag>/<dirname>
         storage.sync(CACHE_MIRROR / rel, fv_dir)             # hydrate (no-op if scratch already has it)
