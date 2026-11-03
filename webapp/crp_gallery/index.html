@@ -34,6 +34,18 @@
     .empty { color: var(--pico-muted-color); font-style: italic; padding: 1rem 0; }
     .pill { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 1rem;
             background: var(--pico-secondary-background); font-size: 0.75rem; }
+    /* copy-metadata controls: emit one-line ids that identify an entry uniquely */
+    .copybar { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
+               margin: 0 0 0.9rem; }
+    .copybar .hint { font-size: 0.78rem; color: var(--pico-muted-color); }
+    button.copy { font-size: 0.75rem; padding: 0.15rem 0.55rem; width: auto;
+                  margin: 0; border-radius: 5px; line-height: 1.5;
+                  background: var(--pico-secondary-background);
+                  border: 1px solid var(--pico-muted-border-color);
+                  color: var(--pico-color); cursor: pointer; }
+    button.copy:hover { background: var(--pico-secondary-hover-background); }
+    button.copy.ok { background: #d8efe2; border-color: #7fc3a0; color: #16603c; }
+    figcaption .copy { margin-left: 0.4rem; }
   </style>
 </head>
 <body>
@@ -120,6 +132,11 @@
   <section id="gallery">
     <div id="layer-note" hidden style="background:#f0eef2;border-left:3px solid var(--accent,#7b2d8e);
          border-radius:6px;padding:.7rem .9rem;margin:0 0 1rem;font-size:.9rem;color:#333"></div>
+    <div class="copybar" id="copybar" hidden>
+      <button class="copy" id="copy-view" type="button">copy this view</button>
+      <button class="copy" id="copy-all" type="button">copy all shown detectors</button>
+      <span class="hint">one line per item, paste straight into a prompt</span>
+    </div>
     <div class="empty" id="empty-msg">No data yet — compute a combination to populate the gallery.</div>
     <div class="entries" id="entries"></div>
   </section>

@@ -176,6 +176,71 @@ function onLayerChange() {
   onRefChange();
 }
 
+// ── copy-metadata ────────────────────────────────────────────────────────────
+// One line per item, carrying every selector needed to find it again:
+// model, composite config, concept basis, FV class, sample, site, block, ref,
+// and for an entry its detector id. Paste straight into a prompt.
+function viewMeta() {
+  const s = curSample();
+  const ln = $("sel-layer").value;
+  const L = s && ln ? s.layers[ln] : null;
+  const inst = curInstance();
+  return {
+    model: $("sel-model").value,
+    config: (inst && inst.config) || $("sel-instance").value,
+    basis: (inst && inst.basis) || "",
+    fv: $("sel-fvclass").value,
+    sample: $("sel-sample").value,
+    site: (L && L.site) || "",
+    block: (L && L.block != null) ? L.block : "",
+    ref: $("sel-ref").value,
+    layer: ln,
+  };
+}
+
+function viewLine(v) {
+  v = v || viewMeta();
+  return `model=${v.model} config=${v.config} basis=${v.basis} fv=${v.fv} `
+       + `sample=${v.sample} site=${v.site} block=${v.block} ref=${v.ref}`;
+}
+
+function entryLine(e, v) {
+  v = v || viewMeta();
+  const rank = (e.rank != null) ? ` rank=${e.rank}` : "";
+  const rel = (e.relevance != null) ? ` score=${(+e.relevance).toPrecision(4)}` : "";
+  return `${viewLine(v)} detector=${e.id}${rank}${rel} png=${e.png}`;
+}
+
+function copyText(text, btn) {
+  const done = (ok) => {
+    if (!btn) return;
+    const old = btn.textContent;
+    btn.textContent = ok ? "copied" : "select & copy";
+    btn.classList.toggle("ok", ok);
+    setTimeout(() => { btn.textContent = old; btn.classList.remove("ok"); }, 1400);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => done(true), () => fallback(text, done));
+  } else {
+    fallback(text, done);
+  }
+}
+
+// Clipboard write is refused in some embedded views; put the text on screen
+// selected so it can be copied by hand instead of failing silently.
+function fallback(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.cssText = "position:fixed;left:1rem;right:1rem;bottom:1rem;height:6rem;z-index:9999";
+  document.body.appendChild(ta);
+  ta.focus(); ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+  if (ok) { ta.remove(); done(true); }
+  else { done(false); setTimeout(() => ta.remove(), 8000); }
+}
+
 function onRefChange() {
   const s = curSample();
   const entries = $("entries");
@@ -198,9 +263,25 @@ function onRefChange() {
     const rel = (e.relevance != null) ? ` · rel ${(+e.relevance).toPrecision(3)}` : "";
     const rank = (e.rank != null) ? ` · rank ${e.rank}` : "";
     cap.innerHTML = `detector <strong>#${e.id}</strong>${rank}${rel} · [<a href="${e.pdf}">pdf</a>]`;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "copy";
+    btn.textContent = "copy id";
+    btn.title = "copy this detector's identifying metadata";
+    btn.addEventListener("click", () => copyText(entryLine(e), btn));
+    cap.appendChild(btn);
     fig.appendChild(a);
     fig.appendChild(cap);
     entries.appendChild(fig);
+  }
+  const bar = $("copybar");
+  if (bar) {
+    bar.hidden = list.length === 0;
+    bar.dataset.count = String(list.length);
+    $("copy-all").textContent = `copy all ${list.length} shown`;
+    $("copy-all").onclick = () => copyText(list.map((e) => entryLine(e)).join("\n"),
+                                           $("copy-all"));
+    $("copy-view").onclick = () => copyText(viewLine(), $("copy-view"));
   }
 }
 
