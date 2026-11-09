@@ -1,22 +1,50 @@
 ---
 name: experiment-suite-design
-description: Design a coherent experiment suite for a research goal — precise self-contained research questions first, then falsifiable hypotheses (technical but clearly explained), then designs with controls, confound handling, sample-size reasoning, and staged compute. Use when planning a study/benchmark/ablation campaign, when the user says "design the experiments", "plan the suite", "what experiments do we need", or before any multi-experiment effort.
+description: Design the SMALLEST experiment that decides a research goal — one research question, one hypothesis, one experiment by default, with controls, confound handling, sample-size reasoning and a stated decision rule. Use when planning a study/benchmark/ablation, when the user says "design the experiments", "plan the suite", "what experiments do we need", or before any experimental effort.
 ---
 
-# Design an experiment suite
+## The rule that governs every other rule
 
-Adapted for computer-science / ML-interpretability work from:
-K-Dense `hypothesis-generation` + `experimental-design` skills and
-poemswe `hypothesis-testing` skill (github.com/K-Dense-AI/scientific-agent-skills,
-github.com/poemswe/co-researcher). Wet-lab machinery replaced by ML
-equivalents; the logic (Fisher's principles, falsifiability, confound
-discipline) is retained.
+**One research question. One hypothesis. One experiment.** That is the target,
+not a starting point to grow from. A design that needs more has to justify the
+extra, and the justification is never "it would also be interesting".
+
+Occam's razor applies to the design, not only to the explanation:
+
+- Between two hypotheses that predict the same observation, take the one with
+  fewer moving parts and fewer free parameters, and test it first. The
+  elaborate one earns its turn only after the simple one fails.
+- Between two measurements that decide the same question, take the cheaper and
+  more direct one. A derived quantity with three preprocessing steps is a
+  worse instrument than a number read straight off the run, even when it is
+  more elegant.
+- Between two experiments that would both settle the question, run the one
+  whose negative result is more informative.
+- An additional condition, site, model or granularity is only in scope if the
+  question cannot be decided without it. "While we are at it" is how suites
+  become untestable.
+
+**Scope cuts before experiments multiply.** When one experiment cannot decide
+the question, the first move is to narrow the question, not to add a second
+experiment. A narrower question with a clean answer beats a broad one with a
+tangle of partial answers.
+
+**Stop rule.** If the design has grown past one experiment, write one sentence
+saying which single result would make the extras unnecessary. If that sentence
+is easy to write, cut to that result and stop. If it cannot be written, the
+question is still too broad — go back and narrow it.
 
 ## Order of operations — questions before hypotheses before designs
 
 ### 1. Research questions (the critical step)
 
-Formulate 1–5 RQs. Each RQ must be:
+Formulate **one** RQ. Additional RQs are admissible only when the *same*
+experiment, with no added conditions, no extra runs and no extra analysis
+machinery, answers them as a by-product. If answering the second question
+requires one more configuration, it is a second experiment — drop it or
+replace the first question with it.
+
+Each RQ must be:
 - **Self-contained**: understandable without reading the codebase or prior
   chat — a new collaborator or reviewer parses it in one read.
 - **Singular**: one question. "Does X help and why" is two RQs.
@@ -30,7 +58,7 @@ faithful? which models?). Good: "When concept detectors at a fixed ViT layer
 are deleted in relevance order, does the class probability fall faster than
 when deleted in activation-magnitude order?"
 
-### 2. Hypotheses (one or more per RQ)
+### 2. Hypothesis (one)
 
 For each RQ write H1/H0 with mechanism:
 - **H1**: directional, falsifiable, with expected magnitude when defensible
@@ -44,13 +72,17 @@ For each RQ write H1/H0 with mechanism:
   exploration.
 - May be technical, but every symbol/term explained in-line.
 
-Quality gate (from the source skills, CS-tuned): testability, falsifiability,
+Write **one** hypothesis. Quality gate: testability, falsifiability,
 parsimony, explanatory power, consistency with known results, novelty vs the
 literature (check the related-work notes/briefs before claiming novelty).
-When a phenomenon has competing explanations, write 2–3 COMPETING hypotheses
-whose predictions differ, and design the experiment to discriminate — not to
-confirm the favorite (cf. register study: H_A artifact vs H_B real signal,
-settled by occlusion + mechanism test).
+
+Competing hypotheses are the one sanctioned exception, and they come with a
+condition: state 2–3 only when a **single** experiment discriminates between
+them because their predictions differ on the **same** measurement. If telling
+them apart needs a separate run per hypothesis, that is a suite masquerading
+as a design — pick the simplest explanation, test it alone, and leave the rest
+for after it fails. Designing to discriminate is right; designing to confirm a
+favourite is not.
 
 ### 3. Variable matrix (per experiment)
 
@@ -102,17 +134,19 @@ correction across multiple comparisons — Wilcoxon + Holm is the repo
 convention). Pre-registration equivalent: the experiment card
 (`remind-me-to-experiment`) or a journal design entry written before compute.
 
-### 6. Suite assembly & staging
+### 6. If more than one experiment is unavoidable
 
-- Order experiments by dependency and by information-per-GPU-hour: cheap
-  discriminating experiments first (screening on toy datasets = the
-  fractional-factorial screen), expensive confirmations (ImageNet-scale)
-  only for hypotheses that survive.
-- Shared infrastructure factored: one data pass serving many measurements
-  (e.g. single FV run per model×config covering all sites/granularities).
-- Every experiment cites its kill condition: what earlier result would make
-  it pointless (do not run experiment 4 if experiment 2 falsified its
-  premise).
+Reaching this section means the stop rule above did not cut the design down.
+Say explicitly why one experiment cannot decide the question before going on.
+Then:
+
+- Order by dependency and by information per GPU-hour: the cheap
+  discriminating run first, the expensive confirmation only for what survives.
+- Factor shared infrastructure: one data pass serving several measurements.
+- Every experiment states its kill condition — the earlier result that makes
+  it pointless, so it is dropped rather than run out of habit.
+- Two experiments is a lot. Three is a campaign and needs the user to have
+  asked for a campaign.
 
 ## Output format
 
@@ -131,7 +165,17 @@ Depends on / killed by: ...
 Cost estimate: ...
 ```
 
-Plus a suite header: goal, RQ list, staging order, total compute estimate.
+Plus a header: goal, the RQ, staging order if there is more than one
+experiment, total compute estimate.
+
+**Before writing the output, answer these three in one line each.** If any
+answer is unconvincing, the design is not ready.
+
+1. Which single number decides the question, and what value of it means yes?
+2. What is the simplest thing that could explain the expected result, and does
+   this design rule it out?
+3. What was cut to get here? (If nothing was cut, the design was not
+   minimised.)
 
 ## Endpoint: designs only, never execution (Adam, 2026-07-26)
 
