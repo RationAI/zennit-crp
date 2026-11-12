@@ -5,6 +5,7 @@ lives here; setup provenance is in the experiment journal. :data:`COMPOSITES` is
 the single name→class registry — keep the name strings stable (gathered data /
 web manifests reference them).
 """
+from zennit_extensions.lrp_composites.attnlrp import AttnLRPComposite
 from zennit_extensions.lrp_composites.chefer2021 import CheferLRPComposite
 from zennit_extensions.lrp_composites.cp_lrp import CPLRPComposite
 
@@ -17,6 +18,8 @@ from zennit_extensions.lrp_composites.cp_lrp import CPLRPComposite
 COMPOSITES = {
     "cp_lrp_baseline": CPLRPComposite,
     "chefer_lrp": CheferLRPComposite,
+    "attnlrp": AttnLRPComposite,
 }
 
-__all__ = ["CheferLRPComposite", "CPLRPComposite", "COMPOSITES"]
+__all__ = ["AttnLRPComposite", "CheferLRPComposite", "CPLRPComposite",
+           "COMPOSITES"]
