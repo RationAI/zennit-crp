@@ -403,8 +403,15 @@ class OptimalStore:
     def get(self, k: str):
         return self.store[k]
 
-    def commit(self, key: str, obj) -> None:
+    def commit(self, key: str, obj, flush: bool = True) -> None:
         self.store[key] = obj
+        if flush:
+            self.flush()
+
+    def flush(self) -> None:
+        """Atomic whole-store rewrite. Callers writing many keys in a row pass
+        ``flush=False`` to commit and call this once per batch; the store sits
+        on network storage, where a rewrite per key dominates the runtime."""
         tmp = self.path.with_name(self.path.stem + ".tmp")
         np.savez(tmp, **self.store)
         tmp.with_suffix(".tmp.npz").replace(self.path)
