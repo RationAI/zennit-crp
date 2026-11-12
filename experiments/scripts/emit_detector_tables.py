@@ -1,10 +1,36 @@
-"""Emit the LaTeX result tables of the concept-detector benchmark from the
-stored npz files, so the paper never carries hand-copied numbers.
+"""SUPERSEDED by :mod:`experiments.scripts.emit_rank_outputs`. Do not run.
 
-Writes two fragments next to the paper:
-  cdet_head_table.tex        mean DAPC per site, head concept, both models
-  cdet_normalised_table.tex  (DAPC - random) / (DAPC_greedy - random)
+This emitted ``cdet_head_table.tex`` and ``cdet_normalised_table.tex``. Both
+are statistically unsound and the numbers in them must not be reported:
+
+* It pools every block into one sample -- ``stat()`` concatenates 12 blocks x
+  16 images and divides by sqrt(192). The same 16 images recur in every block
+  and blocks are not replicates of one another, so the reported standard error
+  is too small by about sqrt(12), and the mean mixes collapsed early blocks
+  with late ones.
+* The normalisation divides by ``greedy - random`` per cell. That denominator
+  approaches zero exactly where the cell collapses, with no guard, and flips
+  sign where the greedy search scores below random -- in both cases the ratio
+  is meaningless and is printed anyway.
+* It subtracts an empirical 5-draw random estimate of a quantity that is zero
+  in expectation by construction (DAPC is antisymmetric), which adds variance
+  instead of removing bias.
+* It takes a ratio of pooled means rather than aggregating a per-image ratio,
+  and reports no interval at all.
+* Its denominator ignores the dual-greedy search even where that search found
+  the better ordering, and labels the greedy result as if it were the
+  attainable optimum.
+
+The replacement fixes each of these; see that module's docstring. The two old
+fragments are left on disk so the paper still builds, and should be replaced
+by ``cdet_normdapc_attention.tex`` / ``cdet_overlap_attention.tex`` and their
+supplementary counterparts.
 """
+import sys
+
+raise SystemExit(
+    "emit_detector_tables.py is superseded by emit_rank_outputs.py and its "
+    "output is statistically unsound; see this module's docstring.")
 from pathlib import Path
 import numpy as np
 
