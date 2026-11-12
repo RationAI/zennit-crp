@@ -426,11 +426,15 @@ ORDER_BUILDERS = {"greedy": greedy_order, "pair": pair_order, "dual": dual_order
 
 
 def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0,
-              cache=None, head_dim=None) -> dict:
+              cache=None, head_dim=None, flush=True) -> dict:
     """One (image, site, block) combo with order-level checkpoint reuse.
     ``cache``: block-input activations for this image (see
     capture_block_inputs); captured here when missing.
-    ``head_dim``: set for the head concept (keep-mask expanded over head slices)."""
+    ``head_dim``: set for the head concept (keep-mask expanded over head slices).
+    ``flush``: write the store to disk after every key. The store lives on
+    network storage and is rewritten whole, which measured ~4.7 s against
+    ~0.07 s of actual work per combo at D=6, so batch callers pass False and
+    flush once per cell instead."""
     keys = combo_keys(OptimalStore.METHOD[mode], site, b, j)
     hook = ZeroChannelsHook(head_dim=head_dim)
     hh = model.get_submodule(layer_name(site, b)).register_forward_hook(hook)
@@ -443,7 +447,7 @@ def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0,
         else:
             order = ORDER_BUILDERS[mode](model, xn, pred, hook, D, steps_cap=steps_cap,
                                          forward_fn=forward_fn)
-            sto.commit(keys["order"], order)          # commit expensive artefact 1st
+            sto.commit(keys["order"], order, flush=flush)   # expensive artefact 1st
         if steps_cap:
             return {"order": order}
         order_t = torch.from_numpy(order).long()         # one numpy→torch hop
@@ -451,7 +455,7 @@ def run_combo(model, x, xn, pred, site, b, D, mode, sto, j, steps_cap=0,
         lerf = prob_curve(model, xn, pred, order_t.flip(0), hook, D, forward_fn)
         out = {"order": order, "morf": morf, "lerf": lerf, "dapc": dapc_of(morf, lerf)}
         for k in ("morf", "lerf", "dapc"):
-            sto.commit(keys[k], out[k])
+            sto.commit(keys[k], out[k], flush=flush)
         return out
     finally:
         hh.remove()
@@ -542,17 +546,22 @@ def action_run(key, mode, sites, blocks, n_imgs, concept="embed_dim"):
                     if j not in caches:
                         caches[j] = capture_block_inputs(model, xn)
                     out = run_combo(model, x, xn, pred, site, b, D, mode, sto, j,
-                                    cache=caches[j], head_dim=head_dim)
+                                    cache=caches[j], head_dim=head_dim, flush=False)
                     print(f"[{key}] {mkey} {site} b{b} img#{j} "
                           f"dapc={out['dapc']:+.3f} ({time.time()-t0:.0f}s)", flush=True)
                     morf_rows.append(out["morf"])
                     lerf_rows.append(out["lerf"])
                     dapc_rows.append(out["dapc"])
                 if dapc_rows:
-                    sto.commit(f"{mkey}__{site}__b{b}__morf", np.stack(morf_rows))
-                    sto.commit(f"{mkey}__{site}__b{b}__lerf", np.stack(lerf_rows))
+                    sto.commit(f"{mkey}__{site}__b{b}__morf", np.stack(morf_rows),
+                               flush=False)
+                    sto.commit(f"{mkey}__{site}__b{b}__lerf", np.stack(lerf_rows),
+                               flush=False)
                     sto.commit(f"{mkey}__{site}__b{b}__dapc",
-                               np.array(dapc_rows, np.float32))
+                               np.array(dapc_rows, np.float32), flush=False)
+                    sto.flush()               # one whole-store write per cell
+                elif pending:
+                    sto.flush()
                     print(f"[{key}] {mkey} {site} b{b} done "
                           f"({len(dapc_rows)} images)", flush=True)
     finally:
