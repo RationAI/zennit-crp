@@ -13,6 +13,8 @@
   --down:#FFE27A; --down-ink:#3B2F00; --up:#CFE2FA; --up-ink:#0E2A4C;
   --sel:#1C2126; --sel-ink:#FFFFFF;
   --code:#F0F2EE;
+  --p0:#CFE3F5; --p1:#F8DCCB; --p2:#D4ECD6; --p3:#EFD9EC; --p4:#FBECC2;
+  --p5:#D2E0F0; --p6:#F6D7D7; --p7:#DCE8CC; --p8:#E2DBF2; --p9:#CFEDEA;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme="light"]){
@@ -22,6 +24,8 @@
     --down:#8A7614; --down-ink:#FFF4C6; --up:#1D3A5E; --up-ink:#D6E6FB;
     --sel:#E6E9EC; --sel-ink:#15181B;
     --code:#12151A;
+    --p0:#1C3A54; --p1:#4A2F18; --p2:#1F3F28; --p3:#3E2440; --p4:#4A3D12;
+    --p5:#243648; --p6:#4B2224; --p7:#2E3B1C; --p8:#2D2748; --p9:#143C39;
   }
 }
 :root[data-theme="dark"]{
@@ -31,6 +35,8 @@
   --down:#8A7614; --down-ink:#FFF4C6; --up:#1D3A5E; --up-ink:#D6E6FB;
   --sel:#E6E9EC; --sel-ink:#15181B;
   --code:#12151A;
+  --p0:#1C3A54; --p1:#4A2F18; --p2:#1F3F28; --p3:#3E2440; --p4:#4A3D12;
+  --p5:#243648; --p6:#4B2224; --p7:#2E3B1C; --p8:#2D2748; --p9:#143C39;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 "IBM Plex Sans",system-ui,sans-serif}
@@ -117,6 +123,23 @@ table.ops td.k-id{color:var(--muted)}
 .switch button:hover:not(.on){color:var(--ink)}
 header .desc{margin:0;color:var(--muted);max-width:90ch;font-size:13px;flex-basis:100%}
 header .desc code{font-family:"JetBrains Mono",monospace;font-size:12px}
+.decomp{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px 12px;align-items:baseline;
+  padding:10px 0 0;border-top:1px solid var(--line);margin-top:4px}
+.decomp > .lab{font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+#decomp-picker{display:flex;flex-wrap:wrap;gap:6px}
+#decomp-picker button{padding:3px 9px;font-size:11.5px}
+#decomp-picker button.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+#decomp-note{flex-basis:100%;font-size:12px;color:var(--muted);max-width:95ch;display:none;line-height:1.5}
+#decomp-note.shown{display:block}
+#decomp-note b{color:var(--ink);font-weight:600}
+.swatches{display:inline-flex;gap:2px;vertical-align:-2px;margin:0 4px}
+.swatches i{width:13px;height:13px;border:1px solid var(--line);display:block}
+/* a highlighted cell keeps its border and head bar; only the fill changes.
+   The attribute selector is needed to outrank .cell.param[data-heads=...],
+   which would otherwise keep its head tint on exactly the parameter cells that
+   define each component. Lineage classes are cleared before a highlight is
+   applied, so the two colourings never overlap. */
+.cell.hl[data-id]{background:var(--hl)}
 </style>
 </head>
 <body>
@@ -130,6 +153,12 @@ header .desc code{font-family:"JetBrains Mono",monospace;font-size:12px}
   <p>One transformer block, attention branch, every op in forward order, every number shown. Click any cell: yellow = everything downstream that depends on it, blue = everything upstream it depends on.</p>
   <p class="desc" id="model-desc"></p>
   <span class="dims" id="dims"></span>
+  <div class="decomp">
+    <span class="lab">Highlight component decomposition</span>
+    <div id="decomp-picker"></div>
+    <span style="font-size:11px;color:var(--muted)">click any cell to reset</span>
+    <p id="decomp-note"></p>
+  </div>
 </header>
 
 <main id="main"></main>

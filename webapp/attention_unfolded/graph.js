@@ -302,6 +302,7 @@
   // ---------- interaction ----------
   function select(id) {
     const c = cells.get(id); if (!c) return;
+    clearHighlight();          // a cell click returns the grid to its default
     const down = new Set(); for (const [oid, o] of cells) if (o.deps.has(id)) down.add(oid);
     for (const [oid, list] of els) for (const el of list) {
       el.classList.remove('sel', 'down', 'up', 'dim');
@@ -330,12 +331,189 @@
     document.getElementById('sel-counts').innerHTML = '';
   }
 
+
+  // ---------- component-decomposition highlighting ----------
+  // A concept detector is a group of model parameters plus the site where its
+  // output first appears. Each formalism below partitions the attention block
+  // into such groups; the partition stops at the first op that mixes groups,
+  // which is why none of them reach attnᵀ (the output projection sums across
+  // heads) and why the q/k formalisms stop before S (the score sums over dims).
+  const DECOMPOSITIONS = {
+    value_dim: {
+      label: 'Value dim',
+      title: 'value dimension d',
+      note: 'W_qkv row 2C+d and its bias → v_flat[:,d] → v_h[:,d mod hd] → ctx_h[:,d mod hd] → oᵀ[d,:] → W_proj column d. One group per embedding dimension of the value stream. Stops at W_proj, the first op that mixes.',
+      count: m => m.C,
+      of: (P, m) => {
+        const n = k => parseInt(P[k], 10);
+        switch (P[0]) {
+          case 'Wqkv': return Math.floor(n(1) / m.C) === 2 ? n(1) % m.C : null;
+          case 'bqkv': return Math.floor(n(1) / m.C) === 2 ? n(1) % m.C : null;
+          case 'qkvT': return Math.floor(n(1) / m.C) === 2 ? n(1) % m.C : null;
+          case 'vflat': return n(2);
+          case 'v': return n(1) * m.HD + n(3);
+          case 'ctx': return n(1) * m.HD + n(3);
+          case 'oT': return n(1);
+          case 'Wproj': return n(2);
+          default: return null;
+        }
+      },
+    },
+    qk_dim: {
+      label: 'Query/key dim',
+      title: 'query–key dimension d',
+      note: 'W_qkv rows d (query) and C+d (key) with their biases → q_flat[:,d], k_flat[:,d] → per-head q,k column d mod hd → scaled query and transposed key. Stops before S: the score sums over all dimensions, so no single dimension owns it. Under zero-ablation, deleting dim d from q and from k removes the same product term, which is why the vanilla ViT treats them as one group.',
+      count: m => m.C,
+      of: (P, m) => {
+        const n = k => parseInt(P[k], 10);
+        const part = p => Math.floor(p / m.C);
+        switch (P[0]) {
+          case 'Wqkv': case 'bqkv': case 'qkvT':
+            return part(n(1)) < 2 ? n(1) % m.C : null;
+          case 'qflat': case 'kflat': return n(2);
+          case 'q': case 'k': case 'qr': case 'kr': case 'qt':
+            return n(1) * m.HD + n(3);
+          case 'kT': return n(1) * m.HD + n(2);
+          default: return null;
+        }
+      },
+    },
+    query_dim: {
+      label: 'Query dim',
+      title: 'query dimension d',
+      note: 'W_qkv row d and its bias → q_flat[:,d] → q_h[:,d mod hd] → rotated and scaled query. Separate from the key dimension because RoPE is applied before the score, so deleting dim d from q and from k are no longer the same intervention.',
+      count: m => m.C,
+      of: (P, m) => {
+        const n = k => parseInt(P[k], 10);
+        switch (P[0]) {
+          case 'Wqkv': case 'bqkv': case 'qkvT':
+            return Math.floor(n(1) / m.C) === 0 ? n(1) % m.C : null;
+          case 'qflat': return n(2);
+          case 'q': case 'qr': case 'qt': return n(1) * m.HD + n(3);
+          default: return null;
+        }
+      },
+    },
+    key_dim: {
+      label: 'Key dim',
+      title: 'key dimension d',
+      note: 'W_qkv row C+d and its bias → k_flat[:,d] → k_h[:,d mod hd] → rotated key and its transpose.',
+      count: m => m.C,
+      of: (P, m) => {
+        const n = k => parseInt(P[k], 10);
+        switch (P[0]) {
+          case 'Wqkv': case 'bqkv': case 'qkvT':
+            return Math.floor(n(1) / m.C) === 1 ? n(1) % m.C : null;
+          case 'kflat': return n(2);
+          case 'k': case 'kr': return n(1) * m.HD + n(3);
+          case 'kT': return n(1) * m.HD + n(2);
+          default: return null;
+        }
+      },
+    },
+    head: {
+      label: 'Head',
+      title: 'attention head h',
+      note: 'every W_qkv row belonging to head h — query, key and value alike — plus W_proj columns h·hd … h·hd+hd−1, and every per-head tensor in between: q, k, v, scores, weights, context. Stops at attnᵀ, where W_proj sums across head columns: that is the first number depending on more than one head.',
+      count: m => m.H,
+      of: (P, m) => {
+        const n = k => parseInt(P[k], 10);
+        const hOfRow = p => Math.floor((p % m.C) / m.HD);
+        switch (P[0]) {
+          case 'Wqkv': case 'bqkv': case 'qkvT': return hOfRow(n(1));
+          case 'qflat': case 'kflat': case 'vflat': return Math.floor(n(2) / m.HD);
+          case 'q': case 'k': case 'v': case 'qr': case 'kr': case 'qt':
+          case 'kT': case 'S': case 'w': case 'ctx': return n(1);
+          case 'oT': return Math.floor(n(1) / m.HD);
+          case 'Wproj': return Math.floor(n(2) / m.HD);
+          default: return null;
+        }
+      },
+    },
+    value_head: {
+      label: 'Value-head',
+      title: 'value rows of head h',
+      note: 'the value half of a head: W_qkv value rows of head h and their biases → v_flat columns of head h → v_h → ctx_h → oᵀ rows of head h → W_proj columns of head h. The query and key rows of the same head are excluded, so the attention weights are left untouched. Zeroing this group zeroes ctx_h entirely, which is why the head-output site and the value site give bit-identical ablations.',
+      count: m => m.H,
+      of: (P, m) => {
+        const n = k => parseInt(P[k], 10);
+        switch (P[0]) {
+          case 'Wqkv': case 'bqkv': case 'qkvT':
+            return Math.floor(n(1) / m.C) === 2
+              ? Math.floor((n(1) % m.C) / m.HD) : null;
+          case 'vflat': return Math.floor(n(2) / m.HD);
+          case 'v': case 'ctx': return n(1);
+          case 'oT': return Math.floor(n(1) / m.HD);
+          case 'Wproj': return Math.floor(n(2) / m.HD);
+          default: return null;
+        }
+      },
+    },
+  };
+  // formalisms offered per model: RoPE splits query and key, vanilla shares them
+  const DECOMP_FOR = m => m.rope
+    ? ['value_dim', 'query_dim', 'key_dim', 'head', 'value_head']
+    : ['value_dim', 'qk_dim', 'head', 'value_head'];
+
+  let activeDecomp = null;
+
+  function clearHighlight() {
+    if (!activeDecomp) return;
+    activeDecomp = null;
+    for (const list of els.values())
+      for (const el of list) { el.classList.remove('hl'); el.style.removeProperty('--hl'); }
+    document.querySelectorAll('[data-decomp]').forEach(b => b.classList.remove('on'));
+    const n = document.getElementById('decomp-note');
+    if (n) { n.textContent = ''; n.classList.remove('shown'); }
+  }
+
+  function applyHighlight(key) {
+    if (activeDecomp === key) { clearHighlight(); return; }
+    clearHighlight();
+    const spec = DECOMPOSITIONS[key];
+    if (!spec) return;
+    clear();                   // drop the lineage colouring; show only the groups
+    activeDecomp = key;
+    for (const [id, list] of els) {
+      const g = spec.of(id.split('_'), model);
+      if (g === null || g === undefined || Number.isNaN(g)) continue;
+      for (const el of list) {
+        el.classList.add('hl');
+        el.style.setProperty('--hl', `var(--p${g % 10})`);
+      }
+    }
+    document.querySelectorAll('[data-decomp]').forEach(
+      b => b.classList.toggle('on', b.dataset.decomp === key));
+    const n = document.getElementById('decomp-note');
+    if (n) {
+      n.innerHTML = `<b>${spec.title}</b> — ${spec.note} `
+        + `<span class="swatches">${Array.from({ length: spec.count(model) }, (_, i) =>
+            `<i style="background:var(--p${i % 10})" title="component ${i}"></i>`).join('')}`
+        + `</span> ${spec.count(model)} components`;
+      n.classList.add('shown');
+    }
+  }
+
+  function buildDecompPicker() {
+    const bar = document.getElementById('decomp-picker');
+    if (!bar) return;
+    bar.innerHTML = '';
+    for (const key of DECOMP_FOR(model)) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.dataset.decomp = key;
+      b.textContent = DECOMPOSITIONS[key].label;
+      b.addEventListener('click', () => applyHighlight(key));
+      bar.appendChild(b);
+    }
+  }
+
   function show(id) {
     model = window.MODELS[id] || Object.values(window.MODELS)[0];
     document.querySelectorAll('[data-model]').forEach(b => b.classList.toggle('on', b.dataset.model === model.id));
     document.getElementById('model-desc').innerHTML = model.desc;
     document.getElementById('dims').textContent = model.dimsLine;
     const G = build(model); render(model, G);
+    buildDecompPicker();
     select(model.defaultCell || 'Wqkv_0_0');
     if (location.hash !== '#' + model.id) history.replaceState(null, '', '#' + model.id);
   }
