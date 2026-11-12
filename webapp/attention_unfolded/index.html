@@ -134,12 +134,17 @@ header .desc code{font-family:"JetBrains Mono",monospace;font-size:12px}
 #decomp-note b{color:var(--ink);font-weight:600}
 .swatches{display:inline-flex;gap:2px;vertical-align:-2px;margin:0 4px}
 .swatches i{width:13px;height:13px;border:1px solid var(--line);display:block}
-/* a highlighted cell keeps its border and head bar; only the fill changes.
-   The attribute selector is needed to outrank .cell.param[data-heads=...],
-   which would otherwise keep its head tint on exactly the parameter cells that
-   define each component. Lineage classes are cleared before a highlight is
-   applied, so the two colourings never overlap. */
-.cell.hl[data-id]{background:var(--hl)}
+/* While a decomposition is highlighted the grid is stripped back to a neutral
+   fill and the per-head bars are hidden, so the only colour on screen is the
+   component colouring. Without this the default head tints compete with it and
+   a member cell is hard to tell from a non-member one.
+   The attribute selector outranks .cell.param[data-heads=...] (0,3,0), which
+   would otherwise keep its tint on exactly the parameter cells that define a
+   component; the .hl rule outranks the neutraliser in turn. */
+body.decomp-on .cell[data-id]{background:var(--panel)}
+body.decomp-on .cell[data-id]::after{background:transparent}
+body.decomp-on .cell.hl[data-id]{background:var(--hl)}
+body.decomp-on .cell.empty{background:transparent}
 </style>
 </head>
 <body>

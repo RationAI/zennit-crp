@@ -460,6 +460,7 @@
   function clearHighlight() {
     if (!activeDecomp) return;
     activeDecomp = null;
+    document.body.classList.remove('decomp-on');
     for (const list of els.values())
       for (const el of list) { el.classList.remove('hl'); el.style.removeProperty('--hl'); }
     document.querySelectorAll('[data-decomp]').forEach(b => b.classList.remove('on'));
@@ -474,6 +475,7 @@
     if (!spec) return;
     clear();                   // drop the lineage colouring; show only the groups
     activeDecomp = key;
+    document.body.classList.add('decomp-on');   // neutralise the default tints
     for (const [id, list] of els) {
       const g = spec.of(id.split('_'), model);
       if (g === null || g === undefined || Number.isNaN(g)) continue;
