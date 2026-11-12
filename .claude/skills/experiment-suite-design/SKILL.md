@@ -1,7 +1,9 @@
 ---
 name: experiment-suite-design
-description: Design the SMALLEST experiment that decides a research goal — one research question, one hypothesis, one experiment by default, with controls, confound handling, sample-size reasoning and a stated decision rule. Use when planning a study/benchmark/ablation, when the user says "design the experiments", "plan the suite", "what experiments do we need", or before any experimental effort.
+description: Design the smallest experiment that decides a question — one research question, one hypothesis, one experiment by default, with controls, confound handling, sample-size reasoning and a stated decision rule. Use when planning a study, trial, benchmark or ablation, when the user says "design the experiments", "plan the suite", "what experiments do we need", or before any experimental effort.
 ---
+
+# Design an experiment
 
 ## The rule that governs every other rule
 
@@ -20,171 +22,171 @@ Occam's razor applies to the design, not only to the explanation:
   more elegant.
 - Between two experiments that would both settle the question, run the one
   whose negative result is more informative.
-- An additional condition, site, model or granularity is only in scope if the
-  question cannot be decided without it. "While we are at it" is how suites
-  become untestable.
+- An additional condition, group or level is only in scope if the question
+  cannot be decided without it. "While we are at it" is how designs become
+  untestable.
 
-**Scope cuts before experiments multiply.** When one experiment cannot decide
-the question, the first move is to narrow the question, not to add a second
-experiment. A narrower question with a clean answer beats a broad one with a
-tangle of partial answers.
+**Narrow the question before adding an experiment.** When one experiment
+cannot decide the question, the first move is to narrow the question, not to
+add a second experiment. A narrow question with a clean answer beats a broad
+one with a tangle of partial answers.
 
 **Stop rule.** If the design has grown past one experiment, write one sentence
-saying which single result would make the extras unnecessary. If that sentence
-is easy to write, cut to that result and stop. If it cannot be written, the
-question is still too broad — go back and narrow it.
+naming the single result that would make the extras unnecessary. If that
+sentence is easy to write, cut to that result and stop. If it cannot be
+written, the question is still too broad — go back and narrow it.
 
-## Order of operations — questions before hypotheses before designs
+## Order of operations — question, then hypothesis, then design
 
-### 1. Research questions (the critical step)
+### 1. The research question
 
-Formulate **one** RQ. Additional RQs are admissible only when the *same*
-experiment, with no added conditions, no extra runs and no extra analysis
-machinery, answers them as a by-product. If answering the second question
-requires one more configuration, it is a second experiment — drop it or
-replace the first question with it.
+Formulate **one**. A second question is admissible only when the *same*
+experiment answers it as a by-product, with no added conditions, no extra runs
+and no extra analysis machinery. If answering it requires one more
+configuration, it is a second experiment — drop it, or replace the first
+question with it.
 
-Each RQ must be:
-- **Self-contained**: understandable without reading the codebase or prior
-  chat — a new collaborator or reviewer parses it in one read.
-- **Singular**: one question. "Does X help and why" is two RQs.
-- **Answerable by observation**: its answer is a measurement outcome, not an
-  opinion. If no measurement can answer it, it is a design goal, not an RQ.
-- **Plainly worded**: technical terms only where unavoidable, each defined at
+The question must be:
+
+- **Self-contained** — understandable without reading the code, the lab
+  notebook or the prior conversation. A new collaborator or reviewer parses it
+  in one read.
+- **Singular** — one question. "Does X help, and why" is two.
+- **Answerable by observation** — its answer is a measurement outcome, not an
+  opinion. If no measurement can answer it, it is a design goal, not a
+  research question.
+- **Plainly worded** — technical terms only where unavoidable, each defined at
   first use.
 
-Bad: "How faithful is CRP on ViTs?" (not self-contained: which notion of
-faithful? which models?). Good: "When concept detectors at a fixed ViT layer
-are deleted in relevance order, does the class probability fall faster than
-when deleted in activation-magnitude order?"
+Bad: "How effective is the new method?" — which notion of effective, measured
+on what, against what. Good: "When the method is applied to the same inputs as
+the standard baseline, is the measured error lower?"
 
-### 2. Hypothesis (one)
+### 2. The hypothesis
 
-For each RQ write H1/H0 with mechanism:
-- **H1**: directional, falsifiable, with expected magnitude when defensible
-  ("relevance-ordered AOPC exceeds activation-ordered by >2× the random-
-  ordering CI width").
-- **H0**: what no-effect concretely looks like in the metric.
-- **Mechanism** ("because..."): why H1 should hold — one sentence; this is
-  what distinguishes a hypothesis from a guess and drives the design.
-- **Falsification criterion**: the concrete observable that kills H1. If you
-  cannot write one, the hypothesis is not testable — rewrite or demote to
+Write **one**, with four parts:
+
+- **H1** — directional and falsifiable, with an expected magnitude where one
+  can be defended ("the treated group's mean exceeds the control's by more
+  than twice the width of the control's confidence interval").
+- **H0** — what no effect concretely looks like in the chosen measurement.
+- **Mechanism** — one sentence on why H1 should hold. This is what separates a
+  hypothesis from a guess, and it is what drives the design.
+- **Falsification criterion** — the concrete observation that kills H1. If you
+  cannot write one, the hypothesis is not testable: rewrite it, or demote it to
   exploration.
-- May be technical, but every symbol/term explained in-line.
 
-Write **one** hypothesis. Quality gate: testability, falsifiability,
-parsimony, explanatory power, consistency with known results, novelty vs the
-literature (check the related-work notes/briefs before claiming novelty).
+Quality gate: testability, falsifiability, parsimony, explanatory power,
+consistency with established results, and novelty against the existing
+literature — check the literature before claiming novelty.
 
-Competing hypotheses are the one sanctioned exception, and they come with a
-condition: state 2–3 only when a **single** experiment discriminates between
-them because their predictions differ on the **same** measurement. If telling
-them apart needs a separate run per hypothesis, that is a suite masquerading
-as a design — pick the simplest explanation, test it alone, and leave the rest
-for after it fails. Designing to discriminate is right; designing to confirm a
-favourite is not.
+Competing hypotheses are the one sanctioned exception, and they carry a
+condition: state two or three only when a **single** experiment discriminates
+between them, because their predictions differ on the **same** measurement. If
+telling them apart needs a separate run per hypothesis, that is a suite
+wearing the costume of a design — take the simplest explanation, test it
+alone, and keep the rest for after it fails. Designing to discriminate is
+right; designing to confirm a favourite is not.
 
-### 3. Variable matrix (per experiment)
+### 3. One change per condition
 
-| Variable | Role | Operationalization |
-|---|---|---|
-| e.g. residual-split rule | independent | lrp_configs name |
-| e.g. AOPC score | dependent | area between MoRF/LeRF prob curves, N images |
-| e.g. model, dataset, N | control (fixed) | pinned checkpoint / split / seed |
-| e.g. pretrain provenance | confound | held constant or measured & reported |
-| e.g. detector count per basis | confound | normalized axis (%-relevance) |
+Each condition differs from the baseline in exactly one respect. When two
+things change together, no observation can separate them: teach one group with
+a new method and also give it extra hours, and a higher score belongs to
+neither the method nor the hours. The outcome is then uninterpretable, however
+large it is.
 
-Every independent variable varies ONE thing per configuration (the
-lrp_configs one-knob convention IS this principle). A configuration that
-changes two things aliases their effects — the fractional-factorial
-"aliasing" trap in ML clothing: you cannot then attribute the outcome to
-either knob.
+This is the most common way a design fails, and it is invisible once the data
+are in — so check it before the run, not after.
 
-### 4. Design principles, ML translation of Fisher
+### 4. Design principles
 
-- **Randomization** → seeds and sample selection. Sample selection rule +
-  seed pinned and persisted (indices to npz). Anything "chosen by hand" is a
-  confound unless it is the explicit subject.
-- **Replication at the right level** → the ML pseudoreplication trap:
-  per-token or per-patch measurements within one image are NOT independent;
-  the independent unit is usually the image (or the seed, for training runs).
-  N = number of images/seeds, and statistics aggregate per-unit first
-  (per-image score → median + bootstrap CI), never pooled tokens.
-- **Blocking** → known nuisance axes (class, dataset difficulty, outlier-
-  token presence) get stratified sampling (class-diverse round-robin) or
-  conditioning in the analysis (e.g. condition on outlier masks when no
-  clean model exists).
-- **Controls** — every effect claim needs at least one: random ordering /
-  random subset (chance floor, K≥10 or closed-form expectation), competing
-  standard method (activation ranking, rollout), null/randomized model where
-  cheap. A number without a control is not a result.
-- **Confounds checklist for this domain**: pretrain provenance (verify
-  checkpoint lineage — do not trust memory), dimensionality mismatch across
-  bases/granularities, conservation leaks (report capture fractions),
-  rule-choice interactions, register/outlier tokens, train/test
-  contamination, GPU nondeterminism (fix seeds; note where exact determinism
-  is not achievable).
+- **Randomisation.** Assignment and selection are made by a rule, not by
+  hand, and the rule is recorded so the selection can be reproduced. Anything
+  chosen by hand is a confound unless it is the explicit subject of the study.
+- **Count the right thing.** Decide what one piece of evidence is, and count
+  those. A piece of evidence is something that could have come out differently
+  on its own. Twenty questions put to ten people is ten pieces of evidence,
+  not two hundred — one person's answers move together. Summarise each one
+  first, then compare across them. Counting the measurements instead of the
+  things measured produces error bars far too narrow to believe.
+- **Balance what you cannot remove.** Some unwanted variation is known and
+  impossible to eliminate: people differ in age, machines differ in speed,
+  material differs by batch. Random assignment balances it only on average,
+  and one draw can still put every older participant in the same group. So
+  split by that variable first and assign conditions within each split, or run
+  every condition on every machine. Where neither is practical, record the
+  variable and account for it when analysing.
+- **Controls.** Every effect claim needs at least one: a chance baseline (what
+  the measurement reads when there is no effect, by simulation or closed
+  form), the standard method it is supposed to beat, or a deliberately
+  broken version of the system. A number without a control is not a result.
+- **Confounds to rule out explicitly.** Provenance of the materials or data
+  (verify it; do not trust memory). Scale or units differing between
+  conditions. Information leaking from what is measured into what is
+  predicted. Interaction with a setting assumed to be neutral. Contamination
+  between the material used to build the system and the material used to
+  evaluate it. Nondeterminism in the apparatus — pin what can be pinned, and
+  state plainly where exact repeatability is not achievable.
 
-### 5. Sample size & decision rules
+### 5. Sample size and the decision rule
 
-No formal power analysis pretense; instead: pilot on toy data → observe
-variance → choose N so the bootstrap CI is decisively smaller than the
-effect claimed; state the decision rule BEFORE the full run (test, threshold,
-correction across multiple comparisons — Wilcoxon + Holm is the repo
-convention). Pre-registration equivalent: the experiment card
-(`remind-me-to-experiment`) or a journal design entry written before compute.
+Do not stage a formal power analysis you cannot support. Instead: run a pilot
+on cheap material, observe the variance, then choose the sample size so the
+confidence interval is decisively narrower than the effect being claimed.
+
+State the decision rule **before** the full run: which number, which test,
+which threshold, and how multiple comparisons are corrected. Write it down
+where it cannot be quietly revised after the data arrive — that record is the
+whole point of pre-registration.
 
 ### 6. If more than one experiment is unavoidable
 
-Reaching this section means the stop rule above did not cut the design down.
-Say explicitly why one experiment cannot decide the question before going on.
+Reaching this section means the stop rule did not cut the design down. Say
+explicitly why one experiment cannot decide the question before going on.
 Then:
 
-- Order by dependency and by information per GPU-hour: the cheap
-  discriminating run first, the expensive confirmation only for what survives.
-- Factor shared infrastructure: one data pass serving several measurements.
-- Every experiment states its kill condition — the earlier result that makes
+- Order by dependency, and by information gained per unit of cost: the cheap
+  discriminating run first, the expensive confirmation only for what survives
+  it.
+- Factor shared effort — one pass over the material serving several
+  measurements.
+- Give every experiment a kill condition: the earlier result that would make
   it pointless, so it is dropped rather than run out of habit.
-- Two experiments is a lot. Three is a campaign and needs the user to have
+- Two experiments is a lot. Three is a campaign, and needs the user to have
   asked for a campaign.
 
-## Output format
+## Output
 
-A suite document (research/<topic>_suite.md, or directly YouTrack issue
-bodies when the user asks for tracked work) containing per experiment:
+One design document per experiment:
 
 ```
 ### E<n>: <title>
-RQ: ...
+Question: ...
 H1 / H0 / Mechanism / Falsified if: ...
-Variable matrix: (table)
+What changes between conditions: ...
 Controls: ...
-Inputs: model+ckpt | dataset+split+N+seed | configs | script
-Decision rule: metric, test, threshold
+Inputs: material, selection rule, sample size, settings, procedure
+Decision rule: measurement, test, threshold
 Depends on / killed by: ...
 Cost estimate: ...
 ```
 
-Plus a header: goal, the RQ, staging order if there is more than one
-experiment, total compute estimate.
+With a header giving the goal, the question, and the total cost estimate —
+plus the ordering, if there is more than one experiment.
 
-**Before writing the output, answer these three in one line each.** If any
+**Before writing the output, answer these two in one line each.** If any
 answer is unconvincing, the design is not ready.
 
 1. Which single number decides the question, and what value of it means yes?
 2. What is the simplest thing that could explain the expected result, and does
    this design rule it out?
-3. What was cut to get here? (If nothing was cut, the design was not
-   minimised.)
 
-## Endpoint: designs only, never execution (Adam, 2026-07-26)
+## Endpoint: designs, never execution
 
-This skill ALWAYS ends with pre-registered designs, never with running
-anything. Each proposed experiment is written as a **suggested entry** in
-the experiment journal's "Suggested — awaiting confirmation" part
-(`experiment-journal` skill: Hypothesis / Design & rationale / Planned
-metrics & evaluation; Conclusion =
-`\todo[inline]{Not performed yet, awaiting confirmation.}`), committed and
-pushed for Adam's rigorous review. Execution of any entry starts only after
-Adam approves it (then it flows through `remind-me-to-experiment` step 4+
-and moves to the Performed part on completion).
+This skill always ends with a written design, never with running anything.
+Each experiment is recorded as a proposal, awaiting review — hypothesis,
+design and rationale, planned measurement and analysis, with the conclusion
+left explicitly unfilled. Execution begins only once the proposal has been
+approved; the result is then recorded against the design as written, including
+where it diverged.

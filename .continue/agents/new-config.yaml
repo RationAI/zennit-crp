@@ -1,0 +1,38 @@
+%YAML 1.1
+---
+name: Local Assistant
+version: 1.0.0
+schema: v1
+model_defaults: &model_defaults
+  provider: openai
+  apiKey: sk-00dcf05e179c4222aefab6fe6338e3fd
+  apiBase: https://llm.ai.e-infra.cz/v1
+models:
+  - name: autocomplete-coder
+    <<: *model_defaults
+    model: coder
+    promptTemplates:
+      autocomplete: '<|fim_prefix|>{{{ prefix }}}<|fim_suffix|>{{{ suffix }}}<|fim_middle|>'
+    autocompleteOptions:
+      transform: false
+    defaultCompletionOptions:
+      temperature: 0.6
+      maxTokens: 512
+    roles:
+      - autocomplete
+  - name: chat-coder
+    <<: *model_defaults
+    model: coder
+    env:
+      useLegacyCompletionsEndpoint: false
+    roles:
+      - chat
+      - edit
+context:
+  - provider: code
+  - provider: docs
+  - provider: diff
+  - provider: terminal
+  - provider: problems
+  - provider: folder
+  - provider: codebase

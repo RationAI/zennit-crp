@@ -157,3 +157,6 @@ webapp/concept_detector_bench/
 
 # kilo agent working dir (local, not for VCS)
 .kilo/
+.claudecfg/
+figures/
+

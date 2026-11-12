@@ -1,0 +1,3 @@
+the experiment/models/zoo.py contains the model classes... but the code contains a lot of arbitrary steps, such as putting the models into eval mode by calling .eval() and selecting device by specifying .to(device). I am quite sure this is unnecessary and the developer will want to specify device only when he actually gets to the point where he uses the model, somewhere in the jupyter notebook or during the experiment setup, not at the model construction time. Unless the model can be directly constructed on the device, it makes no sense to move any model anywhere.
+
+The residual canonisers

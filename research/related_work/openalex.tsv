@@ -1,0 +1,148 @@
+## Transformer Interpretability Beyond Attention Visualization
+2021	conference-paper	IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | arXiv (Cornell University)	Transformer Interpretability Beyond Attention Visualization
+2025	conference-paper		Inverted Transformers Interpretability Beyond Attention Visualization
+2021	conference-paper	AAAI Publications (The Association for the Advancement of Artificial Intelligence (AAAI)) | Proceedings of the AAAI Conference on Artificial Intelligence | arXiv (Cornell University)	Self-Attention Attribution: Interpreting Information Interactions Inside Transformer
+## Generic Attention-model Explainability for Interpreting Bi-Modal and Encoder-Decoder Transformers
+2021	conference-paper	IEEE/CVF International Conference on Computer Vision (ICCV) | International Conference on Computer Vision | arXiv (Cornell University)	Generic Attention-model Explainability for Interpreting Bi-Modal and Encoder-Decoder Transformers
+2023	preprint	Edinburgh Research Explorer (University of Edinburgh) | arXiv (Cornell University)	Hierarchical attention interpretation: an interpretable speech-level transformer for bi-modal depression detection
+2023	conference-paper	ACM Multimedia Asia (MMAsia) | arXiv (Cornell University)	Generic Attention-model Explainability by Weighted Relevance Accumulation
+## Quantifying Attention Flow in Transformers
+2020	conference-paper	Annual Meeting of the Association for Computational Linguistics (ACL) | UvA-DARE (University of Amsterdam) | arXiv (Cornell University)	Quantifying Attention Flow in Transformers
+2022	preprint	CISPA Helmholtz Center | arXiv (Cornell University)	Attention Flows for General Transformers
+2023	conference-paper	IEEE/CVF Winter Conference on Applications of Computer Vision (WACV) | arXiv (Cornell University)	STAR-Transformer: A Spatio-temporal Cross Attention Transformer for Human Action Recognition
+## From attribution maps to human-understandable explanations through Concept Relevance Propagation
+2023	article	Fraunhofer-Publica (Fraunhofer-Gesellschaft) | Nature Machine Intelligence | arXiv (Cornell University)	From attribution maps to human-understandable explanations through Concept Relevance Propagation
+2026	preprint	arXiv (Cornell University)	ConEx: Human-Interpretable Saliency Maps via Concept-Aware Attribution
+2025	preprint	arXiv (Cornell University)	MAPS: Masked Attribution-based Probing of Strategies- A computational framework to align human and model explanations
+## AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for Transformers
+2024	preprint	Fraunhofer-Publica (Fraunhofer-Gesellschaft) | arXiv (Cornell University)	AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for Transformers
+2025	conference-paper		Extending Layer-wise Relevance Propagation in Neural Networks using Semiring Annotations
+2025	article	The Research of Medical Science Review	LAYER-WISE RELEVANCE PROPAGATION IN LARGE-SCALE NEURAL NETWORKS FOR MEDICAL DIAGNOSIS
+## XAI for Transformers: Better Explanations through Conservative Propagation
+2022	preprint	arXiv (Cornell University)	XAI for Transformers: Better Explanations through Conservative Propagation
+2024	conference-paper	IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | arXiv (Cornell University)	On the Faithfulness of Vision Transformer Explanations
+2025	article	Information Fusion | arXiv (Cornell University)	Towards symbolic XAI — explanation through human understandable logical relationships between features
+## Interpreting CLIP's Image Representation via Text-Based Decomposition
+2024	conference-paper	arXiv (Cornell University) | neural information processing systems	Decomposing and Interpreting Image Representations via Text in ViTs Beyond CLIP
+2025	article	Medical Image Analysis | PubMed | arXiv (Cornell University)	CLIP in medical imaging: A survey
+2026	conference-paper	AAAI Publications (The Association for the Advancement of Artificial Intelligence (AAAI)) | Proceedings of the AAAI Conference on Artificial Intelligence	VTD-CLIP: Video-to-Text Discretization via Prompting CLIP
+## Interpreting the Second-Order Effects of Neurons in CLIP
+2024	preprint	arXiv (Cornell University)	Interpreting the Second-Order Effects of Neurons in CLIP
+2023	preprint	arXiv (Cornell University)	Interpreting CLIP: Insights on the Robustness to ImageNet Distribution Shifts
+2021	review	Nature Reviews Methods Primers | Publikationen an der Universität Bielefeld (Universität Bielefeld) | UCL Discovery (University College London)	CLIP and complementary methods
+## Interpretability Beyond Feature Attribution: Quantitative Testing with Concept Activation Vectors
+2017	preprint	arXiv (Cornell University)	Interpretability Beyond Feature Attribution: Quantitative Testing with Concept Activation Vectors (TCAV)
+2022	conference-paper	2022 International Joint Conference on Neural Networks (IJCNN) | arXiv (Cornell University)	Interpretability for Multimodal Emotion Recognition using Concept Activation Vectors
+2021	preprint	arXiv (Cornell University)	Robust Semantic Interpretability: Revisiting Concept Activation Vectors
+## Towards Automatic Concept-based Explanations
+2019	preprint	arXiv (Cornell University)	Towards Automatic Concept-based Explanations
+2022	article	DOAJ (DOAJ: Directory of Open Access Journals) | DuEPublico (University of Duisburg-Essen) | PubMed | PubMed Central | Sensors | Universitätsbibliographie, Universität Duisburg-Essen	Validating Automatic Concept-Based Explanations for AI-Based Digital Histopathology
+2023	conference-paper	Lecture notes in computer science | arXiv (Cornell University)	Automatic Textual Explanations of Concept Lattices
+## Concept Bottleneck Models
+2020	preprint	arXiv (Cornell University)	Concept Bottleneck Models
+2023	conference-paper	AAAI Publications (The Association for the Advancement of Artificial Intelligence (AAAI)) | Proceedings of the AAAI Conference on Artificial Intelligence | arXiv (Cornell University)	Interactive Concept Bottleneck Models
+2022	article	DOAJ (DOAJ: Directory of Open Access Journals) | IEEE Access | arXiv (Cornell University)	Concept Bottleneck Model With Additional Unsupervised Concepts
+## Network Dissection: Quantifying Interpretability of Deep Visual Representations
+2017	conference-paper	DSpace@MIT (Massachusetts Institute of Technology) | IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | arXiv (Cornell University)	Network Dissection: Quantifying Interpretability of Deep Visual Representations
+2018	article	DSpace@MIT (Massachusetts Institute of Technology) | IEEE Transactions on Pattern Analysis and Machine Intelligence | PubMed | arXiv (Cornell University)	Interpreting Deep Visual Representations via Network Dissection
+2018	article	Journal of Vision	Interpreting Visual Representations of Neural Networks via Network Dissection
+## CLIP-Dissect: Automatic Description of Neuron Representations in Deep Vision Networks
+2022	preprint	arXiv (Cornell University)	CLIP-Dissect: Automatic Description of Neuron Representations in Deep Vision Networks
+2024	preprint		Visualizing Intermediate Neurons of Convolutional Neural Networks via CLIP-Dissect
+2024	preprint	arXiv (Cornell University)	Interpreting the Second-Order Effects of Neurons in CLIP
+## Craft: Concept Recursive Activation Factorization for Explainability
+2023	conference-paper	HAL (Le Centre pour la Communication Scientifique Directe) | IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | PubMed | PubMed Central | arXiv (Cornell University)	CRAFT: Concept Recursive Activation FacTorization for Explainability
+2023	conference-paper	Griffith Research Online | International Conference on Image and Vision Computing New Zealand (IVCNZ)	NCAF: NTD-based Concept Activation Factorisation Framework for CNN Explainability
+2026	preprint	MPG.PuRe (Max Planck Society) | arXiv (Cornell University)	What is Missing? Explaining Neurons Activated by Absent Concepts
+## A Holistic Approach to Unifying Automatic Concept Extraction and Concept Importance Estimation
+2023	preprint	HAL (Le Centre pour la Communication Scientifique Directe) | arXiv (Cornell University)	A Holistic Approach to Unifying Automatic Concept Extraction and Concept Importance Estimation
+2023	conference-paper	neural information processing systems	A Holistic Approach to Unifying Automatic Concept Extraction and Concept Importance Estimation
+2026	preprint	arXiv (Cornell University)	Contrastive Concept Importance: Explaining Pairwise Class Decisions Through Automatically Extracted Concept Representations
+## Multi-dimensional concept discovery: A unifying framework with completeness guarantees
+2026	preprint	arXiv (Cornell University)	A Unifying Framework of Concept-based Explainable AI with Completeness Guarantees
+2012	dissertation	MADOC (University of Mannheim)	A Unified Framework for Multi-Level Modeling
+2026	article	Statistics and Computing	Generalized adaptive bridge regression: a unified framework for high-dimensional architecture discovery
+## Vision Transformers Need Registers
+2023	preprint	HAL (Le Centre pour la Communication Scientifique Directe) | arXiv (Cornell University)	Vision Transformers Need Registers
+2026	preprint	arXiv (Cornell University)	Do All Vision Transformers Need Registers? A Cross-Architectural Reassessment
+2025	conference-paper	arXiv (Cornell University) | neural information processing systems	Vision Transformers Don't Need Trained Registers
+## Sparse Autoencoders Find Highly Interpretable Features in Language Models
+2023	preprint	arXiv (Cornell University)	Sparse Autoencoders Find Highly Interpretable Features in Language Models
+2025	article	Europe PMC (PubMed Central) | Proceedings of the National Academy of Sciences | PubMed | PubMed Central	Sparse autoencoders uncover biologically interpretable features in protein language model representations
+2025	conference-paper	Conference on Empirical Methods in Natural Language Processing (EMNLP) | arXiv (Cornell University)	Route Sparse Autoencoder to Interpret Large Language Models
+## Discover-then-Name: Task-Agnostic Concept Bottlenecks via Automated Concept Discovery
+2024	conference-paper	Lecture notes in computer science | arXiv (Cornell University)	Discover-then-Name: Task-Agnostic Concept Bottlenecks via Automated Concept Discovery
+2025	conference-paper	Proceedings of the AAAI Conference on Artificial Intelligence | arXiv (Cornell University)	V2C-CBM: Building Concept Bottlenecks with Vision-to-Concept Tokenizer
+2026	conference-paper	AAAI Publications (The Association for the Advancement of Artificial Intelligence (AAAI)) | Proceedings of the AAAI Conference on Artificial Intelligence	Concepts from Representations: Post-hoc Concept Bottleneck Models via Sparse Decomposition of Visual Representations
+## Understanding Video Transformers via Universal Concept Discovery
+2024	conference-paper	IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | arXiv (Cornell University)	Understanding Video Transformers via Universal Concept Discovery
+2026	preprint	arXiv (Cornell University)	Investigating Spatiotemporal Redundancy in Video Transformer for Collision Anticipation
+2026	article	International Journal of Computer Vision | UvA-DARE (University of Amsterdam) | arXiv (Cornell University)	Looking Beyond the Obvious: A Survey on Abstract Concept Recognition for Video Understanding
+## Visual Concept Connectome: Open World Concept Discovery and their Interlayer Connections
+2024	conference-paper	IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | arXiv (Cornell University)	Visual Concept Connectome (VCC): Open World Concept Discovery and Their Interlayer Connections in Deep Models
+2024	preprint	MPG.PuRe (Max Planck Society) | arXiv (Cornell University)	DCBM: Data-Efficient Visual Concept Bottleneck Models
+2025	preprint	arXiv (Cornell University)	A Geometric Unification of Concept Learning with Concept Cones
+## Analyzing Vision Transformers for Image Classification in Class Embedding Space
+2023	preprint	Publication Server of Goethe University Frankfurt am Main (Goethe University Frankfurt) | arXiv (Cornell University)	Analyzing Vision Transformers for Image Classification in Class Embedding Space
+2023	conference-paper	neural information processing systems	Analyzing Vision Transformers for Image Classification in Class Embedding Space
+2021	article	DOAJ (DOAJ: Directory of Open Access Journals) | Remote Sensing	Vision Transformers for Remote Sensing Image Classification
+## Do Vision Transformers See Like Convolutional Neural Networks?
+2021	preprint	arXiv (Cornell University) | neural information processing systems	Do Vision Transformers See Like Convolutional Neural Networks?
+2022	conference-paper	IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | arXiv (Cornell University)	CMT: Convolutional Neural Networks Meet Vision Transformers
+2023	article	Applied Sciences | DOAJ (DOAJ: Directory of Open Access Journals)	Comparing Vision Transformers and Convolutional Neural Networks for Image Classification: A Literature Review
+## Decoupling Pixel Flipping and Occlusion Strategy for Consistent XAI Benchmarks
+2024	article	DOAJ (DOAJ: Directory of Open Access Journals) | Machine Learning and Knowledge Extraction	Uncertainty in XAI: Human Perception and Modeling Approaches
+2026	preprint	arXiv (Cornell University)	On the Disagreement in Perturbation-based xAI -- Benchmarking Perturbation Choices for Flood Detection from SAR Images
+2025	conference-paper	Fraunhofer-Publica (Fraunhofer-Gesellschaft) | Lecture notes in computer science | arXiv (Cornell University)	From Flexibility to Manipulation: The Slippery Slope of XAI Evaluation
+## A Benchmark for Interpretability Methods in Deep Neural Networks
+2018	preprint	arXiv (Cornell University)	A Benchmark for Interpretability Methods in Deep Neural Networks
+2017	article	Digital Signal Processing | Fraunhofer-Publica (Fraunhofer-Gesellschaft) | MPG.PuRe (Max Planck Society) | Max Planck Digital Library | Publikationsdatenbank der Fraunhofer-Gesellschaft (Fraunhofer-Gesellschaft) | arXiv (Cornell University)	Methods for interpreting and understanding deep neural networks
+2021	article	Fraunhofer-Publica (Fraunhofer-Gesellschaft) | Proceedings of the IEEE | Publikationsdatenbank der Fraunhofer-Gesellschaft (Fraunhofer-Gesellschaft) | arXiv (Cornell University)	Explaining Deep Neural Networks and Beyond: A Review of Methods and Applications
+## A Consistent and Efficient Evaluation Strategy for Attribution Methods
+2022	preprint	arXiv (Cornell University)	A Consistent and Efficient Evaluation Strategy for Attribution Methods
+2022	conference-paper	Conference on Empirical Methods in Natural Language Processing (EMNLP) | arXiv (Cornell University)	A Multilingual Perspective Towards the Evaluation of Attribution Methods in Natural Language Inference
+2024	conference-paper	arXiv (Cornell University)	Counterfactuals As a Means for Evaluating Faithfulness of Attribution Methods in Autoregressive Language Models
+## Evaluating the visualization of what a deep neural network has learned
+2016	article	Fraunhofer-Publica (Fraunhofer-Gesellschaft) | IEEE Transactions on Neural Networks and Learning Systems | PubMed | Publikationsdatenbank der Fraunhofer-Gesellschaft (Fraunhofer-Gesellschaft)	Evaluating the Visualization of What a Deep Neural Network Has Learned
+2015	preprint	arXiv (Cornell University)	Evaluating the visualization of what a Deep Neural Network has learned
+2017	article	FreiDok plus (Universitätsbibliothek Freiburg) | Human Brain Mapping | PubMed | PubMed Central | arXiv (Cornell University)	Deep learning with convolutional neural networks for EEG decoding and visualization
+## RISE: Randomized Input Sampling for Explanation of Black-box Models
+2018	preprint	arXiv (Cornell University)	RISE: Randomized Input Sampling for Explanation of Black-box Models
+null	article	Digital Repository Service (Northeastern University)	Black-Box Detection Explainability Utilizing RISE (Randomized Input Sampling for Explanation of Black-Box Models)
+2023	article	CINECA IRIS Institutial research information system (University of Pisa) | Data Mining and Knowledge Discovery | ISTI Open Portal | Scuola Normale Superiore di Pisa	Benchmarking and survey of explanation methods for black box models
+## From Anecdotal Evidence to Quantitative Evaluation Methods: A Systematic Review on Evaluating Explainable AI
+2023	review	ACM Computing Surveys | University of Twente Research Information | arXiv (Cornell University)	From Anecdotal Evidence to Quantitative Evaluation Methods: A Systematic Review on Evaluating Explainable AI
+2024	review	Applied Sciences | DOAJ (DOAJ: Directory of Open Access Journals) | Jyväskylä University Digital Archive (University of Jyväskylä)	Recent Applications of Explainable AI (XAI): A Systematic Literature Review
+2024	review	DOAJ (DOAJ: Directory of Open Access Journals) | Frontiers in Artificial Intelligence | PubMed | PubMed Central	Human-centered evaluation of explainable AI applications: a systematic review
+## Quantus: An Explainable AI Toolkit for Responsible Evaluation of Neural Network Explanations
+2022	preprint	Fraunhofer-Publica (Fraunhofer-Gesellschaft) | arXiv (Cornell University)	Quantus: An Explainable AI Toolkit for Responsible Evaluation of Neural Network Explanations and Beyond
+2022	article	Displays | Kent Academic Repository (University of Kent) | Open Access at Essex (University of Essex)	A review of visualisation-as-explanation techniques for convolutional neural networks and their evaluation
+2023	conference-paper	International Joint Conference on Artificial Intelligence | University of Twente Research Information | Universitätsbibliographie, Universität Duisburg-Essen	Benchmarking eXplainable AI - A Survey on Available Toolkits and Open Challenges
+## What do Vision Transformers Learn? A Visual Exploration
+2022	preprint	arXiv (Cornell University)	What do Vision Transformers Learn? A Visual Exploration
+2023	article	IEEE Transactions on Visualization and Computer Graphics | PubMed | PubMed Central | arXiv (Cornell University)	How Does Attention Work in Vision Transformers? A Visual Analytics Attempt
+2021	article	DOAJ (DOAJ: Directory of Open Access Journals) | Frontiers in Artificial Intelligence | PubMed | PubMed Central	What Does a Language-And-Vision Transformer See: The Impact of Semantic Information on Visual Representations
+## Rosetta Neurons: Mining the Common Units in a Model Zoo
+2023	conference-paper	IEEE/CVF International Conference on Computer Vision (ICCV) | arXiv (Cornell University)	Rosetta Neurons: Mining the Common Units in a Model Zoo
+2024	preprint	arXiv (Cornell University)	Universal Neurons in GPT2 Language Models
+2024	preprint	arXiv (Cornell University)	Interpreting the Second-Order Effects of Neurons in CLIP
+## On Pixel-Wise Explanations for Non-Linear Classifier Decisions by Layer-Wise Relevance Propagation
+2015	article	DOAJ (DOAJ: Directory of Open Access Journals) | Fraunhofer-Publica (Fraunhofer-Gesellschaft) | PLoS ONE | PubMed | PubMed Central | Publikationsdatenbank der Fraunhofer-Gesellschaft (Fraunhofer-Gesellschaft) | RePEc: Research Papers in Economics | Refubium (Universitätsbibliothek der Freien Universität Berlin) | Universitätsbibliothek der FU Berlin Hochschulschriftenstelle u. Dokumentenserver	On Pixel-Wise Explanations for Non-Linear Classifier Decisions by Layer-Wise Relevance Propagation
+2020	article	情報処理	5分で分かる!? 有名論文ナナメ読み：Bach, S., Binder, A., Montavon, G., Klauschen, F., Muller, K-R. and Samek, W. : On Pixel-Wise Explanations for Non-Linear Classifier Decisions by Layer-Wise Relevance Propagation
+2015	dataset	Harvard Dataverse	Replication Data for: Relevance propagation Results with Bag of Words Classifiers as used in "On Pixel-wise Explanations for Non-Linear Classifier Decisions by Layer-wise Relevance Propaganda"
+## On the Faithfulness of Vision Transformer Explanations
+2024	conference-paper	IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | arXiv (Cornell University)	On the Faithfulness of Vision Transformer Explanations
+2026	conference-paper	Open Access at Essex (University of Essex)	FocusViT: Faithful Explanations for Vision Transformers via Gradient-Guided Layer-Skipping
+2024	conference-paper	IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings - IEEE Computer Society Conference on Computer Vision and Pattern Recognition/Proceedings | arXiv (Cornell University)	Token Transformation Matters: Towards Faithful Post-Hoc Explanation for Vision Transformer
+## Sparse Autoencoders Learn Monosemantic Features in Vision-Language Models
+2025	conference-paper	arXiv (Cornell University) | neural information processing systems	Sparse Autoencoders Learn Monosemantic Features in Vision-Language Models
+2026	conference-paper	Findings of the Association for Computational Linguistics: EACL | arXiv (Cornell University)	Evaluating Sparse Autoencoders for Monosemantic Representation
+2023	preprint	arXiv (Cornell University)	Sparse Autoencoders Find Highly Interpretable Features in Language Models
+## Probing the Representational Power of Sparse Autoencoders in Vision Models
+2025	conference-paper	IEEE/CVF International Conference on Computer Vision Workshops (ICCVW)	Probing the Representational Power of Sparse Autoencoders in Vision Models
+2026	preprint	arXiv (Cornell University)	Learning Retrieval Models with Sparse Autoencoders
+2025	conference-paper	Conference on Empirical Methods in Natural Language Processing (EMNLP) | arXiv (Cornell University)	Route Sparse Autoencoder to Interpret Large Language Models
+## Concept Transformer: Attention-based Interpretability with Concept Transformers
+2024	article	IEEE Transactions on Medical Imaging | PubMed	Concept-Based Lesion Aware Transformer for Interpretable Retinal Disease Diagnosis
+2023	article	Artificial Intelligence Review | arXiv (Cornell University)	A survey of the vision transformers and their CNN-transformer based variants
+2026	article	IEEE Transactions on Neural Networks and Learning Systems | PubMed | arXiv (Cornell University)	Graph Transformers: A Survey

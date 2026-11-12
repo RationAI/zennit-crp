@@ -1,0 +1,37 @@
+Transformer Interpretability Beyond Attention Visualization
+Generic Attention-model Explainability for Interpreting Bi-Modal and Encoder-Decoder Transformers
+Quantifying Attention Flow in Transformers
+From attribution maps to human-understandable explanations through Concept Relevance Propagation
+AttnLRP: Attention-Aware Layer-Wise Relevance Propagation for Transformers
+XAI for Transformers: Better Explanations through Conservative Propagation
+Interpreting CLIP's Image Representation via Text-Based Decomposition
+Interpreting the Second-Order Effects of Neurons in CLIP
+Interpretability Beyond Feature Attribution: Quantitative Testing with Concept Activation Vectors
+Towards Automatic Concept-based Explanations
+Concept Bottleneck Models
+Network Dissection: Quantifying Interpretability of Deep Visual Representations
+CLIP-Dissect: Automatic Description of Neuron Representations in Deep Vision Networks
+Craft: Concept Recursive Activation Factorization for Explainability
+A Holistic Approach to Unifying Automatic Concept Extraction and Concept Importance Estimation
+Multi-dimensional concept discovery: A unifying framework with completeness guarantees
+Vision Transformers Need Registers
+Sparse Autoencoders Find Highly Interpretable Features in Language Models
+Discover-then-Name: Task-Agnostic Concept Bottlenecks via Automated Concept Discovery
+Understanding Video Transformers via Universal Concept Discovery
+Visual Concept Connectome: Open World Concept Discovery and their Interlayer Connections
+Analyzing Vision Transformers for Image Classification in Class Embedding Space
+Do Vision Transformers See Like Convolutional Neural Networks?
+Decoupling Pixel Flipping and Occlusion Strategy for Consistent XAI Benchmarks
+A Benchmark for Interpretability Methods in Deep Neural Networks
+A Consistent and Efficient Evaluation Strategy for Attribution Methods
+Evaluating the visualization of what a deep neural network has learned
+RISE: Randomized Input Sampling for Explanation of Black-box Models
+From Anecdotal Evidence to Quantitative Evaluation Methods: A Systematic Review on Evaluating Explainable AI
+Quantus: An Explainable AI Toolkit for Responsible Evaluation of Neural Network Explanations
+What do Vision Transformers Learn? A Visual Exploration
+Rosetta Neurons: Mining the Common Units in a Model Zoo
+On Pixel-Wise Explanations for Non-Linear Classifier Decisions by Layer-Wise Relevance Propagation
+On the Faithfulness of Vision Transformer Explanations
+Sparse Autoencoders Learn Monosemantic Features in Vision-Language Models
+Probing the Representational Power of Sparse Autoencoders in Vision Models
+Concept Transformer: Attention-based Interpretability with Concept Transformers
