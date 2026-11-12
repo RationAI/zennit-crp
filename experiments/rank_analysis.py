@@ -68,6 +68,7 @@ class Cells:
     image_ids: list
     dapc: dict          # (method, site, block) -> (n_images,) float
     order: dict         # (method, site, block) -> (n_images, D) int
+    k_random: int = 1   # random orderings averaged into each stored random DAPC
 
     @property
     def n_images(self):
@@ -130,7 +131,8 @@ def load_cells(key: str, concept: str = "embed_dim") -> Cells:
                     zr[k], np.int64)
 
     return Cells(key=key, concept=concept, D=int(meta["D"]),
-                 image_ids=list(meta["image_ids"]), dapc=dapc, order=order)
+                 image_ids=list(meta["image_ids"]), dapc=dapc, order=order,
+                 k_random=int(meta.get("k_random", 1)))
 
 
 # ── aggregation over the independent unit (images) ────────────────────────────
@@ -153,15 +155,22 @@ def bootstrap_ci(v, stat=np.median, n_boot=10000, alpha=0.05, seed=0):
 def signal_threshold(c: Cells, site, block, floor=0.05, sigmas=3.0):
     """Smallest bound worth dividing by, for this cell.
 
-    A random ordering scores 0 in expectation, so the random spread measures how
-    much DAPC a cell produces from nothing. Requiring the bound to clear
-    ``sigmas`` times that spread keeps the normalisation from dividing signal by
-    noise where the detectors barely matter — collapsed early blocks, mainly.
-    ``floor`` applies when the cell has no random control stored."""
+    A random ordering scores 0 in expectation, so the spread of the random
+    control measures how much DAPC a cell produces from nothing. Requiring the
+    bound to clear ``sigmas`` times that spread keeps the normalisation from
+    dividing signal by noise where the detectors barely matter — collapsed
+    early blocks, mainly.
+
+    The stored random DAPC of an image is itself the mean of ``k_random``
+    orderings, so its spread is narrower than a single ordering's by about
+    sqrt(k_random); that factor is put back, because the quantity of interest
+    is what one arbitrary ordering can produce. ``floor`` applies when the cell
+    has no random control."""
     r = c.dapc.get(("random", site, block))
     if r is None or np.sum(np.isfinite(r)) < 2:
         return floor
-    return max(floor, sigmas * float(np.nanstd(r, ddof=1)))
+    sd = float(np.nanstd(r, ddof=1)) * np.sqrt(max(1, c.k_random))
+    return max(floor, sigmas * sd)
 
 
 def bound_per_image(c: Cells, site, block, eps=None):

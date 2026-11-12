@@ -144,6 +144,11 @@ def fig_overlap_vs_k(c: ra.Cells, site, block, outdir, label):
 
 
 # ── tables + csv ──────────────────────────────────────────────────────────────
+def _bound_median(c: ra.Cells, site, b):
+    v = ra.bound_per_image(c, site, b)
+    return "" if v is None or not np.isfinite(v).any() else float(np.nanmedian(v))
+
+
 def _cell_rows(c: ra.Cells, label, scope):
     """One CSV row per (site, block, method) with both estimands."""
     rows = []
@@ -159,6 +164,11 @@ def _cell_rows(c: ra.Cells, label, scope):
                        "n_images": c.n_images,
                        "cell_n": ra.cell_n(c, site, b),
                        "signal_threshold": ra.signal_threshold(c, site, b),
+                       # the filter keeps the images whose bound clears the
+                       # threshold, identically for every method in the cell;
+                       # the retained bound is recorded so the conditioning is
+                       # visible rather than implicit.
+                       "bound_median": _bound_median(c, site, b),
                        "dapc_mean": float(np.nanmean(raw)) if raw is not None else "",
                        "norm_dapc": nd[0], "norm_lo": nd[1], "norm_hi": nd[2],
                        "norm_n": nd[3], "norm_undefined": nd[4]}

@@ -44,7 +44,10 @@ def seed_combos(sto: OptimalStore, sites):
         m = re.match(rf"{SEED_METHOD}__(.+?)__b(\d+)__img(\d+)__order$", k)
         if m and m.group(1) in sites:
             out.append((m.group(1), int(m.group(2)), int(m.group(3))))
-    return sorted(out, key=lambda t: (t[0], t[1], t[2]))
+    # deepest block first: the tables report the last block, and a cached-prefix
+    # forward makes block 0 about 12x dearer than block 11, so the cells the
+    # paper needs land first and the expensive early blocks can be cut.
+    return sorted(out, key=lambda t: (-t[1], t[0], t[2]))
 
 
 def main():
